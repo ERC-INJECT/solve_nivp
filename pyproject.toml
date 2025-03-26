@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Solve_IVP_NS"
+version = "0.1.0"
+description = "A solver package for implicit ODEs and projection-based solvers"
+authors = [
+  { name = "David Riley" }
+]
+dependencies = [
+  # e.g. "numpy>=1.20", "jax>=0.4.0", ...
+]
