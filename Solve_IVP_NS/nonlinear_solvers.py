@@ -1,80 +1,951 @@
-# Optional acceleration imports: try to import JAX.
-try:
-    import jax
-    import jax.numpy as jnp
-    from jax.config import config
-    jax.config.update("jax_enable_x64", True)
-    JAX_AVAILABLE = True
-    print('JAX_AVAILABLE', JAX_AVAILABLE)
-except ImportError:
-    JAX_AVAILABLE = False
+# # nonlinear_solvers.py  (fast-path projector dispatch)
 
-# Try to import autograd for automatic differentiation.
-try:
-    from autograd import jacobian as autograd_jacobian
-    AUTOGRAD_AVAILABLE = True
-except ImportError:
-    AUTOGRAD_AVAILABLE = False
+# from __future__ import annotations
 
+# import inspect
+# import numpy as np
+# import scipy.sparse as sp
+# import scipy.sparse.linalg as spla
+# import warnings
+# import math
+
+# class ImplicitEquationSolver:
+#     """Solve F(y)=0 with projection-aware VI or semismooth Newton (fast path)."""
+
+#     def __init__(
+#         self,
+#         method: str = 'semismooth_newton',
+#         jacobian=None,
+#         tol: float = 1e-10,
+#         max_iter: int = 100,
+#         proj=None,
+#         rho0: float = 0.9,
+#         delta: float = 0.7,
+#         component_slices=None,
+#         use_autodiff: bool = False,
+#         autodiff_mode: str = 'numerical',
+#         L: float = 0.9,
+#         Lmin: float = 0.3,
+#         nu: float = 0.66,
+#         lam: float = 1.0,
+#         sparse: bool | str = 'auto',
+#         sparse_threshold: int = 200,
+#         linear_solver: str = 'gmres',
+#         precond_reuse_steps: int = 5,
+#         ilu_drop_tol: float = 1e-4,
+#         ilu_fill_factor: float = 10.0,
+#         gmres_tol: float = 1e-6,
+#         gmres_maxiter: int | None = None,
+#         gmres_restart: int | None = None,
+#         splu_permc_spec: str = 'COLAMD',
+#         ilu_permc_spec: str = 'COLAMD',
+#         linear_tol_strategy: str = 'fixed',
+#         eisenstat_c: float = 0.5,
+#         eisenstat_exp: float = 0.5,
+#         adaptive_lam: bool = True,
+#         lam_update_strategy: str = 'vi',
+#         globalization: str = 'none',
+#         ls_c1: float = 1e-4,
+#         ls_beta: float = 0.5,
+#         ls_min_alpha: float = 1e-8,
+#         max_backtracks: int = 15,
+#         use_broyden: bool = False,
+#         # VI strict per-block Lipschitz enforcement (opt-in)
+#         vi_strict_block_lipschitz: bool = True,
+#         vi_max_block_adjust_iters: int = 10,
+#     ) -> None:
+#         if method not in ['VI', 'semismooth_newton']:
+#             raise ValueError("Unsupported solver method. Use 'VI' or 'semismooth_newton'.")
+#         self.method = method
+#         self.jacobian = jacobian
+#         self.tol = tol
+#         self.max_iter = max_iter
+#         self.proj = proj
+#         self.rho0 = rho0
+#         self.delta = delta
+#         self.component_slices = component_slices
+#         self.use_autodiff = False
+#         self.autodiff_mode = 'numerical'
+#         self.L = L
+#         self.Lmin = Lmin
+#         self.nu = nu
+#         self.lam = lam
+
+#         # Sparse / linear solver configuration
+#         self.sparse = sparse
+#         self.sparse_threshold = int(sparse_threshold)
+#         self.linear_solver = (linear_solver or 'gmres').lower()
+#         self.precond_reuse_steps = max(0, int(precond_reuse_steps))
+#         self.ilu_drop_tol = ilu_drop_tol
+#         self.ilu_fill_factor = ilu_fill_factor
+#         self.gmres_tol = gmres_tol
+#         self.gmres_maxiter = gmres_maxiter
+#         self.gmres_restart = gmres_restart
+#         self.splu_permc_spec = splu_permc_spec
+#         self.ilu_permc_spec = ilu_permc_spec
+#         self.linear_tol_strategy = (linear_tol_strategy or 'fixed').lower()
+#         self.eisenstat_c = float(eisenstat_c)
+#         self.eisenstat_exp = float(eisenstat_exp)
+#         self.adaptive_lam = bool(adaptive_lam)
+#         self.lam_update_strategy = lam_update_strategy or 'vi'
+#         self.globalization = (globalization or 'none').lower()
+#         if self.globalization not in ('none', 'linesearch'):
+#             self.globalization = 'none'
+#         self.ls_c1 = float(ls_c1)
+#         self.ls_beta = float(ls_beta)
+#         self.ls_min_alpha = float(ls_min_alpha)
+#         self.max_backtracks = int(max_backtracks)
+
+#         # Quasi-Newton (dense)
+#         self.use_broyden = bool(use_broyden)
+#         self._B = None
+#         self._y_prev_broyden = None
+#         self._F_prev_broyden = None
+
+#         # VI strict block Lipschitz options
+#         self.vi_strict_block_lipschitz = bool(vi_strict_block_lipschitz)
+#         self.vi_max_block_adjust_iters = int(vi_max_block_adjust_iters)
+
+#         # Rho adaptation safeguards (bounds and "stuck" thresholds)
+#         # These are conservative defaults; they can be adjusted by users after construction if needed.
+#         self.rho_min = 1e-12
+#         self.rho_max = 1e6
+#         # A component is considered "stuck" if the change is below this absolute threshold times a scale
+#         self.stuck_eps_abs = 1e-14
+#         # Optional relative scale for stuck detection; set small to avoid false positives on tiny states
+#         self.stuck_eps_rel = 1e-12
+
+#         # GMRES preconditioner cache
+#         self._ilu = None
+#         self._ilu_steps_since_build = 0
+#         self._last_shape = None
+#         self._last_pattern = None
+
+#         # Identity caches
+#         self._I_cache = {}
+
+#         # Basic checks
+#         if self.method == 'VI':
+#             if self.proj is None:
+#                 raise ValueError("Projection operator 'proj' must be provided for method 'VI'.")
+#             if self.component_slices is None:
+#                 raise ValueError("component_slices must be provided for method 'VI'.")
+#         if self.method == 'semismooth_newton' and self.proj is None:
+#             raise ValueError("Projection operator 'proj' must be provided for 'semismooth_newton'.")
+
+#         # ---- Bind fast projector dispatchers once (no per-iteration try/except) ----
+#         self._bind_projector_fastpaths()
+
+#     # ---------- Fastpath binding ----------
+#     def _bind_projector_fastpaths(self):
+#         """Bind self._project and self._tangent with only the args supported by the projector."""
+#         if self.proj is None:
+#             self._project = None
+#             self._tangent = None
+#             return
+
+#         def _supports(fn, name):
+#             try:
+#                 return name in inspect.signature(fn).parameters
+#             except Exception:
+#                 return False
+
+#         P = self.proj
+#         # --- detect what the projector exposes ---
+#         has_prev_p = _supports(P.project, 'prev_state')
+#         has_step_p = _supports(P.project, 'step_size')
+#         has_rhok_p = _supports(P.project, 'rhok')          # keyword form
+#         has_rho_p  = _supports(P.project, 'rho')           # positional/keyword form
+#         has_t_p    = _supports(P.project, 't')
+#         has_Fk_p   = _supports(P.project, 'Fk_val')
+
+#         # ---- PROJECT BINDER ----
+#         if has_prev_p:
+#             def _project(cur, cand, rho, t, Fk, prev):
+#                 # Only pass parameters the projector actually accepts
+#                 kw = {}
+#                 if has_t_p:   kw['t'] = t
+#                 if has_Fk_p:  kw['Fk_val'] = Fk
+#                 if has_step_p:
+#                     kw['step_size'] = getattr(self, 'prev_step', None)
+#                 kw['prev_state'] = prev
+
+#                 if has_rhok_p:
+#                     # projector expects keyword rhok
+#                     kw['rhok'] = rho
+#                     return P.project(cur, cand, **kw)
+#                 elif has_rho_p:
+#                     # projector expects a 'rho' parameter (positional-or-keyword) — pass positionally
+#                     return P.project(cur, cand, rho, **kw)
+#                 else:
+#                     # projector doesn't want any stepsize param
+#                     return P.project(cur, cand, **kw)
+#         else:
+#             def _project(cur, cand, rho, t, Fk, prev):
+#                 kw = {}
+#                 if has_t_p:   kw['t'] = t
+#                 if has_Fk_p:  kw['Fk_val'] = Fk
+#                 if has_step_p:
+#                     kw['step_size'] = getattr(self, 'prev_step', None)
+#                 if has_rhok_p:
+#                     kw['rhok'] = rho
+#                     return P.project(cur, cand, **kw)
+#                 elif has_rho_p:
+#                     return P.project(cur, cand, rho, **kw)
+#                 else:
+#                     return P.project(cur, cand, **kw)
+
+#         self._project = _project
+
+#         # ---- TANGENT BINDER (unchanged except we accept both rhok/rho too) ----
+#         has_prev_t = _supports(P.tangent_cone, 'prev_state')
+#         has_step_t = _supports(P.tangent_cone, 'step_size')
+#         has_rhok_t = _supports(P.tangent_cone, 'rhok')
+#         has_rho_t  = _supports(P.tangent_cone, 'rho')
+#         has_t_t    = _supports(P.tangent_cone, 't')
+#         has_Fk_t   = _supports(P.tangent_cone, 'Fk_val')
+
+#         if has_prev_t:
+#             def _tangent(cand, cur, rho, t, Fk, prev):
+#                 kw = {}
+#                 if has_t_t:   kw['t'] = t
+#                 if has_Fk_t:  kw['Fk_val'] = Fk
+#                 if has_step_t:
+#                     kw['step_size'] = getattr(self, 'prev_step', None)
+#                 kw['prev_state'] = prev
+#                 if has_rhok_t:
+#                     kw['rhok'] = rho
+#                     return P.tangent_cone(cand, cur, **kw)
+#                 elif has_rho_t:
+#                     return P.tangent_cone(cand, cur, rho, **kw)
+#                 else:
+#                     return P.tangent_cone(cand, cur, **kw)
+#         else:
+#             def _tangent(cand, cur, rho, t, Fk, prev):
+#                 kw = {}
+#                 if has_t_t:   kw['t'] = t
+#                 if has_Fk_t:  kw['Fk_val'] = Fk
+#                 if has_step_t:
+#                     kw['step_size'] = getattr(self, 'prev_step', None)
+#                 if has_rhok_t:
+#                     kw['rhok'] = rho
+#                     return P.tangent_cone(cand, cur, **kw)
+#                 elif has_rho_t:
+#                     return P.tangent_cone(cand, cur, rho, **kw)
+#                 else:
+#                     return P.tangent_cone(cand, cur, **kw)
+
+#         self._tangent = _tangent
+
+
+#     # ---------- Public API ----------
+#     def _func_wrapper(self, y):
+#         return self.func(y)
+
+#     def set_func(self, func):
+#         self.func = func
+
+#     def set_projection(self, proj):
+#         """Allow swapping projector at runtime, with fastpath rebind."""
+#         self.proj = proj
+#         self._bind_projector_fastpaths()
+
+#     def solve(self, func, y0):
+#         self.set_func(func)
+#         if self.method == 'VI':
+#             return self._solve_with_VI(func, y0)
+#         else:
+#             return self._solve_with_semismooth_newton(func, y0)
+
+#     # ---------------- Semismooth Newton ----------------
+#     def _phi(self, y):
+#         Fk_val = self.func(y)
+#         lam = self.lam
+#         tcur = getattr(self, 'current_time', None)
+#         prev = getattr(self, 'prev_state', None)
+#         proj_val = self._project(y, y - lam * Fk_val, lam, tcur, Fk_val, prev)
+#         F = y - proj_val
+#         return 0.5 * np.dot(F, F)
+
+#     def _solve_with_semismooth_newton(self, func, y0):
+#         y = y0.copy()
+#         lam = self.lam
+#         n = len(y)
+
+#         # Decide sparse path once (dimension doesn't change within a solve)
+#         sparse_active = self._sparse_active(n)
+#         if sparse_active:
+#             I = self._I_cache.get(("csr", n))
+#             if I is None:
+#                 I = sp.eye(n, format='csr')
+#                 self._I_cache[("csr", n)] = I
+#         else:
+#             I = self._I_cache.get(n)
+#             if I is None:
+#                 I = np.eye(n)
+#                 self._I_cache[n] = I
+
+#         # Buffers
+#         candidate = np.empty_like(y)
+#         proj_z = np.empty_like(y)
+#         F_buf = np.empty_like(y)
+
+#         # Reset Broyden state
+#         if self.use_broyden:
+#             self._B = None
+#             self._y_prev_broyden = None
+#             self._F_prev_broyden = None
+
+#         for iteration in range(1, self.max_iter + 1):
+#             # cache context once per iteration
+#             tcur = getattr(self, 'current_time', None)
+#             prev = getattr(self, 'prev_state', None)
+
+#             # Optional adaptive lam
+#             if self.adaptive_lam and self.lam_update_strategy == 'vi':
+#                 try:
+#                     lam = self._update_rho(func, y, lam)
+#                     self.lam = lam
+#                 except Exception:
+#                     pass
+
+#             F_in = func(y)
+#             self.last_Fk_val = F_in  # cheap attribute write
+
+#             # candidate = y - lam F(y)
+#             np.subtract(y, lam * F_in, out=candidate)
+
+#             # projection (fastpath)
+#             proj_val = self._project(y, candidate, lam, tcur, F_in, prev)
+#             proj_z[:] = proj_val
+
+#             # F_buf = y - proj_z
+#             np.subtract(y, proj_z, out=F_buf)
+#             errF = np.linalg.norm(F_buf)
+#             if errF < self.tol:
+#                 y[:] = proj_z
+#                 F_y = func(y)
+#                 return (y.copy(), F_y, errF, True, iteration)
+
+#             # Inner Jacobian
+#             used_broyden = False
+#             if self.use_broyden and not sparse_active:
+#                 if self._B is not None and self._y_prev_broyden is not None and self._F_prev_broyden is not None:
+#                     s_vec = y - self._y_prev_broyden
+#                     y_vec = F_in - self._F_prev_broyden
+#                     denom = float(np.dot(s_vec, s_vec))
+#                     if np.isfinite(denom) and denom > 0.0:
+#                         Bs = self._B @ s_vec
+#                         corr = (y_vec - Bs) / denom
+#                         self._B = self._B + np.outer(corr, s_vec)
+#                 if self._B is None:
+#                     if self.jacobian is not None:
+#                         B0 = self.jacobian(y)
+#                     else:
+#                         B0 = self._numerical_jacobian(func, y, sparse=False)
+#                     if sp.issparse(B0):
+#                         B0 = B0.toarray()
+#                     self._B = B0
+#                 J_in = self._B
+#                 used_broyden = True
+#             else:
+#                 if self.jacobian is not None:
+#                     J_in = self.jacobian(y)
+#                 else:
+#                     J_in = self._numerical_jacobian(func, y, sparse=sparse_active)
+
+#             # Eisenstat–Walker tol for GMRES if enabled
+#             rtol_dyn = self.gmres_tol
+#             if self.linear_solver == 'gmres' and self.linear_tol_strategy != 'fixed':
+#                 eta = min(0.5, self.eisenstat_c * (errF ** self.eisenstat_exp))
+#                 rtol_dyn = max(self.gmres_tol, eta)
+
+#             if sparse_active:
+#                 J_in = self._to_csr(J_in)
+#                 Dproj = self._to_csr(self._tangent(candidate, y, lam, tcur, F_in, prev), n)
+#                 J = (I - Dproj) + lam * (Dproj @ J_in)
+#                 rhs = -F_buf
+#                 delta, ok = self._solve_linear_sparse(J, rhs, rtol=rtol_dyn, pattern_hint=J.nnz)
+#                 if not ok:
+#                     return (y, F_in, errF, False, iteration)
+#             else:
+#                 Dproj = self._tangent(candidate, y, lam, tcur, F_in, prev)
+#                 if sp.issparse(Dproj):
+#                     Dproj = Dproj.toarray()
+#                 if sp.issparse(J_in):
+#                     J_in = J_in.toarray()
+#                 J = I - Dproj + lam * (Dproj @ J_in)
+#                 try:
+#                     delta = np.linalg.solve(J, -F_buf)
+#                 except np.linalg.LinAlgError:
+#                     return (y, F_in, errF, False, iteration)
+
+#             # Globalization (optional)
+#             if self.globalization == 'linesearch':
+#                 phi0 = 0.5 * errF * errF
+#                 grad_dir = -errF * errF
+#                 alpha = 1.0
+#                 backtracks = 0
+
+#                 y_trial = y + alpha * delta
+#                 phi_trial = self._phi(y_trial)
+#                 while (phi_trial > phi0 + self.ls_c1 * alpha * grad_dir
+#                        and backtracks < self.max_backtracks
+#                        and alpha > self.ls_min_alpha):
+#                     alpha *= self.ls_beta
+#                     y_trial = y + alpha * delta
+#                     phi_trial = self._phi(y_trial)
+#                     backtracks += 1
+
+#                 if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir:
+#                     if self.use_broyden and not sparse_active:
+#                         self._y_prev_broyden = y.copy()
+#                         self._F_prev_broyden = F_in.copy()
+#                     y = y_trial
+#                 else:
+#                     # Steepest descent fallback
+#                     if sp.issparse(J):
+#                         grad_phi = J.T.dot(F_buf)
+#                     else:
+#                         grad_phi = J.T @ F_buf
+#                     nrm_g = np.linalg.norm(grad_phi)
+#                     if nrm_g == 0.0:
+#                         return (y, F_in, errF, False, iteration)
+#                     delta_g = -grad_phi
+#                     grad_dir = -nrm_g * nrm_g
+
+#                     alpha = 1.0
+#                     backtracks = 0
+#                     y_trial = y + alpha * delta_g
+#                     phi_trial = self._phi(y_trial)
+
+#                     while (phi_trial > phi0 + self.ls_c1 * alpha * grad_dir
+#                            and backtracks < self.max_backtracks
+#                            and alpha > self.ls_min_alpha):
+#                         alpha *= self.ls_beta
+#                         y_trial = y + alpha * delta_g
+#                         phi_trial = self._phi(y_trial)
+#                         backtracks += 1
+
+#                     if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir:
+#                         if self.use_broyden and not sparse_active:
+#                             self._y_prev_broyden = y.copy()
+#                             self._F_prev_broyden = F_in.copy()
+#                         y = y_trial
+#                     else:
+#                         return (y, F_in, errF, False, iteration)
+#             else:
+#                 if self.use_broyden and not sparse_active:
+#                     self._y_prev_broyden = y.copy()
+#                     self._F_prev_broyden = F_in.copy()
+#                 np.add(y, delta, out=y)
+
+#         # Out of iterations
+#         F_in = func(y)
+#         self.last_Fk_val = F_in
+#         tcur = getattr(self, 'current_time', None)
+#         prev = getattr(self, 'prev_state', None)
+#         errF = np.linalg.norm(y - self._project(y, y - lam * F_in, lam, tcur, F_in, prev))
+#         return (y, F_in, errF, False, self.max_iter)
+
+#     # ---------------- VI (projected fixed-point) ----------------
+#     # def _solve_with_VI(self, func, y0):
+#     #     k = 0
+#     #     yk = y0.copy()
+#     #     rho = self.rho0
+#     #     tcur = getattr(self, 'current_time', None)
+#     #     prev = getattr(self, 'prev_state', None)
+
+#     #     Fk_val = func(yk)
+#     #     self.last_Fk_val = Fk_val
+#     #     y_proj = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
+#     #     err = np.linalg.norm(yk - y_proj)
+
+#     #     while err > self.tol and k < self.max_iter:
+#     #         rho = self._update_rho(func, yk, rho)
+#     #         tcur = getattr(self, 'current_time', None)
+#     #         prev = getattr(self, 'prev_state', None)
+
+#     #         Fk_val = func(yk)
+#     #         self.last_Fk_val = Fk_val
+#     #         yk1 = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
+
+#     #         Fk_val_1 = func(yk1)
+#     #         err = np.linalg.norm(yk1 - self._project(yk1, yk1 - rho * Fk_val_1, rho, tcur, Fk_val_1, prev))
+#     #         yk = yk1
+#     #         k += 1
+
+#     #     success = (err <= self.tol)
+#     #     return (yk, func(yk), err, success, k)
+
+#     def _solve_with_VI(self, func, y0):
+#         def _sanitize_rho(rho_in, *, context="init"):
+#             """Ensure rho (scalar or array) is finite, positive, and within [rho_floor, rho_ceil].
+#             If non-finite values are found, reset them to a safe default (self.rho0 or 1.0) then clip.
+#             Returns sanitized rho with same type/shape semantics (scalar or ndarray).
+#             """
+#             debug_local = bool(getattr(self, 'debug_vi', False))
+#             if np.isscalar(rho_in):
+#                 r = float(rho_in)
+#                 if not np.isfinite(r) or r <= 0.0:
+#                     base = self.rho0 if (np.isscalar(self.rho0) and np.isfinite(self.rho0) and self.rho0 > 0) else 1.0
+#                     if debug_local:
+#                         print(f"[VI] rho sanitize ({context}): scalar reset from {r} to {base}")
+#                     r = float(base)
+#                 r = float(np.clip(r, self.rho_min, self.rho_max))
+#                 return r
+#             else:
+#                 arr = np.asarray(rho_in, dtype=float)
+#                 reset_mask = ~np.isfinite(arr) | (arr <= 0.0)
+#                 if np.any(reset_mask):
+#                     base = self.rho0
+#                     if not (np.isscalar(base) and np.isfinite(base) and base > 0):
+#                         base = 1.0
+#                     if debug_local:
+#                         bad_vals = arr[reset_mask]
+#                         print(f"[VI] rho sanitize ({context}): resetting {bad_vals.size} entries (e.g., {bad_vals[:3]}) to {base}")
+#                     arr[reset_mask] = float(base)
+#                 # clip to bounds
+#                 np.clip(arr, self.rho_min, self.rho_max, out=arr)
+#                 return arr
+
+#         # Helper: block-wise relative L2 of natural residual r = (y - P(y - rho F(y)))
+#         def _rel_block_l2(r, y, slices):
+#             if slices is not None:
+#                 vals = []
+#                 for s in slices:
+#                     rs, ys = r[s], y[s]
+#                     n  = max(1, rs.size)
+#                     nr = np.linalg.norm(rs) / math.sqrt(n)   # RMS of residual
+#                     ny = np.linalg.norm(ys) / math.sqrt(n)   # RMS of state
+#                     vals.append(nr / (1.0 + ny))
+#                 return max(vals) if vals else 0.0
+#             else:
+#                 n  = max(1, r.size)
+#                 nr = np.linalg.norm(r) / math.sqrt(n)
+#                 ny = np.linalg.norm(y) / math.sqrt(n)
+#                 return nr / (1.0 + ny)
+
+
+#         # Expand block-wise rho (length = number of component_slices) to a per-index vector (length = n)
+#         def _expand_rho_to_vec(rho_in, n, slices):
+#             # scalar -> full vector
+#             if np.isscalar(rho_in):
+#                 return float(rho_in) * np.ones(n, dtype=float)
+#             arr = np.asarray(rho_in, dtype=float)
+#             if arr.ndim == 0:
+#                 return float(arr) * np.ones(n, dtype=float)
+#             if arr.size == n:
+#                 return arr.astype(float, copy=False)
+#             if slices is not None and arr.size == len(slices):
+#                 vec = np.empty(n, dtype=float)
+#                 for v, s in zip(arr, slices):
+#                     vec[s] = float(v)
+#                 return vec
+#             # Fallback: broadcast mean
+#             return float(np.mean(arr)) * np.ones(n, dtype=float)
+
+#         # Initialize block rho from last solve (if available). If scalar, broadcast to blocks when slices exist.
+#         def _init_block_rho():
+#             last = getattr(self, 'rho_last', self.rho0)
+#             slices = self.component_slices
+#             if slices is None:
+#                 return float(last) if np.isscalar(last) else float(np.mean(np.asarray(last, dtype=float)))
+#             m = len(slices)
+#             if np.isscalar(last):
+#                 return np.full(m, float(last), dtype=float)
+#             arr = np.asarray(last, dtype=float).reshape(-1)
+#             if arr.size == m:
+#                 return arr.copy()
+#             return np.full(m, float(np.mean(arr)), dtype=float)
+
+#         # Ensure we pass per-block rho to projector when component_slices is defined
+#         def _assert_project_rho(rho_arg):
+#             if self.component_slices is None:
+#                 return
+#             if np.isscalar(rho_arg):
+#                 return
+#             arr = np.asarray(rho_arg)
+#             assert arr.size == len(self.component_slices), (
+#                 "rho passed to projector must be per-block (size == number of component_slices) when component_slices is set"
+#             )
+
+#         k = 0
+#         yk = y0.copy()
+#         debug = bool(getattr(self, 'debug_vi', False))
+
+#         # Use per-block rho when component_slices is defined; otherwise scalar
+#         if self.component_slices is not None and len(self.component_slices) > 0:
+#             rho = _init_block_rho()  # shape (n_blocks,)
+#         else:
+#             rho = float(getattr(self, 'rho_last', self.rho0))
+#         # Sanitize initial rho and persist immediately so bad values don't leak into next solves
+#         rho = _sanitize_rho(rho, context="init")
+#         self.rho_last = rho
+#         tcur = getattr(self, 'current_time', None)
+#         prev = getattr(self, 'prev_state', None)
+#         if debug:
+#             if self.component_slices is not None and len(self.component_slices) > 0:
+#                 print(f"[VI] init: blocks={len(self.component_slices)} rho={rho}")
+#             else:
+#                 print(f"[VI] init: scalar rho={rho:.3e}")
+
+#         Fk_val = func(yk)
+#         self.last_Fk_val = Fk_val
+#         # Initial error at yk using current rho
+#         rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+#         if not np.all(np.isfinite(rho_vec)):
+#             rho = _sanitize_rho(rho, context="expand-init")
+#             rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+#         candidate = yk - rho_vec * Fk_val
+#         if not np.all(np.isfinite(candidate)):
+#             rho = _sanitize_rho(rho * 0.1 if np.isscalar(rho) else rho * 0.1, context="candidate-init")
+#             rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+#             candidate = yk - rho_vec * Fk_val
+#         _assert_project_rho(rho)
+#         y_proj = self._project(yk, candidate, rho, tcur, Fk_val, prev)
+#         r0 = (yk - y_proj)
+#         err = _rel_block_l2(r0, yk, self.component_slices)
+#         if not np.isfinite(err):
+#             rho = _sanitize_rho(self.rho0 if np.isfinite(self.rho0) else 1.0, context="err-init-reset")
+#             rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+#             candidate = yk - rho_vec * Fk_val
+#             y_proj = self._project(yk, candidate, rho, tcur, Fk_val, prev)
+#             r0 = (yk - y_proj)
+#             err = _rel_block_l2(r0, yk, self.component_slices)
+#         if debug:
+#             print(f"[VI] k={k} err={err:.3e}")
+
+#         # Helper for per-block rho update at beginning of iteration
+#         def _update_rho_blocks(rb, y_base, F_base, t_ctx, prev_ctx):
+#             rb = np.asarray(rb, dtype=float).copy()
+#             rb = _sanitize_rho(rb, context="blocks-pre")
+#             slices = self.component_slices
+#             # Start with a projection using current rb
+#             rho_vec_local = _expand_rho_to_vec(rb, len(y_base), slices)
+#             cand_local = y_base - rho_vec_local * F_base
+#             _assert_project_rho(rb)
+#             y_temp = self._project(y_base, cand_local, rb, t_ctx, F_base, prev_ctx)
+#             if self.vi_strict_block_lipschitz:
+#                 for i, s in enumerate(slices):
+#                     stuck_thresh = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + np.linalg.norm(y_base[s]))
+#                     den = np.linalg.norm(y_temp[s] - y_base[s])
+#                     if den < stuck_thresh:
+#                         continue
+#                     iter_count = 0
+#                     rk_i = np.inf
+#                     while iter_count < self.vi_max_block_adjust_iters:
+#                         F_temp = func(y_temp)
+#                         num = rb[i] * np.linalg.norm(F_temp[s] - F_base[s])
+#                         rk_i = (num / den) if den != 0.0 else 0.0
+#                         if rk_i > self.L:
+#                             rb[i] = self.nu * rb[i]
+#                             # Reproject with updated rb (fixed base y_base, F_base)
+#                             rho_vec_local = _expand_rho_to_vec(rb, len(y_base), slices)
+#                             cand_local = y_base - rho_vec_local * F_base
+#                             _assert_project_rho(rb)
+#                             y_temp = self._project(y_base, cand_local, rb, t_ctx, F_base, prev_ctx)
+#                             den = np.linalg.norm(y_temp[s] - y_base[s])
+#                             if den < stuck_thresh:
+#                                 break
+#                             iter_count += 1
+#                             continue
+#                         else:
+#                             break
+#                     if np.isfinite(rk_i) and rk_i < self.Lmin:
+#                         rb[i] = (1.0 / self.nu) * rb[i]
+#                 # Final clamp/sanitize
+#                 rb = np.maximum(rb, np.finfo(float).tiny)
+#                 np.clip(rb, self.rho_min, self.rho_max, out=rb)
+#                 rb = _sanitize_rho(rb, context="blocks-post-strict")
+#                 return rb
+#             else:
+#                 # Fast single-pass per-block update using current y_temp and F_temp
+#                 F_temp = func(y_temp)
+#                 for i, s in enumerate(slices):
+#                     den = np.linalg.norm(y_temp[s] - y_base[s])
+#                     stuck_thresh = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + np.linalg.norm(y_base[s]))
+#                     if den < stuck_thresh:
+#                         continue
+#                     num = rb[i] * np.linalg.norm(F_temp[s] - F_base[s])
+#                     rk_i = num / den
+#                     if rk_i > self.L:
+#                         rb[i] = self.nu * rb[i]
+#                     elif rk_i < self.Lmin:
+#                         rb[i] = (1.0 / self.nu) * rb[i]
+#                 rb = np.maximum(rb, np.finfo(float).tiny)
+#                 np.clip(rb, self.rho_min, self.rho_max, out=rb)
+#                 rb = _sanitize_rho(rb, context="blocks-post")
+#                 return rb
+
+#         while err > self.tol and k < self.max_iter:
+#             # Update rho at the beginning of the iteration (mirror scalar algorithm)
+#             tcur = getattr(self, 'current_time', None)
+#             prev = getattr(self, 'prev_state', None)
+
+#             Fk_val = func(yk)
+#             self.last_Fk_val = Fk_val
+
+#             if self.component_slices is not None and len(self.component_slices) > 0:
+#                 rho = _update_rho_blocks(rho, yk, Fk_val, tcur, prev)
+#             else:
+#                 rho = self._update_rho(func, yk, rho)
+
+#             # Project with the updated rho to get yk1
+#             rho = _sanitize_rho(rho, context="iter-pre")
+#             rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+#             candidate = yk - rho_vec * Fk_val
+#             if not np.all(np.isfinite(candidate)):
+#                 rho = _sanitize_rho(rho * 0.5 if np.isscalar(rho) else rho * 0.5, context="iter-candidate")
+#                 rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+#                 candidate = yk - rho_vec * Fk_val
+#             _assert_project_rho(rho)
+#             yk1 = self._project(yk, candidate, rho, tcur, Fk_val, prev)
+
+#             # Compute error at new point using the same updated rho
+#             Fk_val_1 = func(yk1)
+#             rho_vec = _expand_rho_to_vec(rho, len(yk1), self.component_slices)
+#             proj_candidate = yk1 - rho_vec * Fk_val_1
+#             _assert_project_rho(rho)
+#             proj_yk1 = self._project(yk1, proj_candidate, rho, tcur, Fk_val_1, prev)
+#             r1 = (yk1 - proj_yk1)
+#             err = _rel_block_l2(r1, yk1, self.component_slices)
+#             if not np.isfinite(err):
+#                 if debug:
+#                     print(f"[VI] non-finite err encountered; shrinking rho and retrying one step")
+#                 rho = _sanitize_rho(rho * 0.5 if np.isscalar(rho) else rho * 0.5, context="iter-err-reset")
+#                 rho_vec = _expand_rho_to_vec(rho, len(yk1), self.component_slices)
+#                 proj_candidate = yk1 - rho_vec * Fk_val_1
+#                 proj_yk1 = self._project(yk1, proj_candidate, rho, tcur, Fk_val_1, prev)
+#                 r1 = (yk1 - proj_yk1)
+#                 err = _rel_block_l2(r1, yk1, self.component_slices)
+
+#             if debug:
+#                 if isinstance(rho, np.ndarray):
+#                     print(f"[VI] k={k+1} err={err:.3e} rho={rho}")
+#                 else:
+#                     print(f"[VI] k={k+1} err={err:.3e} rho={rho:.3e}")
+
+#             yk = yk1
+#             k += 1
+
+#         success = (err <= self.tol)
+#         # Persist last rho for subsequent solves (both cached and default field)
+#         rho = _sanitize_rho(rho, context="final")
+#         self.rho0 = rho
+#         self.rho_last = rho
+#         F_final = func(yk)
+#         self.last_Fk_val = F_final
+#         if debug:
+#             if isinstance(rho, np.ndarray):
+#                 print(f"[VI] done: success={success} iters={k} final_err={err:.3e} rho={rho}")
+#             else:
+#                 print(f"[VI] done: success={success} iters={k} final_err={err:.3e} rho={rho:.3e}")
+#         return (yk, F_final, err, success, k)
+
+#     # ---- VI stepsize update (unchanged math, but uses fast projection) ----
+#     def _update_rho(self, func, yk, rho):
+#         # guard against bad rho
+#         if not np.isscalar(rho) or not np.isfinite(rho) or rho <= 0:
+#             base = self.rho0 if (np.isscalar(self.rho0) and np.isfinite(self.rho0) and self.rho0 > 0) else 1.0
+#             rho = float(base)
+
+#         tcur = getattr(self, 'current_time', None)
+#         prev = getattr(self, 'prev_state', None)
+
+#         Fk_val = func(yk)
+#         self.last_Fk_val = Fk_val
+#         yk1 = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
+#         # Stuck detection for scalar path
+#         den = np.linalg.norm(yk1 - yk)
+#         stuck_thresh = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + np.linalg.norm(yk))
+#         if den >= stuck_thresh:
+#             rk = self._get_rk(func, yk1, yk, rho)
+#             while rk > self.L:
+#                 rho = self.nu * rho
+#                 yk1 = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
+#                 den = np.linalg.norm(yk1 - yk)
+#                 if den < stuck_thresh:
+#                     break
+#                 rk = self._get_rk(func, yk1, yk, rho)
+#             if rk < self.Lmin:
+#                 rho = (1.0 / self.nu) * rho
+#         # Clamp
+#         rho = float(np.clip(rho, self.rho_min, self.rho_max))
+#         return rho
+
+#     def _get_rk(self, func, yk1, yk, rho):
+#         num = rho * np.linalg.norm(func(yk1) - func(yk))
+#         den = np.linalg.norm(yk1 - yk)
+#         return 0.0 if den == 0.0 else (num / den)
+
+#     # ---------- Numerical Jacobian ----------
+#     def _numerical_jacobian(self, func, y, eps: float | None = None, sparse: bool | None = None, mode: str = 'fd'):
+#         n = len(y)
+#         J = np.empty((n, n), dtype=y.dtype)
+
+#         if (mode or 'fd').lower() == 'cs':
+#             try:
+#                 h = 1e-30
+#                 y_cs = y.astype(complex)
+#                 for i in range(n):
+#                     y_cs_i = y_cs.copy()
+#                     y_cs_i[i] += 1j * h
+#                     Fi = func(y_cs_i)
+#                     J[:, i] = np.imag(Fi) / h
+#                 use_sparse = self._sparse_active(n) if sparse is None else bool(sparse)
+#                 return J if not use_sparse else sp.csr_matrix(J)
+#             except Exception:
+#                 pass
+
+#         F0 = func(y)
+#         base = np.sqrt(np.finfo(float).eps) if eps is None else float(eps)
+#         for i in range(n):
+#             h = base * max(1.0, abs(y[i]))
+#             y_eps = y.copy()
+#             y_eps[i] += h
+#             F_eps = func(y_eps)
+#             J[:, i] = (F_eps - F0) / h
+#         use_sparse = self._sparse_active(n) if sparse is None else bool(sparse)
+#         return J if not use_sparse else sp.csr_matrix(J)
+
+#     # ---------- Sparse helpers ----------
+#     def _to_csr(self, A, n=None):
+#         if sp.issparse(A):
+#             return A.tocsr()
+#         if isinstance(A, np.ndarray):
+#             if A.ndim == 1:
+#                 return sp.diags(A, format='csr')
+#             return sp.csr_matrix(A)
+#         if n is not None:
+#             try:
+#                 return sp.csr_matrix(A, shape=(n, n))
+#             except Exception:
+#                 pass
+#         return sp.csr_matrix(A)
+
+#     def _solve_linear_sparse(self, J, rhs, rtol=None, pattern_hint=None):
+#         n = J.shape[0]
+#         b = rhs if (isinstance(rhs, np.ndarray) and rhs.ndim == 1) else np.asarray(rhs).reshape(n)
+
+#         if self.linear_solver == 'splu':
+#             try:
+#                 lu = spla.splu(J.tocsc(), permc_spec=self.splu_permc_spec)
+#                 x = lu.solve(b)
+#                 return x, True
+#             except Exception:
+#                 x, info = self._gmres(
+#                     J, b,
+#                     rtol=(self.gmres_tol if rtol is None else rtol),
+#                     maxiter=self.gmres_maxiter,
+#                     restart=self.gmres_restart,
+#                 )
+#                 return (x, info == 0)
+#         else:
+#             M = None
+#             need_rebuild = (
+#                 self._ilu is None or self._last_shape != J.shape or self._ilu_steps_since_build >= self.precond_reuse_steps
+#             )
+#             pattern_key = (J.shape, J.nnz, pattern_hint)
+#             if need_rebuild or self._last_pattern != pattern_key:
+#                 try:
+#                     ilu = spla.spilu(
+#                         J.tocsc(),
+#                         drop_tol=self.ilu_drop_tol,
+#                         fill_factor=self.ilu_fill_factor,
+#                         permc_spec=self.ilu_permc_spec,
+#                     )
+#                     self._ilu = ilu
+#                     self._ilu_steps_since_build = 0
+#                     self._last_shape = J.shape
+#                     self._last_pattern = pattern_key
+#                 except Exception:
+#                     self._ilu = None
+#             if self._ilu is not None:
+#                 ilu = self._ilu
+#                 M = spla.LinearOperator(J.shape, matvec=lambda v: ilu.solve(v))
+#                 self._ilu_steps_since_build += 1
+#             x, info = self._gmres(
+#                 J, b, M=M,
+#                 rtol=(self.gmres_tol if rtol is None else rtol),
+#                 maxiter=self.gmres_maxiter,
+#                 restart=self.gmres_restart,
+#             )
+#             return (x, info == 0)
+
+#     def _gmres(self, A, b, M=None, rtol=None, maxiter=None, restart=None):
+#         kwargs = {'M': M, 'maxiter': maxiter, 'restart': restart}
+#         try:
+#             return spla.gmres(A, b, rtol=(rtol if rtol is not None else self.gmres_tol), atol=0.0, **kwargs)
+#         except TypeError:
+#             return spla.gmres(A, b, tol=(rtol if rtol is not None else self.gmres_tol), **kwargs)
+
+#     def _sparse_active(self, n: int) -> bool:
+#         if isinstance(self.sparse, str):
+#             if self.sparse.lower() == 'auto':
+#                 return n >= self.sparse_threshold
+#             return True
+#         return bool(self.sparse)
+
+
+# nonlinear_solvers.py  (fast-path projector dispatch)
+
+from __future__ import annotations
+
+import inspect
 import numpy as np
-from scipy.optimize import root
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 import warnings
+import math
 
 class ImplicitEquationSolver:
-    """
-    Generic solver for the implicit equation F(y)=0.
-    
-    This solver returns a tuple:
-         (y_new, Fk, error, success, iterations)
-    
-    Supported methods:
-      - 'root'
-      - 'newton_raphson'
-      - 'PEG'
-      - 'VI'
-      - 'semismooth_newton'
-      
-    For the semismooth newton method, a projection operator (proj) and functions
-    g_func and J_g_func must be provided.
-    
-    Parameters:
-      method : str, default 'root'
-          The solver method.
-      jacobian : callable, optional
-          A user-supplied function to compute the Jacobian.
-      tol : float, default 1e-10
-          Convergence tolerance.
-      max_iter : int, default 100
-          Maximum number of iterations.
-      proj : object, optional
-          Projection operator (must implement .project and .tangent_cone).
-      rho0 : float, default 0.9
-          Parameter for VI/PEG methods.
-      delta : float, default 0.7
-          Parameter for VI/PEG methods.
-      component_slices : list, optional
-          List of slices for partitioning the state (required for some methods).
-      use_autodiff : bool, default False
-          Whether to use automatic differentiation for Jacobian computation.
-      autodiff_mode : str, default 'autograd'
-          Which autodiff backend to use: 'jax' (if available) or 'autograd'.
-      L : float, default 0.9
-          Parameter used in VI line-search.
-      Lmin : float, default 0.3
-          Lower bound parameter in VI line-search.
-      nu : float, default 0.66
-          Factor used in VI line-search.
-      lam : float, default 1.0
-          Parameter used in the semismooth function.
-      g_func : callable, optional
-          Function used in semismooth newton (typically the integrator residual).
-      J_g_func : callable, optional
-          User-provided Jacobian for g_func (if autodiff is not used).
-    """
-    def __init__(self, method='root', jacobian=None, tol=1e-10, max_iter=100,
-                 proj=None, rho0=0.9, delta=0.7, component_slices=None,
-                 use_autodiff=False, autodiff_mode='autograd', L=0.9, Lmin=0.3,
-                 nu=0.66, lam=1.0, g_func=None, J_g_func=None):
+    """Solve F(y)=0 with projection-aware VI or semismooth Newton (fast path)."""
+
+    def __init__(
+        self,
+        method: str = 'semismooth_newton',
+        jacobian=None,
+        tol: float = 1e-10,
+        max_iter: int = 100,
+        proj=None,
+        rho0: float = 0.9,
+        delta: float = 0.7,
+        component_slices=None,
+        use_autodiff: bool = False,
+        autodiff_mode: str = 'numerical',
+        L: float = 0.9,
+        Lmin: float = 0.3,
+        nu: float = 0.66,
+        lam: float = 1.0,
+        sparse: bool | str = 'auto',
+        sparse_threshold: int = 200,
+        linear_solver: str = 'gmres',
+        precond_reuse_steps: int = 5,
+        ilu_drop_tol: float = 1e-4,
+        ilu_fill_factor: float = 10.0,
+        gmres_tol: float = 1e-6,
+        gmres_maxiter: int | None = None,
+        gmres_restart: int | None = None,
+        splu_permc_spec: str = 'COLAMD',
+        ilu_permc_spec: str = 'COLAMD',
+        linear_tol_strategy: str = 'fixed',
+        eisenstat_c: float = 0.5,
+        eisenstat_exp: float = 0.5,
+        adaptive_lam: bool = True,
+        lam_update_strategy: str = 'vi',
+        globalization: str = 'none',
+        ls_c1: float = 1e-4,
+        ls_beta: float = 0.5,
+        ls_min_alpha: float = 1e-8,
+        max_backtracks: int = 15,
+        use_broyden: bool = False,
+        # VI strict per-block Lipschitz enforcement (opt-in)
+        vi_strict_block_lipschitz: bool = True,
+        vi_max_block_adjust_iters: int = 10,
+    ) -> None:
+        if method not in ['VI', 'semismooth_newton']:
+            raise ValueError("Unsupported solver method. Use 'VI' or 'semismooth_newton'.")
         self.method = method
         self.jacobian = jacobian
         self.tol = tol
@@ -83,627 +954,733 @@ class ImplicitEquationSolver:
         self.rho0 = rho0
         self.delta = delta
         self.component_slices = component_slices
-        self.use_autodiff = use_autodiff
-        self.autodiff_mode = autodiff_mode.lower()
+        self.use_autodiff = False
+        self.autodiff_mode = 'numerical'
         self.L = L
         self.Lmin = Lmin
         self.nu = nu
-        self.lam = lam  # Parameter for semismooth function
+        self.lam = lam
 
-        # Require projection and component slices for PEG, VI, and semismooth_newton.
-        if self.method in ['PEG', 'VI'] and self.proj is None:
-            raise ValueError(f"Projection operator 'proj' must be provided for method '{self.method}'.")
-        if self.method in ['PEG', 'VI'] and self.component_slices is None:
-            raise ValueError(f"component_slices must be provided for method '{self.method}'.")
-        if self.method == 'semismooth_newton':
+        # Sparse / linear solver configuration
+        self.sparse = sparse
+        self.sparse_threshold = int(sparse_threshold)
+        self.linear_solver = (linear_solver or 'gmres').lower()
+        self.precond_reuse_steps = max(0, int(precond_reuse_steps))
+        self.ilu_drop_tol = ilu_drop_tol
+        self.ilu_fill_factor = ilu_fill_factor
+        self.gmres_tol = gmres_tol
+        self.gmres_maxiter = gmres_maxiter
+        self.gmres_restart = gmres_restart
+        self.splu_permc_spec = splu_permc_spec
+        self.ilu_permc_spec = ilu_permc_spec
+        self.linear_tol_strategy = (linear_tol_strategy or 'fixed').lower()
+        self.eisenstat_c = float(eisenstat_c)
+        self.eisenstat_exp = float(eisenstat_exp)
+        self.adaptive_lam = bool(adaptive_lam)
+        self.lam_update_strategy = lam_update_strategy or 'vi'
+        self.globalization = (globalization or 'none').lower()
+        if self.globalization not in ('none', 'linesearch'):
+            self.globalization = 'none'
+        self.ls_c1 = float(ls_c1)
+        self.ls_beta = float(ls_beta)
+        self.ls_min_alpha = float(ls_min_alpha)
+        self.max_backtracks = int(max_backtracks)
+
+        # Quasi-Newton (dense)
+        self.use_broyden = bool(use_broyden)
+        self._B = None
+        self._y_prev_broyden = None
+        self._F_prev_broyden = None
+
+        # VI strict block Lipschitz options
+        self.vi_strict_block_lipschitz = bool(vi_strict_block_lipschitz)
+        self.vi_max_block_adjust_iters = int(vi_max_block_adjust_iters)
+
+        # Rho adaptation safeguards (bounds and "stuck" thresholds)
+        # These are conservative defaults; they can be adjusted by users after construction if needed.
+        self.rho_min = 1e-12
+        self.rho_max = 1e6
+        # A component is considered "stuck" if the change is below this absolute threshold times a scale
+        self.stuck_eps_abs = 1e-14
+        # Optional relative scale for stuck detection; set small to avoid false positives on tiny states
+        self.stuck_eps_rel = 1e-12
+
+        # GMRES preconditioner cache
+        self._ilu = None
+        self._ilu_steps_since_build = 0
+        self._last_shape = None
+        self._last_pattern = None
+
+        # Identity caches
+        self._I_cache = {}
+
+        # Basic checks
+        if self.method == 'VI':
             if self.proj is None:
-                raise ValueError("Projection operator 'proj' must be provided for semismooth newton method.")
-            # If g_func or J_g_func are provided, you may store them.
-            if g_func is not None:
-                self.g_func = g_func
-            if J_g_func is not None:
-                self.J_g_func = J_g_func
+                raise ValueError("Projection operator 'proj' must be provided for method 'VI'.")
+            if self.component_slices is None:
+                raise ValueError("component_slices must be provided for method 'VI'.")
+        if self.method == 'semismooth_newton' and self.proj is None:
+            raise ValueError("Projection operator 'proj' must be provided for 'semismooth_newton'.")
 
-        # Set up automatic jacobian if requested.
-        if self.use_autodiff and self.jacobian is None:
-            print(f'JAX_AVAILABLE {JAX_AVAILABLE}')
-            if self.autodiff_mode == 'jax' and JAX_AVAILABLE:
-                self.jacobian = jax.jit(jax.jacfwd(self._func_wrapper))
-            elif self.autodiff_mode == 'autograd' and AUTOGRAD_AVAILABLE:
-                self.jacobian = autograd_jacobian(self._func_wrapper)
-            else:
-                warnings.warn("Requested autodiff backend is not available; falling back to numerical Jacobian.")
-                self.jacobian = None  # Will use numerical approximation later
+        # ---- Bind fast projector dispatchers once (no per-iteration try/except) ----
+        self._bind_projector_fastpaths()
+
+    # ---------- Fastpath binding ----------
+    def _bind_projector_fastpaths(self):
+        """Bind self._project and self._tangent with only the args supported by the projector."""
+        if self.proj is None:
+            self._project = None
+            self._tangent = None
+            return
+
+        def _supports(fn, name):
+            try:
+                return name in inspect.signature(fn).parameters
+            except Exception:
+                return False
+
+        P = self.proj
+        # --- detect what the projector exposes ---
+        has_prev_p = _supports(P.project, 'prev_state')
+        has_step_p = _supports(P.project, 'step_size')
+        has_rhok_p = _supports(P.project, 'rhok')          # keyword form
+        has_rho_p  = _supports(P.project, 'rho')           # positional/keyword form
+        has_t_p    = _supports(P.project, 't')
+        has_Fk_p   = _supports(P.project, 'Fk_val')
+
+        # ---- PROJECT BINDER ----
+        if has_prev_p:
+            def _project(cur, cand, rho, t, Fk, prev):
+                # Only pass parameters the projector actually accepts
+                kw = {}
+                if has_t_p:   kw['t'] = t
+                if has_Fk_p:  kw['Fk_val'] = Fk
+                if has_step_p:
+                    kw['step_size'] = getattr(self, 'prev_step', None)
+                kw['prev_state'] = prev
+
+                if has_rhok_p:
+                    # projector expects keyword rhok
+                    kw['rhok'] = rho
+                    return P.project(cur, cand, **kw)
+                elif has_rho_p:
+                    # projector expects a 'rho' parameter (positional-or-keyword) — pass positionally
+                    return P.project(cur, cand, rho, **kw)
+                else:
+                    # projector doesn't want any stepsize param
+                    return P.project(cur, cand, **kw)
+        else:
+            def _project(cur, cand, rho, t, Fk, prev):
+                kw = {}
+                if has_t_p:   kw['t'] = t
+                if has_Fk_p:  kw['Fk_val'] = Fk
+                if has_step_p:
+                    kw['step_size'] = getattr(self, 'prev_step', None)
+                if has_rhok_p:
+                    kw['rhok'] = rho
+                    return P.project(cur, cand, **kw)
+                elif has_rho_p:
+                    return P.project(cur, cand, rho, **kw)
+                else:
+                    return P.project(cur, cand, **kw)
+
+        self._project = _project
+
+        # ---- TANGENT BINDER (unchanged except we accept both rhok/rho too) ----
+        has_prev_t = _supports(P.tangent_cone, 'prev_state')
+        has_step_t = _supports(P.tangent_cone, 'step_size')
+        has_rhok_t = _supports(P.tangent_cone, 'rhok')
+        has_rho_t  = _supports(P.tangent_cone, 'rho')
+        has_t_t    = _supports(P.tangent_cone, 't')
+        has_Fk_t   = _supports(P.tangent_cone, 'Fk_val')
+
+        if has_prev_t:
+            def _tangent(cand, cur, rho, t, Fk, prev):
+                kw = {}
+                if has_t_t:   kw['t'] = t
+                if has_Fk_t:  kw['Fk_val'] = Fk
+                if has_step_t:
+                    kw['step_size'] = getattr(self, 'prev_step', None)
+                kw['prev_state'] = prev
+                if has_rhok_t:
+                    kw['rhok'] = rho
+                    return P.tangent_cone(cand, cur, **kw)
+                elif has_rho_t:
+                    return P.tangent_cone(cand, cur, rho, **kw)
+                else:
+                    return P.tangent_cone(cand, cur, **kw)
+        else:
+            def _tangent(cand, cur, rho, t, Fk, prev):
+                kw = {}
+                if has_t_t:   kw['t'] = t
+                if has_Fk_t:  kw['Fk_val'] = Fk
+                if has_step_t:
+                    kw['step_size'] = getattr(self, 'prev_step', None)
+                if has_rhok_t:
+                    kw['rhok'] = rho
+                    return P.tangent_cone(cand, cur, **kw)
+                elif has_rho_t:
+                    return P.tangent_cone(cand, cur, rho, **kw)
+                else:
+                    return P.tangent_cone(cand, cur, **kw)
+
+        self._tangent = _tangent
 
 
+    # ---------- Public API ----------
     def _func_wrapper(self, y):
-        """
-        Wrapper to call the user-supplied function.
-        This is used to build the autodiff Jacobian.
-        """
         return self.func(y)
 
     def set_func(self, func):
-        """
-        Set the function F(y) that is to be solved.
-        Attempt to set up autodifferentiation for the Jacobian.
-        If an error occurs (e.g. due to JAX tracer issues), fall back to numerical differentiation.
-        """
         self.func = func
-        if self.use_autodiff and self.jacobian is None:
-            try:
-                if self.autodiff_mode == 'jax' and JAX_AVAILABLE:
-                    # Try to set up JAX autodiff.
-                    self.jacobian = jax.jit(jax.jacfwd(self._func_wrapper))
-                elif self.autodiff_mode == 'autograd' and AUTOGRAD_AVAILABLE:
-                    self.jacobian = autograd_jacobian(self._func_wrapper)
-            except Exception as e:
-                warnings.warn(f"Autodiff backend {self.autodiff_mode} failed with error: {e}. "
-                              "Falling back to numerical Jacobian.")
-                self.jacobian = None
+
+    def set_projection(self, proj):
+        """Allow swapping projector at runtime, with fastpath rebind."""
+        self.proj = proj
+        self._bind_projector_fastpaths()
 
     def solve(self, func, y0):
-        """
-        Solve F(y)=0 for y, starting from initial guess y0.
-        
-        Returns:
-          (y_new, Fk, error, success, iterations)
-        """
         self.set_func(func)
-        if self.method == 'root':
-            return self._solve_with_root(func, y0)
-        elif self.method == 'newton_raphson':
-            return self._solve_with_newton_raphson(func, y0)
-        elif self.method == 'PEG':
-            return self._solve_with_PEG(func, y0)
-        elif self.method == 'VI':
+        if self.method == 'VI':
             return self._solve_with_VI(func, y0)
-        elif self.method == 'semismooth_newton':
-            return self._solve_with_semismooth_newton(func, y0)
-        elif self.method == 'IPRG':
-            return self._solve_with_IPRG(func, y0)
-        elif self.method == 'EGA':
-            return self._solve_with_EGA(func, y0)            
         else:
-            raise ValueError(f"Unknown solver method: {self.method}")
+            return self._solve_with_semismooth_newton(func, y0)
 
-    def _solve_with_root(self, func, y0):
-        sol = root(func, y0, method='hybr')
-        Fk = sol.fun
-        success = sol.success
-        err = np.linalg.norm(Fk)
-        iters = getattr(sol, 'nfev', 1)
-        return (sol.x, Fk, err, success, iters)
-
-    def _solve_with_newton_raphson(self, func, y0):
-        y = y0.copy()
-        for iteration in range(self.max_iter):
-            F = func(y)
-            errF = np.linalg.norm(F, ord=2)
-            if errF < self.tol:
-                return (y, F, errF, True, iteration+1)
-            # Compute Jacobian either via autodiff or numerical finite-differences.
-            if self.jacobian is not None:
-                J = self.jacobian(y)
-            else:
-                J = self._numerical_jacobian(func, y)
-            try:
-                delta_val = np.linalg.solve(J, -F)
-            except np.linalg.LinAlgError:
-                return (y, F, errF, False, iteration+1)
-            y_new = y + delta_val
-            if np.linalg.norm(delta_val, ord=2) < self.tol:
-                F_new = func(y_new)
-                err_new = np.linalg.norm(F_new)
-                return (y_new, F_new, err_new, True, iteration+1)
-            y = y_new
-        F_final = func(y)
-        return (y, F_final, np.linalg.norm(F_final), False, self.max_iter)
+    # ---------------- Semismooth Newton ----------------
+    def _phi(self, y):
+        Fk_val = self.func(y)
+        lam = self.lam
+        tcur = getattr(self, 'current_time', None)
+        prev = getattr(self, 'prev_state', None)
+        proj_val = self._project(y, y - lam * Fk_val, lam, tcur, Fk_val, prev)
+        F = y - proj_val
+        return 0.5 * np.dot(F, F)
 
     def _solve_with_semismooth_newton(self, func, y0):
-        """
-        Modified semismooth Newton method that:
-          1) Evaluates the residual F_in = func(y)
-          2) Forms candidate = y - lam * F_in
-          3) Projects the candidate using proj.project
-          4) Defines the semismooth function F = y - proj(candidate)
-          5) Builds a semismooth Jacobian: J = I - Dproj*(I - lam*J_in)
-          6) Solves J * delta = -F via linear solve.
-        
-        Returns:
-          (projected_solution, F_in, error, success, iterations)
-        """
         y = y0.copy()
         lam = self.lam
         n = len(y)
-        I = np.eye(n)
-        # Track initial residual for relative tolerance
-        # initial_res = np.linalg.norm(func(y))
-        
-        for iteration in range(self.max_iter):
-            F_in = func(y)  # Evaluate residual
-            candidate = y - lam * F_in  # Full Newton candidate
-            proj_z = self.proj.project(y, candidate, rhok=None)  # Apply projection
-            F = y - proj_z  # Semismooth function
-            errF = np.linalg.norm(F)
+
+        # Decide sparse path once (dimension doesn't change within a solve)
+        sparse_active = self._sparse_active(n)
+        if sparse_active:
+            I = self._I_cache.get(("csr", n))
+            if I is None:
+                I = sp.eye(n, format='csr')
+                self._I_cache[("csr", n)] = I
+        else:
+            I = self._I_cache.get(n)
+            if I is None:
+                I = np.eye(n)
+                self._I_cache[n] = I
+
+        # Buffers
+        candidate = np.empty_like(y)
+        proj_z = np.empty_like(y)
+        F_buf = np.empty_like(y)
+
+        # Reset Broyden state
+        if self.use_broyden:
+            self._B = None
+            self._y_prev_broyden = None
+            self._F_prev_broyden = None
+
+        for iteration in range(1, self.max_iter + 1):
+            # cache context once per iteration
+            tcur = getattr(self, 'current_time', None)
+            prev = getattr(self, 'prev_state', None)
+
+            # Optional adaptive lam
+            if self.adaptive_lam and self.lam_update_strategy == 'vi':
+                try:
+                    lam = self._update_rho(func, y, lam)
+                    self.lam = lam
+                except Exception:
+                    pass
+
+            F_in = func(y)
+            self.last_Fk_val = F_in  # cheap attribute write
+
+            # candidate = y - lam F(y)
+            np.subtract(y, lam * F_in, out=candidate)
+
+            # projection (fastpath)
+            proj_val = self._project(y, candidate, lam, tcur, F_in, prev)
+            proj_z[:] = proj_val
+
+            # F_buf = y - proj_z
+            np.subtract(y, proj_z, out=F_buf)
+            errF = np.linalg.norm(F_buf)
             if errF < self.tol:
-                return (proj_z, F_in, errF, True, iteration+1)
-            # Compute derivative of the residual (J_in) via autodiff or finite differences.
-            if self.jacobian is not None:
-                J_in = self.jacobian(y)
+                y[:] = proj_z
+                F_y = func(y)
+                return (y.copy(), F_y, errF, True, iteration)
+
+            # Inner Jacobian
+            used_broyden = False
+            if self.use_broyden and not sparse_active:
+                if self._B is not None and self._y_prev_broyden is not None and self._F_prev_broyden is not None:
+                    s_vec = y - self._y_prev_broyden
+                    y_vec = F_in - self._F_prev_broyden
+                    denom = float(np.dot(s_vec, s_vec))
+                    if np.isfinite(denom) and denom > 0.0:
+                        Bs = self._B @ s_vec
+                        corr = (y_vec - Bs) / denom
+                        self._B = self._B + np.outer(corr, s_vec)
+                if self._B is None:
+                    if self.jacobian is not None:
+                        B0 = self.jacobian(y)
+                    else:
+                        B0 = self._numerical_jacobian(func, y, sparse=False)
+                    if sp.issparse(B0):
+                        B0 = B0.toarray()
+                    self._B = B0
+                J_in = self._B
+                used_broyden = True
             else:
-                J_in = self._numerical_jacobian(func, y)
-            # Get derivative of the projection: tangent cone matrix.
-            Dproj = self.proj.tangent_cone(candidate, proj_z)
-            J = I - Dproj @ (I - lam * J_in)
-            try:
-                delta = np.linalg.solve(J, -F)
-            except np.linalg.LinAlgError:
-                return (y, F, errF, False, iteration+1)
-            y_new = y + delta
-            # if np.linalg.norm(delta) < self.tol:
-            #     F_new = func(y_new)
-            #     candidate_new = y_new - lam * F_new
-            #     proj_new = self.proj.project(y_new, candidate_new, rhok=None)
-            #     F_smooth = y_new - proj_new
-            #     err_new = np.linalg.norm(F_smooth)
-            #     return (proj_new, F_new, err_new, True, iteration+1)
-            y = y_new
-        return (proj_z, F_in, errF, False, self.max_iter)
-
-    # def _solve_with_PEG(self, func, y0):
-    #     x = y0.copy()
-    #     x_ = y0.copy()
-    #     Fx = func(x)
-    #     k = 1
-    #     success = False
-    #     con = self.delta + self.delta**2
-    #     num_comps = len(self.component_slices)
-    #     rhok = np.full(num_comps, self.rho0)
-    #     thetak_minus1 = np.ones(num_comps)
-    #     y_new = x.copy()
-    #     while k <= self.max_iter:
-    #         adjustment = np.zeros_like(x)
-    #         for i, sl in enumerate(self.component_slices):
-    #             adjustment[sl] = rhok[i] * Fx[sl]
-    #         y_new = self.proj.project(x, x_ - adjustment, rhok)
-    #         Fy = func(y_new)
-            
-    #         for i, sl in enumerate(self.component_slices):
-    #             diff_y = y_new[sl] - x[sl]
-    #             diff_f = Fy[sl] - Fx[sl]
-    #             ndy2 = np.dot(diff_y, diff_y)
-    #             ndf2 = np.dot(diff_f, diff_f)
-    #             if ndf2 >=  1e-12 and ndy2 >=1e-12:
-    #                 temp = thetak_minus1[i] / (4 * rhok[i] * self.delta)
-    #                 lambda_candidate = temp * (ndy2 / ndf2)
-    #                 rho_k_new = min(con * rhok[i], lambda_candidate)
-    #             else:
-    #                 rho_k_new = rhok[i]
-
-
-    #             denom_val =  rhok[i] * self.delta
-    #             thetak = rho_k_new / (rhok[i] * self.delta)
-    #             thetak_minus1[i] = thetak
-
-    #             if np.abs(denom_val) < 1e-12 or np.isnan(denom_val) or np.isnan(thetak_minus1[i]):
-    #                 print(f"At iteration {k}, index {i}: thetak_minus1 = {thetak_minus1[i]}, denominator = {denom_val}, ndy2: {ndy2}, rho value: {rhok[i]}")
-    #             rhok[i] = max(rho_k_new,1e-12)
-    #         for i, sl in enumerate(self.component_slices):
-    #             x_[sl] = (1 - self.delta) * y_new[sl] + self.delta * x_[sl]
-    #         err_local = 0.0
-    #         for sl in self.component_slices:
-    #             denom = np.linalg.norm(y_new[sl]) + 1e-10
-    #             err_local = max(err_local, np.linalg.norm(y_new[sl] - x[sl]) / denom)
-    #         if err_local < self.tol:
-    #             success = True
-    #             break
-    #         # if success == False:
-    #         #     return  (y0, func(y0), err_local, success, k)
-    #         x = y_new.copy()
-    #         Fx = Fy.copy()
-    #         k += 1
-    #     return (y_new, Fy, err_local, success, k)
-
-
-    def _solve_with_PEG(self, func, y0):
-        """
-        PEG method with a single (global) rhok for all slices, 
-        and an error measure scaled by sqrt(N).
-
-        Returns:
-            (y_new, Fy, err_local, success, iterations)
-        """
-        # Initialization
-        x = y0.copy()
-        x_ = y0.copy()
-        Fx = func(x)                      # initial residual
-        k = 1
-        success = False
-
-        # For the step-size adaptation
-        con = self.delta + self.delta**2  # e.g. delta=0.7 => con=1.19
-        rhok = self.rho0                  # single scalar
-        thetak_minus1 = 1.0
-
-        y_new = x.copy()
-        
-        # Precompute normalizing factor for the error measure
-        # or compute each iteration if problem size might change
-        Nsqrt = np.sqrt(x.size)
-
-        while k <= self.max_iter:
-            # 1) Weighted step for the entire vector
-            adjustment = rhok * Fx
-            
-            # If self.proj.project expects an array for rhok, make one of length #slices
-            # (each slice sees the same rhok).
-            # If your 'projection' is fine with a scalar, just pass rhok directly.
-            big_rhok = np.full(len(self.component_slices), rhok)
-
-            # 2) Projection
-            y_new = self.proj.project(x, x_ - adjustment, big_rhok)
-            Fy = func(y_new)
-
-            # 3) Single scalar step-size update logic
-            diff_y = y_new - x
-            diff_f = Fy - Fx
-            ndy2 = np.dot(diff_y, diff_y)
-            ndf2 = np.dot(diff_f, diff_f)
-
-            if (ndf2 >= 1e-12):
-                temp = thetak_minus1 / (4.0 * rhok * self.delta)
-                lambda_candidate = temp * (ndy2 / ndf2)
-                rhok_new = min(con * rhok, lambda_candidate)
-            else:
-                rhok_new = rhok
-
-            thetak = rhok_new / (rhok * self.delta)
-            thetak_minus1 = thetak
-            
-            # safeguard
-            rhok = max(rhok_new, 1e-12)
-
-            # 4) Momentum update for x_
-            x_ = (1.0 - self.delta)*y_new + self.delta*x_
-
-            # 5) Convergence check
-            # If you want the same style as your other methods 
-            # but scale by sqrt(N) so that errors don't scale with dimension:
-            err_local = np.linalg.norm(y_new - x) / Nsqrt
-
-            if err_local < self.tol:
-                success = True
-                break
-
-            # prepare for next iteration
-            x = y_new.copy()
-            Fx = Fy.copy()
-            k += 1
-
-        return (y_new, Fy, err_local, success, k)
-
-
-    def _solve_with_EGA(self, func, y0):
-        """
-        EG–Anderson(1) method, implementing precisely the steps from the
-        snippet:
-
-        Algorithm 1: EG–Anderson(1):
-        1) Initialization: 
-            - choose x0 in Omega
-            - omega >= 0, gamma > 0, tau > 1/2, rho, mu in (0,1)
-            - sigma0 = 1, M >= 1
-            - a sufficiently large M>0
-            For k=0,1,2... do:
-
-        Step 1: compute F_y(xk) = P( xk, xk - gamma * H(xk), gamma ) - xk
-                if F_y(xk)=0 => stop
-                otherwise set tk = gamma, go to step2
-        Step 2: yk+0.5 = P( xk, xk - tk * H(xk), tk )
-                yk+1   = P( xk, xk - tk * H( yk+0.5 ), tk )
-                if    tk * <H(yk+0.5)-H(xk),  yk+0.5 - yk+1>
-                        <= mu/2 ( ||xk-yk+0.5||^2 + ||yk+0.5-yk+1||^2 )
-                        => go step3
-                else  tk = rho * tk, repeat step2
-        Step 3: F_tk(xk)     = yk+0.5 - xk
-                Ftilde_tk(xk)= yk+1 - xk
-                if ||Ftilde_tk|| < min( ||F_tk||, omega*sigma_k^(-tau) ) 
-                    => alpha_k=  <Ftilde, Ftilde-F_tk>/||Ftilde-F_tk||^2
-                else alpha_k= M+1
-        Step 4: if |alpha_k|<=M => x_{k+1}= alpha_k * xk + (1-alpha_k)*yk+1
-                                        sigma_{k+1}= sigma_k+1
-                else => x_{k+1}= yk+1
-                        sigma_{k+1}= sigma_k
-        (end for)
-
-        We treat "H(x)" as your 'func(x)'. The projection is done via self.proj.project(...).
-
-        Returns
-        -------
-        (x_final, F_res, err, success, iterations)
-        where F_res = P(...) - x_final, the final residual
-        """
-        import numpy as np
-
-        max_iter = self.max_iter
-        tol      = self.tol
-
-        # -------------- Retrieve or default the needed parameters --------------
-        # The snippet uses parameters:
-        #   gamma  > 0   (the initial step-size, or line-search base)
-        #   rho    in (0,1) (backtracking scale)
-        #   mu     in (0,1) (the line-search acceptance parameter)
-        #   tau    > 1/2
-        #   omega  >= 0
-        #   sigma0 = 1
-        #   M >= 1
-        # You can store them in the solver or pass them via solver_opts.
-        gamma  = getattr(self, "gamma", 0.1)  # or from self.solver_opts
-        rho    = getattr(self, "rho",   0.8)
-        mu     = getattr(self, "mu",    0.5)
-        tau    = getattr(self, "tau",   0.6)
-        omega  = getattr(self, "omega", 30.0)
-        M      = getattr(self, "M",     5000)
-
-        # Initialize
-        xk     = y0.copy()
-        sigma_k= 1.0  # per snippet: sigma0=1
-        iteration=0
-        success = False
-
-        # -------------- Step 1: compute F_y(xk) = P(...) - xk --------------
-        def F_y(x):
-            # projection = POmega(xk - gamma * H(xk))
-            proj_x = self.proj.project(x, x - gamma*func(x), gamma)
-            return proj_x - x
-
-        Fy_k = F_y(xk)
-        err  = np.linalg.norm(Fy_k)
-        if err < tol:
-            # done immediately
-            return (xk, func(xk), err, True, iteration)
-
-        # main loop
-        while iteration < max_iter:
-            iteration += 1
-
-            # # Step1 re-check: if Fy_k=0 => done
-            # if err < tol:
-            #     success = True
-            #     break
-
-            # Otherwise set tk= gamma, go to Step2
-            tk = gamma
-
-            # Step2: do a small backtracking loop
-            #   yk+0.5= P( xk, xk - tk*H(xk), tk )
-            #   yk+1  = P( xk, xk - tk*H(yk+0.5), tk )
-            #   check condition (3.1):
-            #    tk * < H(yk+0.5)-H(xk),  yk+0.5-yk+1 >
-            #    <= mu/2 ( ||xk-yk+0.5||^2 + ||yk+0.5-yk+1||^2 )
-            backtrack_ok = False
-            max_backtrack=20000
-
-            for _ in range(max_backtrack):
-                # yk+0.5
-                y_half = self.proj.project(xk, xk - tk*func(xk), tk)
-                # yk+1
-                y_next = self.proj.project(xk, xk - tk*func(y_half), tk)
-
-                # condition (3.1)
-                lhs_vec = func(y_half) - func(xk)
-                lhs     = tk * np.dot(lhs_vec, (y_half - y_next))
-                # the right side
-                rside= 0.5*mu*( np.linalg.norm(xk - y_half)**2
-                                + np.linalg.norm(y_half - y_next)**2 )
-                if lhs <= rside:
-                    backtrack_ok= True
-                    break
+                if self.jacobian is not None:
+                    J_in = self.jacobian(y)
                 else:
-                    tk = rho*tk
+                    J_in = self._numerical_jacobian(func, y, sparse=sparse_active)
 
-            # if we never satisfied => proceed with minimal tk
-            if not backtrack_ok:
-                y_half = self.proj.project(xk, xk - tk*func(xk), tk)
-                y_next = self.proj.project(xk, xk - tk*func(y_half), tk)
+            # Eisenstat–Walker tol for GMRES if enabled
+            rtol_dyn = self.gmres_tol
+            if self.linear_solver == 'gmres' and self.linear_tol_strategy != 'fixed':
+                eta = min(0.5, self.eisenstat_c * (errF ** self.eisenstat_exp))
+                rtol_dyn = max(self.gmres_tol, eta)
 
-            # Step3: define F_tk(xk), Ftilde_tk(xk)
-            F_tk      = y_half - xk     # (yk+0.5 - xk)
-            Ftilde_tk = y_next - xk     # (yk+1 - xk)
-
-            normF    = np.linalg.norm(F_tk)
-            normFtld = np.linalg.norm(Ftilde_tk)
-
-            # condition => if ||Ftilde_tk|| < min( ||F_tk||,  omega*sigma_k^-tau )
-            #   alpha_k= <Ftilde_tk, Ftilde_tk-F_tk> / || Ftilde_tk-F_tk||^2
-            # else alpha_k= M+1
-            alpha_k = M+1  # default
-            # check if normFtld < min(normF,  omega*(sigma_k^(-tau)) )
-            if normFtld < min( normF, omega*(sigma_k**(-tau)) ):
-                # alpha_k= <Ftilde_tk, (Ftilde_tk - F_tk)> / ||Ftilde_tk - F_tk||^2
-                diff = Ftilde_tk - F_tk
-                denom= np.dot(diff, diff)
-                if denom > 1e-15:  # avoid zero division
-                    alpha_k= np.dot(Ftilde_tk, diff)/ denom
-
-            # Step4:
-            # if |alpha_k| <= M => x_{k+1}= alpha_k xk + (1-alpha_k) yk+1, sigma_{k+1}= sigma_k+1
-            # else => x_{k+1}= yk+1, sigma_{k+1}= sigma_k
-            if abs(alpha_k) <= M:
-                xkp1 = alpha_k*xk + (1.0-alpha_k)*y_next
-                sigma_new= sigma_k+1
+            if sparse_active:
+                J_in = self._to_csr(J_in)
+                Dproj = self._to_csr(self._tangent(candidate, y, lam, tcur, F_in, prev), n)
+                J = (I - Dproj) + lam * (Dproj @ J_in)
+                rhs = -F_buf
+                delta, ok = self._solve_linear_sparse(J, rhs, rtol=rtol_dyn, pattern_hint=J.nnz)
+                if not ok:
+                    return (y, F_in, errF, False, iteration)
             else:
-                xkp1= y_next
-                sigma_new= sigma_k
+                Dproj = self._tangent(candidate, y, lam, tcur, F_in, prev)
+                if sp.issparse(Dproj):
+                    Dproj = Dproj.toarray()
+                if sp.issparse(J_in):
+                    J_in = J_in.toarray()
+                J = I - Dproj + lam * (Dproj @ J_in)
+                try:
+                    delta = np.linalg.solve(J, -F_buf)
+                except np.linalg.LinAlgError:
+                    return (y, F_in, errF, False, iteration)
 
-            # update xk => xkp1
-            xk = xkp1
-            sigma_k= sigma_new
+            # Globalization (optional)
+            if self.globalization == 'linesearch':
+                phi0 = 0.5 * errF * errF
+                grad_dir = -errF * errF
+                alpha = 1.0
+                backtracks = 0
 
-            # compute final residual for next iteration
-            # Fy_k= self.proj.project(xk, xk - gamma*func(xk), gamma) - xk
-            temp = self.proj.project(xk, xk - func(xk), gamma/gamma)
-            err = np.linalg.norm(xk -temp )
-            if err < tol:
-                xk = temp
-                success= True
-                break
+                y_trial = y + alpha * delta
+                phi_trial = self._phi(y_trial)
+                while (phi_trial > phi0 + self.ls_c1 * alpha * grad_dir
+                       and backtracks < self.max_backtracks
+                       and alpha > self.ls_min_alpha):
+                    alpha *= self.ls_beta
+                    y_trial = y + alpha * delta
+                    phi_trial = self._phi(y_trial)
+                    backtracks += 1
 
-        # End while
-        return (xk, func(xk), err, success, iteration)
-
-
-    def _solve_with_IPRG(self, func, y0):
-        """
-        Inertial Projected Reflected Gradient (IPRG) method.
-
-        Implements the steps:
-
-          Given x_{-1}, x0, lam0 > 0, theta in [0, 1/7], and mu in (0, mu-bar):
-
-            1) w_n = x_n + theta * (x_n - x_{n-1})
-               y_n = 2*x_n - x_{n-1}
-               x_{n+1} = P_C( w_n - lam_n * A(y_n) )
-
-               if w_n == y_n == x_{n+1}, stop
-
-            2) dot_n = < A(y_n) - A(y_{n-1}), y_n - x_{n+1} >
-               if dot_n <= 0:
-                   lam_{n+1} = lam_n
-               else:
-                   rho_n = sqrt( 2||y_{n-1} - x_n||^2
-                                 + (2+sqrt{2})||x_n - y_n||^2
-                                 + 2||x_{n+1} - y_n||^2 )
-                   lam_{n+1} = min( mu_iprg * rho_n / dot_n, lam_n )
-
-            3) n <- n+1, go to 1)
-
-        We interpret 'func' as the operator A(\cdot).
-        We use 'self.proj.project(...)' for the projection P_C.
-
-        Returns
-        -------
-        (x_final, Fk, err, success, iterations)
-
-        where:
-          - x_final = x_{n+1} upon termination
-          - Fk = func(x_final)
-          - err = final || x_{n+1} - x_n ||
-          - success = bool
-          - iterations = number of iterations performed
-        """
-
-        # We need an initial x_{-1} and x_0.
-        # If the user only gives one guess y0, we will just set x_{-1} = x_0 = y0
-        x_m1 = y0.copy()  # x_{-1}
-        x_n  = y0.copy()  # x_0
-
-        # lam_n  = self.lam0     # initial lambda_0
-        # theta  = self.theta    # inertial param
-        # mu_val = self.mu_iprg  # "mu" in the paper
-        # Initialize parameters (θ, μ, λ₀)
-        theta = (0.99 / 7) #self.theta if self.theta is not None else (0.99 / 7)
-        lam_n = 1.0 #self.lambda0  # λ₀ = 1.0
-        mu_bar = (1 - 7 * theta) / (4 + 2 * np.sqrt(2))  # μ̄ formula
-        mu_val = 0.99 * mu_bar #self.mu if self.mu is not None else 0.99 * mu_bar
-
-        # We'll store y_{n-1} = 2*x_{n-1} - x_{n-2}, but for the first iteration
-        # we do not have x_{n-2}. We'll just skip the dot-product step the very first time.
-        # We keep track of y_old = y_{n-1}, A(y_old) from the previous iteration.
-        y_old = None
-        Ay_old = None
-
-        success = False
-        for iteration in range(1, self.max_iter+1):
-            # Step 1: form w_n, y_n
-            w_n = x_n + theta*(x_n - x_m1)
-            y_n = 2.0*x_n - x_m1
-
-            # compute the candidate
-            A_y_n = func(y_n)
-            x_np1 = self.proj.project(w_n, w_n - lam_n*A_y_n, lam_n)
-
-            # Check the "stop if w_n == y_n == x_{n+1}" in a numerical sense:
-            if (np.allclose(w_n, y_n, rtol=1e-12, atol=1e-15)
-                and np.allclose(y_n, x_np1, rtol=1e-12, atol=1e-15)):
-                success = True
-                break
-
-            # Step 2: update lambda_{n+1}, but only if we have y_{n-1}
-            # i.e. only if iteration >= 2
-            if y_old is not None:
-                # dot_n = < A(y_n) - A(y_{n-1}), y_n - x_{n+1} >
-                diff_Ay = A_y_n - Ay_old
-                diff_yx = y_n - x_np1
-                dot_n = np.dot(diff_Ay, diff_yx)
-
-                if dot_n <= 0.0:
-                    lam_next = lam_n
+                if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir:
+                    if self.use_broyden and not sparse_active:
+                        self._y_prev_broyden = y.copy()
+                        self._F_prev_broyden = F_in.copy()
+                    y = y_trial
                 else:
-                    # Compute rho_n
-                    #   rho_n = sqrt( 2||y_{n-1}-x_n||^2 + (2+sqrt{2})||x_n-y_n||^2
-                    #                 + 2||x_{n+1}-y_n||^2 )
-                    term1 = 2.0*np.linalg.norm(y_old - x_n)**2
-                    term2 = (2.0+np.sqrt(2.0))*np.linalg.norm(x_n - y_n)**2
-                    term3 = 2.0*np.linalg.norm(x_np1 - y_n)**2
-                    rho_n =term1 + term2 + term3
-                    lam_next = min(mu_val * rho_n / dot_n, lam_n)
+                    # Steepest descent fallback
+                    if sp.issparse(J):
+                        grad_phi = J.T.dot(F_buf)
+                    else:
+                        grad_phi = J.T @ F_buf
+                    nrm_g = np.linalg.norm(grad_phi)
+                    if nrm_g == 0.0:
+                        return (y, F_in, errF, False, iteration)
+                    delta_g = -grad_phi
+                    grad_dir = -nrm_g * nrm_g
+
+                    alpha = 1.0
+                    backtracks = 0
+                    y_trial = y + alpha * delta_g
+                    phi_trial = self._phi(y_trial)
+
+                    while (phi_trial > phi0 + self.ls_c1 * alpha * grad_dir
+                           and backtracks < self.max_backtracks
+                           and alpha > self.ls_min_alpha):
+                        alpha *= self.ls_beta
+                        y_trial = y + alpha * delta_g
+                        phi_trial = self._phi(y_trial)
+                        backtracks += 1
+
+                    if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir:
+                        if self.use_broyden and not sparse_active:
+                            self._y_prev_broyden = y.copy()
+                            self._F_prev_broyden = F_in.copy()
+                        y = y_trial
+                    else:
+                        return (y, F_in, errF, False, iteration)
             else:
-                # No update if it's the very first iteration
-                lam_next = lam_n
+                if self.use_broyden and not sparse_active:
+                    self._y_prev_broyden = y.copy()
+                    self._F_prev_broyden = F_in.copy()
+                np.add(y, delta, out=y)
 
-            # Step 3: shift indices:
-            #   x_{-1} <- x_n
-            #   x_n    <- x_{n+1}
-            #   y_{n-1} <- y_n, etc.
-            x_m1 = x_n
-            x_n  = x_np1
-            y_old   = y_n
-            Ay_old  = A_y_n
-            lam_n   = lam_next
+        # Out of iterations
+        F_in = func(y)
+        self.last_Fk_val = F_in
+        tcur = getattr(self, 'current_time', None)
+        prev = getattr(self, 'prev_state', None)
+        errF = np.linalg.norm(y - self._project(y, y - lam * F_in, lam, tcur, F_in, prev))
+        return (y, F_in, errF, False, self.max_iter)
 
-            # Check for convergence in the usual sense:
-            err = np.linalg.norm(x_n - x_m1)
-            if err < self.tol:
-                success = True
-                break
-
-        # End of loop
-        Fk = func(x_n)
-        # final error measure
-        err_final = np.linalg.norm(x_n - x_m1)
-
-        return (x_n, Fk, err_final, success, iteration)
-
+    # ---------------- VI (projected fixed-point) ----------------
     def _solve_with_VI(self, func, y0):
         k = 0
         yk = y0.copy()
+        n=yk.size
+        
         rho = self.rho0
+        tcur = getattr(self, 'current_time', None)
+        prev = getattr(self, 'prev_state', None)
+
         Fk_val = func(yk)
-        y_proj = self.proj.project(yk, yk - rho * Fk_val, rho)
+        self.last_Fk_val = Fk_val
+        y_proj = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
         err = np.linalg.norm(yk - y_proj)
+
         while err > self.tol and k < self.max_iter:
             rho = self._update_rho(func, yk, rho)
+            tcur = getattr(self, 'current_time', None)
+            prev = getattr(self, 'prev_state', None)
+
             Fk_val = func(yk)
-            yk1 = self.proj.project(yk, yk - rho * Fk_val, rho)
+            self.last_Fk_val = Fk_val
+            yk1 = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
+
             Fk_val_1 = func(yk1)
-            err = np.linalg.norm(yk1 - self.proj.project(yk1, yk1 - rho * Fk_val_1, rho))
+            err = np.linalg.norm(yk1 - self._project(yk1, yk1 - rho * Fk_val_1, rho, tcur, Fk_val_1, prev))/math.sqrt(n)
             yk = yk1
             k += 1
+
         success = (err <= self.tol)
         return (yk, func(yk), err, success, k)
 
+    # def _solve_with_VI(self, func, y0):
+    #     def _sanitize_rho(rho_in, *, context="init"):
+    #         """Ensure rho (scalar or array) is finite, positive, and within [rho_floor, rho_ceil].
+    #         If non-finite values are found, reset them to a safe default (self.rho0 or 1.0) then clip.
+    #         Returns sanitized rho with same type/shape semantics (scalar or ndarray).
+    #         """
+    #         debug_local = bool(getattr(self, 'debug_vi', False))
+    #         if np.isscalar(rho_in):
+    #             r = float(rho_in)
+    #             if not np.isfinite(r) or r <= 0.0:
+    #                 base = self.rho0 if (np.isscalar(self.rho0) and np.isfinite(self.rho0) and self.rho0 > 0) else 1.0
+    #                 if debug_local:
+    #                     print(f"[VI] rho sanitize ({context}): scalar reset from {r} to {base}")
+    #                 r = float(base)
+    #             r = float(np.clip(r, self.rho_min, self.rho_max))
+    #             return r
+    #         else:
+    #             arr = np.asarray(rho_in, dtype=float)
+    #             reset_mask = ~np.isfinite(arr) | (arr <= 0.0)
+    #             if np.any(reset_mask):
+    #                 base = self.rho0
+    #                 if not (np.isscalar(base) and np.isfinite(base) and base > 0):
+    #                     base = 1.0
+    #                 if debug_local:
+    #                     bad_vals = arr[reset_mask]
+    #                     print(f"[VI] rho sanitize ({context}): resetting {bad_vals.size} entries (e.g., {bad_vals[:3]}) to {base}")
+    #                 arr[reset_mask] = float(base)
+    #             # clip to bounds
+    #             np.clip(arr, self.rho_min, self.rho_max, out=arr)
+    #             return arr
+
+    #     # Helper: block-wise relative L2 of natural residual r = (y - P(y - rho F(y)))
+    #     def _rel_block_l2(r, y, slices):
+    #         if slices is not None:
+    #             vals = []
+    #             for s in slices:
+    #                 rs, ys = r[s], y[s]
+    #                 n  = max(1, rs.size)
+    #                 nr = np.linalg.norm(rs) / math.sqrt(n)   # RMS of residual
+    #                 ny = np.linalg.norm(ys) / math.sqrt(n)   # RMS of state
+    #                 vals.append(nr / (1.0 + ny))
+    #             return max(vals) if vals else 0.0
+    #         else:
+    #             n  = max(1, r.size)
+    #             nr = np.linalg.norm(r) / math.sqrt(n)
+    #             ny = np.linalg.norm(y) / math.sqrt(n)
+    #             return nr / (1.0 + ny)
+
+
+    #     # Expand block-wise rho (length = number of component_slices) to a per-index vector (length = n)
+    #     def _expand_rho_to_vec(rho_in, n, slices):
+    #         # scalar -> full vector
+    #         if np.isscalar(rho_in):
+    #             return float(rho_in) * np.ones(n, dtype=float)
+    #         arr = np.asarray(rho_in, dtype=float)
+    #         if arr.ndim == 0:
+    #             return float(arr) * np.ones(n, dtype=float)
+    #         if arr.size == n:
+    #             return arr.astype(float, copy=False)
+    #         if slices is not None and arr.size == len(slices):
+    #             vec = np.empty(n, dtype=float)
+    #             for v, s in zip(arr, slices):
+    #                 vec[s] = float(v)
+    #             return vec
+    #         # Fallback: broadcast mean
+    #         return float(np.mean(arr)) * np.ones(n, dtype=float)
+
+    #     # Initialize block rho from last solve (if available). If scalar, broadcast to blocks when slices exist.
+    #     def _init_block_rho():
+    #         last = getattr(self, 'rho_last', self.rho0)
+    #         slices = self.component_slices
+    #         if slices is None:
+    #             return float(last) if np.isscalar(last) else float(np.mean(np.asarray(last, dtype=float)))
+    #         m = len(slices)
+    #         if np.isscalar(last):
+    #             return np.full(m, float(last), dtype=float)
+    #         arr = np.asarray(last, dtype=float).reshape(-1)
+    #         if arr.size == m:
+    #             return arr.copy()
+    #         return np.full(m, float(np.mean(arr)), dtype=float)
+
+    #     k = 0
+    #     yk = y0.copy()
+    #     debug = bool(getattr(self, 'debug_vi', False))
+
+    #     # Use per-block rho when component_slices is defined; otherwise scalar
+    #     if self.component_slices is not None and len(self.component_slices) > 0:
+    #         rho = _init_block_rho()  # shape (n_blocks,)
+    #     else:
+    #         rho = float(getattr(self, 'rho_last', self.rho0))
+    #     # Sanitize initial rho and persist immediately so bad values don't leak into next solves
+    #     rho = _sanitize_rho(rho, context="init")
+    #     self.rho_last = rho
+    #     tcur = getattr(self, 'current_time', None)
+    #     prev = getattr(self, 'prev_state', None)
+    #     if debug:
+    #         if self.component_slices is not None and len(self.component_slices) > 0:
+    #             print(f"[VI] init: blocks={len(self.component_slices)} rho={rho}")
+    #         else:
+    #             print(f"[VI] init: scalar rho={rho:.3e}")
+
+    #     Fk_val = func(yk)
+    #     self.last_Fk_val = Fk_val
+    #     # Candidate uses per-index scaling; projector receives block-level rho when available
+    #     rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+    #     # Guard against non-finite rho_vec
+    #     if not np.all(np.isfinite(rho_vec)):
+    #         rho = _sanitize_rho(rho, context="expand-init")
+    #         rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+    #     candidate = yk - rho_vec * Fk_val
+    #     if not np.all(np.isfinite(candidate)):
+    #         # Reduce rho and try once more
+    #         rho = _sanitize_rho(rho * 0.1 if np.isscalar(rho) else rho * 0.1, context="candidate-init")
+    #         rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+    #         candidate = yk - rho_vec * Fk_val
+    #     y_proj = self._project(yk, candidate, rho, tcur, Fk_val, prev)
+
+    #     # Block-wise L2 natural residual at yk
+    #     r0 = (yk - y_proj)
+    #     err = _rel_block_l2(r0, yk, self.component_slices)
+    #     if not np.isfinite(err):
+    #         # If projection resulted in non-finite error, reset rho to safe value and recompute once
+    #         rho = _sanitize_rho(self.rho0 if np.isfinite(self.rho0) else 1.0, context="err-init-reset")
+    #         rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+    #         candidate = yk - rho_vec * Fk_val
+    #         y_proj = self._project(yk, candidate, rho, tcur, Fk_val, prev)
+    #         r0 = (yk - y_proj)
+    #         err = _rel_block_l2(r0, yk, self.component_slices)
+    #     if debug:
+    #         print(f"[VI] k={k} err={err:.3e}")
+
+    #     while err > self.tol and k < self.max_iter:
+    #         # Project with current rho
+    #         tcur = getattr(self, 'current_time', None)
+    #         prev = getattr(self, 'prev_state', None)
+
+    #         Fk_val = func(yk)
+    #         self.last_Fk_val = Fk_val
+    #         rho = _sanitize_rho(rho, context="iter-pre")
+    #         rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+    #         candidate = yk - rho_vec * Fk_val
+    #         if not np.all(np.isfinite(candidate)):
+    #             rho = _sanitize_rho(rho * 0.5 if np.isscalar(rho) else rho * 0.5, context="iter-candidate")
+    #             rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+    #             candidate = yk - rho_vec * Fk_val
+    #         yk1 = self._project(yk, candidate, rho, tcur, Fk_val, prev)
+
+    #         # Evaluate at new point and compute residual for error
+    #         Fk_val_1 = func(yk1)
+    #         rho = _sanitize_rho(rho, context="iter-post-proj")
+    #         rho_vec = _expand_rho_to_vec(rho, len(yk1), self.component_slices)
+    #         proj_candidate = yk1 - rho_vec * Fk_val_1
+    #         proj_yk1 = self._project(yk1, proj_candidate, rho, tcur, Fk_val_1, prev)
+
+    #         # Block-wise L2 natural residual at yk1
+    #         r1 = (yk1 - proj_yk1)
+    #         err = _rel_block_l2(r1, yk1, self.component_slices)
+    #         if not np.isfinite(err):
+    #             if debug:
+    #                 print(f"[VI] non-finite err encountered; shrinking rho and retrying one step")
+    #             rho = _sanitize_rho(rho * 0.5 if np.isscalar(rho) else rho * 0.5, context="iter-err-reset")
+    #             rho_vec = _expand_rho_to_vec(rho, len(yk1), self.component_slices)
+    #             proj_candidate = yk1 - rho_vec * Fk_val_1
+    #             proj_yk1 = self._project(yk1, proj_candidate, rho, tcur, Fk_val_1, prev)
+    #             r1 = (yk1 - proj_yk1)
+    #             err = _rel_block_l2(r1, yk1, self.component_slices)
+
+    #         # Update rho per block
+    #         if self.component_slices is not None and len(self.component_slices) > 0:
+    #             rb = np.asarray(rho, dtype=float).copy()
+    #             if self.vi_strict_block_lipschitz:
+    #                 # Strict component-wise Lipschitz enforcement with re-projections
+    #                 yk_current = yk1.copy()
+    #                 Fk_current = Fk_val_1.copy()
+    #                 for i, s in enumerate(self.component_slices):
+    #                     # Stuck detection for this block relative to yk
+    #                     den_initial = np.linalg.norm(yk_current[s] - yk[s])
+    #                     stuck_thresh = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + np.linalg.norm(yk[s]))
+    #                     if den_initial < stuck_thresh:
+    #                         continue
+
+    #                     iter_count = 0
+    #                     rk_i = np.inf
+    #                     # Increase rho[i] until Lipschitz satisfied or max iters
+    #                     while iter_count < self.vi_max_block_adjust_iters:
+    #                         rho_vec = _expand_rho_to_vec(rb, len(yk), self.component_slices)
+    #                         candidate = yk - rho_vec * Fk_val
+    #                         yk_temp = self._project(yk, candidate, rb, tcur, Fk_val, prev)
+    #                         Fk_temp = func(yk_temp)
+
+    #                         den = np.linalg.norm(yk_temp[s] - yk[s])
+    #                         if den < stuck_thresh:
+    #                             # Component stuck; stop adjusting this block
+    #                             break
+    #                         num = rb[i] * np.linalg.norm(Fk_temp[s] - Fk_val[s])
+    #                         rk_i = num / den if den != 0.0 else 0.0
+    #                         if rk_i > self.L:
+    #                             rb[i] = self.nu * rb[i]
+    #                             iter_count += 1
+    #                         else:
+    #                             # Lipschitz satisfied
+    #                             yk_current = yk_temp
+    #                             Fk_current = Fk_temp
+    #                             break
+
+    #                     # Optional single decrease if too small (mirror scalar logic)
+    #                     if np.isfinite(rk_i) and rk_i < self.Lmin:
+    #                         rb[i] = (1.0 / self.nu) * rb[i]
+    #                         # We do not re-check after decrease (to match scalar path semantics)
+
+    #                     # Recompute current state after this block's rho change
+    #                     rho_vec = _expand_rho_to_vec(rb, len(yk), self.component_slices)
+    #                     candidate = yk - rho_vec * Fk_val
+    #                     yk_current = self._project(yk, candidate, rb, tcur, Fk_val, prev)
+    #                     Fk_current = func(yk_current)
+
+    #                 # After all components adjusted, update outputs with current state
+    #                 yk1 = yk_current
+    #                 Fk_val_1 = Fk_current
+    #                 # Ensure positivity and clamp
+    #                 rb = np.maximum(rb, np.finfo(float).tiny)
+    #                 np.clip(rb, self.rho_min, self.rho_max, out=rb)
+    #                 rho = _sanitize_rho(rb, context="iter-update-strict")
+    #             else:
+    #                 # Fast per-block update without extra projections
+    #                 for i, s in enumerate(self.component_slices):
+    #                     num = rb[i] * np.linalg.norm(Fk_val_1[s] - Fk_val[s])
+    #                     den = np.linalg.norm(yk1[s] - yk[s])
+    #                     # Detect stuck components: absolute + relative threshold
+    #                     stuck_thresh = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + np.linalg.norm(yk[s]))
+    #                     if den < stuck_thresh:
+    #                         # Skip update for stuck block
+    #                         continue
+    #                     rk_i = num / den
+    #                     if rk_i > self.L:
+    #                         rb[i] = self.nu * rb[i]
+    #                     elif rk_i < self.Lmin:  # strict < to avoid growth bias at boundary
+    #                         rb[i] = (1.0 / self.nu) * rb[i]
+    #                 # Ensure positivity and clamp
+    #                 rb = np.maximum(rb, np.finfo(float).tiny)
+    #                 np.clip(rb, self.rho_min, self.rho_max, out=rb)
+    #                 # Sanitize and clip per-block
+    #                 rho = _sanitize_rho(rb, context="iter-update")
+    #         else:
+    #             # Scalar update with stuck detection
+    #             rhos = float(rho)
+    #             num = rhos * np.linalg.norm(Fk_val_1 - Fk_val)
+    #             den = np.linalg.norm(yk1 - yk)
+    #             stuck_thresh = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + np.linalg.norm(yk))
+    #             if den >= stuck_thresh:
+    #                 rk = num / den
+    #                 if rk > self.L:
+    #                     rhos = self.nu * rhos
+    #                 elif rk < self.Lmin:
+    #                     rhos = (1.0 / self.nu) * rhos
+    #             # sanitize and clamp
+    #             rhos = float(np.clip(rhos, self.rho_min, self.rho_max))
+    #             rho = _sanitize_rho(rhos, context="iter-update-scalar")
+
+    #         if debug:
+    #             if isinstance(rho, np.ndarray):
+    #                 print(f"[VI] k={k+1} err={err:.3e} rho={rho}")
+    #             else:
+    #                 print(f"[VI] k={k+1} err={err:.3e} rho={rho:.3e}")
+
+    #         yk = yk1
+    #         k += 1
+
+    #     success = (err <= self.tol)
+    #     # Persist last rho for subsequent solves (both cached and default field)
+    #     rho = _sanitize_rho(rho, context="final")
+    #     self.rho0 = rho
+    #     self.rho_last = rho
+    #     F_final = func(yk)
+    #     self.last_Fk_val = F_final
+    #     if debug:
+    #         if isinstance(rho, np.ndarray):
+    #             print(f"[VI] done: success={success} iters={k} final_err={err:.3e} rho={rho}")
+    #         else:
+    #             print(f"[VI] done: success={success} iters={k} final_err={err:.3e} rho={rho:.3e}")
+    #     return (yk, F_final, err, success, k)
+
+    # ---- VI stepsize update (unchanged math, but uses fast projection) ----
     def _update_rho(self, func, yk, rho):
+        # guard against bad rho
+        if not np.isscalar(rho) or not np.isfinite(rho) or rho <= 0:
+            base = self.rho0 if (np.isscalar(self.rho0) and np.isfinite(self.rho0) and self.rho0 > 0) else 1.0
+            rho = float(base)
+
+        tcur = getattr(self, 'current_time', None)
+        prev = getattr(self, 'prev_state', None)
+
         Fk_val = func(yk)
-        yk1 = self.proj.project(yk, yk - rho * Fk_val, rho)
-        rk = self._get_rk(func, yk1, yk, rho)
-        while rk > self.L:
-            rho = self.nu * rho
-            yk1 = self.proj.project(yk, yk - rho * Fk_val, rho)
+        self.last_Fk_val = Fk_val
+        yk1 = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
+        # Stuck detection for scalar path
+        den = np.linalg.norm(yk1 - yk)
+        stuck_thresh = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + np.linalg.norm(yk))
+        if den >= stuck_thresh:
             rk = self._get_rk(func, yk1, yk, rho)
-        if rk <= self.Lmin:
-            rho = (1.0 / self.nu) * rho
+            while rk > self.L:
+                rho = self.nu * rho
+                yk1 = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
+                den = np.linalg.norm(yk1 - yk)
+                if den < stuck_thresh:
+                    break
+                rk = self._get_rk(func, yk1, yk, rho)
+            if rk < self.Lmin:
+                rho = (1.0 / self.nu) * rho
+        # Clamp
+        rho = float(np.clip(rho, self.rho_min, self.rho_max))
         return rho
 
     def _get_rk(self, func, yk1, yk, rho):
@@ -711,13 +1688,110 @@ class ImplicitEquationSolver:
         den = np.linalg.norm(yk1 - yk)
         return 0.0 if den == 0.0 else (num / den)
 
-    def _numerical_jacobian(self, func, y, eps=1e-8):
+    # ---------- Numerical Jacobian ----------
+    def _numerical_jacobian(self, func, y, eps: float | None = None, sparse: bool | None = None, mode: str = 'fd'):
         n = len(y)
-        J = np.zeros((n, n), dtype=y.dtype)
+        J = np.empty((n, n), dtype=y.dtype)
+
+        if (mode or 'fd').lower() == 'cs':
+            try:
+                h = 1e-30
+                y_cs = y.astype(complex)
+                for i in range(n):
+                    y_cs_i = y_cs.copy()
+                    y_cs_i[i] += 1j * h
+                    Fi = func(y_cs_i)
+                    J[:, i] = np.imag(Fi) / h
+                use_sparse = self._sparse_active(n) if sparse is None else bool(sparse)
+                return J if not use_sparse else sp.csr_matrix(J)
+            except Exception:
+                pass
+
         F0 = func(y)
+        base = np.sqrt(np.finfo(float).eps) if eps is None else float(eps)
         for i in range(n):
+            h = base * max(1.0, abs(y[i]))
             y_eps = y.copy()
-            y_eps[i] += eps
+            y_eps[i] += h
             F_eps = func(y_eps)
-            J[:, i] = (F_eps - F0) / eps
-        return J
+            J[:, i] = (F_eps - F0) / h
+        use_sparse = self._sparse_active(n) if sparse is None else bool(sparse)
+        return J if not use_sparse else sp.csr_matrix(J)
+
+    # ---------- Sparse helpers ----------
+    def _to_csr(self, A, n=None):
+        if sp.issparse(A):
+            return A.tocsr()
+        if isinstance(A, np.ndarray):
+            if A.ndim == 1:
+                return sp.diags(A, format='csr')
+            return sp.csr_matrix(A)
+        if n is not None:
+            try:
+                return sp.csr_matrix(A, shape=(n, n))
+            except Exception:
+                pass
+        return sp.csr_matrix(A)
+
+    def _solve_linear_sparse(self, J, rhs, rtol=None, pattern_hint=None):
+        n = J.shape[0]
+        b = rhs if (isinstance(rhs, np.ndarray) and rhs.ndim == 1) else np.asarray(rhs).reshape(n)
+
+        if self.linear_solver == 'splu':
+            try:
+                lu = spla.splu(J.tocsc(), permc_spec=self.splu_permc_spec)
+                x = lu.solve(b)
+                return x, True
+            except Exception:
+                x, info = self._gmres(
+                    J, b,
+                    rtol=(self.gmres_tol if rtol is None else rtol),
+                    maxiter=self.gmres_maxiter,
+                    restart=self.gmres_restart,
+                )
+                return (x, info == 0)
+        else:
+            M = None
+            need_rebuild = (
+                self._ilu is None or self._last_shape != J.shape or self._ilu_steps_since_build >= self.precond_reuse_steps
+            )
+            pattern_key = (J.shape, J.nnz, pattern_hint)
+            if need_rebuild or self._last_pattern != pattern_key:
+                try:
+                    ilu = spla.spilu(
+                        J.tocsc(),
+                        drop_tol=self.ilu_drop_tol,
+                        fill_factor=self.ilu_fill_factor,
+                        permc_spec=self.ilu_permc_spec,
+                    )
+                    self._ilu = ilu
+                    self._ilu_steps_since_build = 0
+                    self._last_shape = J.shape
+                    self._last_pattern = pattern_key
+                except Exception:
+                    self._ilu = None
+            if self._ilu is not None:
+                ilu = self._ilu
+                M = spla.LinearOperator(J.shape, matvec=lambda v: ilu.solve(v))
+                self._ilu_steps_since_build += 1
+            x, info = self._gmres(
+                J, b, M=M,
+                rtol=(self.gmres_tol if rtol is None else rtol),
+                maxiter=self.gmres_maxiter,
+                restart=self.gmres_restart,
+            )
+            return (x, info == 0)
+
+    def _gmres(self, A, b, M=None, rtol=None, maxiter=None, restart=None):
+        kwargs = {'M': M, 'maxiter': maxiter, 'restart': restart}
+        try:
+            return spla.gmres(A, b, rtol=(rtol if rtol is not None else self.gmres_tol), atol=0.0, **kwargs)
+        except TypeError:
+            return spla.gmres(A, b, tol=(rtol if rtol is not None else self.gmres_tol), **kwargs)
+
+    def _sparse_active(self, n: int) -> bool:
+        if isinstance(self.sparse, str):
+            if self.sparse.lower() == 'auto':
+                return n >= self.sparse_threshold
+            return True
+        return bool(self.sparse)

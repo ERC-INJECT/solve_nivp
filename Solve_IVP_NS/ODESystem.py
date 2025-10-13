@@ -9,6 +9,7 @@ from .integrations import (
     Trapezoidal,
     ThetaMethod,
     CompositeMethod,
+    EmbeddedBETR,
     # BDFMethod,
     # AdaptiveSteppingBDF
 )
@@ -16,34 +17,38 @@ from .integrations import (
 # from .adaptive_integrator import AdaptiveStepping
 
 class ODESystem:
-    """
-    Encapsulates an ordinary differential equation (ODE) system together with a numerical integrator.
-    
-    This class sets up the system using an ODE function, initial state, and a selected integration method.
-    It supports both fixed-step and adaptive-step integration.
-    
-    Parameters:
-        fun : callable
-            Function defining the ODE, with signature fun(t, y).
-        y0 : array_like
-            Initial state vector.
-        method : str or IntegrationMethod, default 'backward_euler'
-            The integration method to use. This can be a string specifying the method (e.g., 'backward_euler',
-            'trapezoidal', 'theta', 'composite', 'bdf') or an instance of an IntegrationMethod.
-        a : float, default 1.0
-            Parameter used for some integrators (e.g., CompositeMethod).
-        adaptive : bool, default False
-            Flag indicating whether to use adaptive time stepping.
-        atol : float, default 1e-6
-            Absolute tolerance for adaptive stepping.
-        rtol : float, default 1e-3
-            Relative tolerance for adaptive stepping.
-        component_slices : list of slice objects, optional
-            Slices that partition the state vector into components (used for error estimation).
-        verbose : bool, default False
-            If True, enables verbose logging during stepping.
-        A : optional (e.g., np.array)
-            A matrix parameter to pass to the integration method.
+    """Encapsulate RHS, initial state and integration method configuration.
+
+    The system binds a user RHS ``fun`` with an implicit integration method
+    (possibly adaptive) and stores current state for the driver. The RHS may
+    support signature variants ``fun(t, y)`` or ``fun(t, y, Fk)`` (third
+    argument ignored if unused).
+
+    Parameters
+    ----------
+    fun : callable
+        ODE right-hand side ``fun(t, y) -> ndarray``.
+    y0 : array_like, shape (n,)
+        Initial state vector.
+    method : str | IntegrationMethod, default 'backward_euler'
+        Integration scheme name or pre-instantiated method object.
+    a : float, default 1.0
+        Auxiliary parameter (currently only placeholder for composite schemes).
+    adaptive : bool, default False
+        Enable adaptive step controller (two half-step Richardson + PI).
+    atol, rtol : float
+        Absolute / relative tolerances (adaptive only).
+    component_slices : list[slice], optional
+        Partition for per-block error norm and projection logic.
+    verbose : bool, default False
+        Emit basic rejection diagnostics.
+    A : ndarray, optional
+        Constant mass / descriptor matrix; identity if omitted.
+
+    Notes
+    -----
+    Integrator ``step`` methods must return a 5‑tuple ``(y_new, Fk_new, err, success, iterations)``.
+    ``Fk_new`` is propagated upward and recorded by the driver for diagnostics.
     """
     def __init__(self, 
                  fun: Callable[[float, np.ndarray], np.ndarray], 
@@ -88,7 +93,8 @@ class ODESystem:
             #     )
             # else:
                 # Otherwise, use the generic adaptive stepping mechanism.
-                from .adaptive_integrator import AdaptiveStepping  # Adjust this import if AdaptiveStepping is in a different module.
+                # Always use the generic adaptive stepper
+                from .adaptive_integrator import AdaptiveStepping
                 self.adaptive_stepper = AdaptiveStepping(
                     integrator=self.method,
                     component_slices=self.component_slices,
@@ -120,8 +126,8 @@ class ODESystem:
             return ThetaMethod(theta=0.5, A=A)
         elif method_name == 'composite':
             return CompositeMethod(a=a, A=A)
-        elif method_name == 'bdf':
-            return BDFMethod(A=A, atol=self.atol, rtol=self.rtol)
+        elif method_name == 'embedded_betr':
+            return EmbeddedBETR(A=A)
         else:
             raise ValueError(f"Unknown integration method: {method_name}")
     

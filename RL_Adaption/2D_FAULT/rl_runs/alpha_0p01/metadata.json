@@ -1,0 +1,7 @@
+{
+  "alpha": 0.01,
+  "total_timesteps": 20000,
+  "training_wall_time_sec": 468.2896270751953,
+  "model_path": "rl_runs/alpha_0p01/model.zip",
+  "vecnorm_path": "rl_runs/alpha_0p01/vec_norm.pkl"
+}

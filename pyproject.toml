@@ -10,5 +10,21 @@ authors = [
   { name = "David Riley" }
 ]
 dependencies = [
-  # e.g. "numpy>=1.20", "jax>=0.4.0", ...
+  "numpy>=1.20",
+  "scipy>=1.8",
 ]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7",
+]
+rl = [
+  "gymnasium>=0.29",
+  "stable-baselines3>=2.2",
+  "sb3-contrib>=2.2",
+  "matplotlib>=3.5",
+]
+
+[project.scripts]
+solve_ivp_ns-selftest = "Solve_IVP_NS._selftest:main"
+

@@ -3,22 +3,18 @@ from tqdm import tqdm
 from typing import Any, Tuple, List
 
 class ODESolver:
-    """
-    ODESolver performs integration of an ODE system over a specified time span.
-    
-    The solver iteratively advances the solution using either adaptive or fixed time steps.
-    It records the time points, state vectors, step sizes, and diagnostic error information.
-    
-    Attributes:
-        system: The ODE system instance (e.g., an instance of ODESystem).
-        t0: The initial time.
-        tf: The final time.
-        h_initial: The initial time step size.
-        t_values: List of time points.
-        y_values: List of state vectors corresponding to each time step.
-        h_values: List of step sizes taken.
-        error_estimates: List of diagnostic tuples (solver_error, success flag, iteration count).
-        fk: List of derivative/residual values computed during integration.
+    """Time integration driver (fixed or adaptive) for an ``ODESystem``.
+
+    Stores growing histories of time grid, states, step sizes and solver
+    diagnostics. For adaptive runs, rejected steps do not append entries.
+
+    Residual semantics
+    ------------------
+    ``fk`` list stores the raw implicit residual / function value ``F(y_k)``
+    returned by the integrator's nonlinear solve at each *accepted* step. This
+    can be useful for post-process diagnostics (e.g. monitoring equilibrium of
+    projected components). Entries may be ``None`` if a method does not return
+    a residual (should not occur with current integrators).
     """
     def __init__(self, system: Any, t_span: Tuple[float, float], h: float = 1e-2):
         """
@@ -39,16 +35,21 @@ class ODESolver:
         self.fk: List[Any] = []
 
     def solve(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Tuple[Any, bool, int]]]:
-        """
-        Integrate the ODE system from the initial to the final time.
-        
-        Returns:
-            A tuple containing:
-                - t_values: Array of time points.
-                - y_values: Array of state vectors at each time point.
-                - h_values: Array of step sizes used.
-                - fk: Array of derivative/residual values (as objects to support varying sizes).
-                - error_estimates: List of diagnostic tuples (solver_error, success flag, iteration count).
+        """Integrate from ``t0`` to ``tf``.
+
+        Returns
+        -------
+        t_values : ndarray (m,)
+            Time points (monotone, includes final time).
+        y_values : ndarray (m, n)
+            State history.
+        h_values : ndarray (m,)
+            Step sizes used; first entry equals initial ``h`` guess.
+        fk : object ndarray (m,)
+            Residual / implicit function evaluations per accepted step.
+        error_estimates : list[tuple]
+            Per-step tuples ``(solver_error, success, iterations)`` coming from
+            the nonlinear solver (solver_error is typically final residual norm).
         """
         t = self.t0
         h = self.h_initial

@@ -1,170 +1,209 @@
 import numpy as np
+import math
+
 
 class AdaptiveStepping:
+    """Richardson extrapolation based adaptive step-size controller.
+
+    Strategy
+    --------
+    Performs one full step of size ``h`` and two half steps of size ``h/2``.
+    A Richardson LTE estimate is formed from the difference of the two solutions::
+
+        E_raw = y_full - y_hi
+        E = RMS( (y_full - y_hi) / (2^p - 1) / (atol + rtol*max(|y_prev|,|y_hi|)) )
+
+    The step is accepted if ``E <= 1`` and the accepted state is the *high*
+    accuracy solution from the two half steps (``y_hi``). On rejection the
+    candidate is discarded and only the step-size is shrunk.
+
+    Controller
+    ----------
+    Proposed new step size (PI variant when previous error available)::
+
+        h_new = h * safety * E^{-alpha} * E_prev^{-beta}
+
+    with clamps ``h_down <= factor <= h_up``. Exponents default to Gustafsson
+    style values ``alpha = 0.7/(p+1)``, ``beta = 0.4/(p+1)``.
+
+    Parameters
+    ----------
+    integrator : IntegrationMethod
+        Underlying implicit integrator implementing ``step`` returning the
+        standard 5‑tuple.
+    component_slices : list[slice], optional
+        State partition for block-wise error computation.
+    atol, rtol : float
+        Absolute / relative tolerances.
+    h0, h_min, h_max : float
+        Initial, minimum, maximum step sizes.
+    h_up, h_down : float
+        Growth / shrinkage clamps on multiplicative factor.
+    method_order : int, optional
+        Explicit order ``p`` (auto inferred from integrator if omitted).
+    safety : float
+        Multiplicative safety factor (<1) for cautious adaptation.
+    use_PI : bool
+        Enable PI controller; otherwise falls back to simple proportional.
+    skip_error_indices : iterable[int], optional
+        Indices (w.r.t. ``component_slices``) excluded from LTE norm (e.g. purely
+        algebraic or projection-only variables).
+
+    Returns (from ``step``)
+    -----------------------
+    ``(y_new, fk_new, h_new, E, success, solver_error, iterations)`` where
+    ``fk_new`` is the residual returned by the accepted underlying step (HI variant).
     """
-    Adaptive time-stepping controller for non-BDF integrators using a full-step/two-half-step strategy.
-    
-    This class estimates the local error of a proposed step by comparing a single full step
-    with two successive half steps. Based on the computed error, the step size is adapted for
-    the next integration step.
-    
-    Parameters:
-        integrator : object
-            An integrator instance that implements a 'step' method.
-        component_slices : list of slice objects, optional
-            Slices to partition the state vector into components for error estimation.
-        atol : float, default 1e-6
-            Absolute tolerance for error estimation.
-        rtol : float, default 1e-3
-            Relative tolerance for error estimation.
-        h0 : float, default 1e-2
-            Initial time step size.
-        h_min : float, default 1e-5
-            Minimum allowable time step.
-        h_max : float, default 1e3
-            Maximum allowable time step.
-        h_up : float, default 2.0
-            Maximum factor for increasing the step size.
-        h_down : float, default 0.6
-            Factor for decreasing the step size.
-        q : float, default 0.5
-            Order exponent used in the step size control.
-        verbose : bool, default False
-            If True, prints diagnostic messages during stepping.
-        skip_error_indices : list of int, optional
-            Component indices to skip during error estimation.
-    """
-    def __init__(self, integrator, component_slices=None, atol=1e-6, rtol=1e-3, h0=1e-2,
-                 h_min=1e-5, h_max=1e3, h_up=2.0, h_down=0.6, q=0.5, verbose=False,
-                 skip_error_indices=None):
+
+    def __init__(
+        self,
+        integrator,
+        component_slices=None,
+        atol: float = 1e-6,
+        rtol: float = 1e-3,
+        h0: float = 1e-2,
+        h_min: float = 1e-10,
+        h_max: float = 1e3,
+        h_up: float = 2.0,
+        h_down: float = 0.6,
+        # Optional explicit method order; if None, infer from integrator
+        method_order: int | None = None,
+        safety: float = 0.9,
+        use_PI: bool = True,
+        verbose: bool = False,
+        skip_error_indices=None,
+    ) -> None:
         self.integrator = integrator
-        self.atol = atol
-        self.rtol = rtol
-        self.h = h0
-        self.h_min = h_min
-        self.h_max = h_max
-        self.h_up = h_up
-        self.h_down = h_down
-        self.q = q
-        self.verbose = verbose
         self.component_slices = component_slices
-        self.skip_error_indices = skip_error_indices if skip_error_indices is not None else []
+        self.atol = float(atol)
+        self.rtol = float(rtol)
+        self.h = float(h0)
+        self.h_min = float(h_min)
+        self.h_max = float(h_max)
+        self.h_up = float(h_up)
+        self.h_down = float(h_down)
+        self.verbose = bool(verbose)
+        self.skip_error_indices = set(skip_error_indices or [])
+
+        # Determine method order p (1 for BE/Composite-1, 2 for TR, etc.)
+        self.p = int(method_order) if method_order is not None else self._infer_method_order(integrator)
+
+        # PI controller parameters (Gustafsson-like exponents)
+        self.safety = float(safety)
+        self.use_PI = bool(use_PI)
+        self._alpha = 0.7 / (self.p + 1.0)
+        self._beta = 0.4 / (self.p + 1.0)
+        self._E_prev = None
+
+        # Small buffers to reduce allocations in error computation
+        self._etol_buf = None
+
+    def _infer_method_order(self, integrator) -> int:
+        # Respect explicit attribute if present
+        p = getattr(integrator, 'order', None)
+        if isinstance(p, (int, float)) and p > 0:
+            return int(p)
+        name = integrator.__class__.__name__.lower()
+        # Common cases
+        if 'trapezoidal' in name or 'embeddedbetr' in name:
+            return 2
+        if 'thetamethod' in name:
+            theta = getattr(integrator, 'theta', None)
+            return 2 if theta is not None and abs(theta - 0.5) < 1e-12 else 1
+        # Default conservative choice
+        return 1
+
+    def _scaled_error(self, y_prev, y_lo, y_hi) -> float:
+        """Global RMS scaled error using Richardson with denom max-clamped."""
+        denom = max(1e-14, (2.0 ** self.p) - 1.0)
+        accum = 0.0
+        count = 0
+
+        if self.component_slices is None:
+            err = (y_lo - y_hi) / denom
+            if self._etol_buf is None or self._etol_buf.shape != y_hi.shape:
+                self._etol_buf = np.empty_like(y_hi)
+            # etol = atol + rtol*max(|y_hi|, |y_prev|)
+            np.maximum(np.abs(y_hi), np.abs(y_lo), out=self._etol_buf)
+            self._etol_buf *= self.rtol
+            self._etol_buf += self.atol
+            se = err / self._etol_buf
+            accum = float(np.dot(se, se))
+            count = se.size
+        else:
+            for i, sl in enumerate(self.component_slices):
+                if i in self.skip_error_indices:
+                    continue
+                prev = y_prev[sl]
+                lo = y_lo[sl]
+                hi = y_hi[sl]
+                err = (lo - hi) / denom
+                if self._etol_buf is None or self._etol_buf.shape != hi.shape:
+                    self._etol_buf = np.empty_like(hi)
+                np.maximum(np.abs(hi), np.abs(lo), out=self._etol_buf)
+                self._etol_buf *= self.rtol
+                self._etol_buf += self.atol
+                se = err / self._etol_buf
+                accum += float(np.dot(se.ravel(), se.ravel()))
+                count += se.size
+
+        return 0.0 if count == 0 else math.sqrt(accum / count)
+
+    def _propose_h(self, h: float, E: float) -> float:
+        if E <= 0.0 or not np.isfinite(E):
+            g = self.h_up
+        else:
+            if self.use_PI and self._E_prev is not None and self._E_prev > 0.0:
+                g = self.safety * (E ** (-self._alpha)) * (self._E_prev ** (-self._beta))
+            else:
+                g = self.safety * (E ** (-1.0 / (self.p + 1.0)))
+            g = min(self.h_up, max(self.h_down, g))
+        return min(self.h_max, max(self.h_min, g * h))
 
     def step(self, fun, t, y, h):
-        """
-        Perform one adaptive time step using a full-step and two half-step strategy.
-        
-        The method:
-          1. Computes a full-step using the integrator.
-          2. Computes two half-steps and compares the result with the full-step.
-          3. Estimates the error based on the difference between the full-step and half-step solutions.
-          4. Adjusts the time step size accordingly.
-        
-        Parameters:
-            fun : callable
-                Function representing the right-hand side (derivative) of the ODE.
-            t : float
-                Current time.
-            y : array_like
-                Current state vector.
-            h : float
-                Proposed time step size.
-                
-        Returns:
-            y_new : array_like
-                New state computed from the two half-steps.
-            fk_new : array_like
-                Derivative evaluated at the new state.
-            h_new : float
-                Adapted time step for the next step.
-            E : float
-                Estimated scaled error.
-            success : bool
-                True if the error is acceptable (E ≤ 1), False otherwise.
-            solver_error : float
-                Error reported by the integrator's solver for the full-step.
-            solver_iterations : int
-                Number of iterations taken by the integrator for the full-step.
-        """
-        # Compute the full step.
+        """Perform one adaptive step; returns (y_new, fk_new, h_new, E, success, solver_error, iterations)."""
+        # Full step
         try:
-            y_full, fk_full, solver_error_full, solver_success_full, iter_full = \
-                self.integrator.step(fun, t, y, h)
+            y_full, fk_full, solver_err, ok_full, it_full = self.integrator.step(fun, t, y, h)
         except RuntimeError as e:
             if self.verbose:
-                print(f"Error during full step at t={t:.5f}: {e}")
+                print(f"[adaptive] error in full step @ t={t:.6g}: {e}")
             return y, None, h, np.inf, False, np.inf, 0
+        if not ok_full:
+            # Shrink and retry outside
+            if self.verbose:
+                print(f" convergent reject @ t={t:.6g},h -> {max(self.h_min, self.h_down * h):.3e}")
+            return y, None, max(self.h_min, self.h_down * h), np.inf, False, solver_err, it_full
 
-        if not solver_success_full:
-            return y, None, h, np.inf, False, solver_error_full, iter_full
-
-        # Compute two half-steps.
-        half_h = 0.5 * h
+        # Two half-steps
+        h2 = 0.5 * h
         try:
-            y_half, _, _, success_half1, _ = self.integrator.step(fun, t, y, half_h)
-            if not success_half1:
-                return y, None, half_h, np.inf, False, np.inf, 0
-
-            y_half_full, fk_half_full, _, success_half2, _ = \
-                self.integrator.step(fun, t + half_h, y_half, half_h)
-            if not success_half2:
-                return y, None, half_h, np.inf, False, np.inf, 0
+            y_half, _, _, ok_h1, _ = self.integrator.step(fun, t, y, h2)
+            if not ok_h1:
+                if self.verbose:
+                    print(f" convergent reject @ t={t:.6g},h -> {max(self.h_min, self.h_down * h):.3e}")
+                return y, None, max(self.h_min, self.h_down * h), np.inf, False, np.inf, 0
+            y_hi, fk_hi, _, ok_h2, _ = self.integrator.step(fun, t + h2, y_half, h2)
+            if not ok_h2:
+                if self.verbose:
+                    print(f" convergent reject @ t={t:.6g},h -> {max(self.h_min, self.h_down * h):.3e}")
+                return y, None, max(self.h_min, self.h_down * h), np.inf, False, np.inf, 0
         except RuntimeError as e:
             if self.verbose:
-                print(f"Error during half steps at t={t:.5f}: {e}")
+                print(f"[adaptive] error in half steps @ t={t:.6g}: {e}")
             return y, None, h, np.inf, False, np.inf, 0
 
-        # Determine the state components to estimate error.
-        if self.component_slices is not None:
-            components_prev = [y[s] for s in self.component_slices]
-            components_LO = [y_full[s] for s in self.component_slices]
-            components_HI = [y_half_full[s] for s in self.component_slices]
-        else:
-            components_prev = [y]
-            components_LO = [y_full]
-            components_HI = [y_half_full]
-
-        # Compute error order exponent (p = 1/q - 1).
-        p = 1 / self.q - 1
-        all_scaled_errors = []
-
-        # Loop over each component for error estimation.
-        for idx, (comp_prev, comp_LO, comp_HI) in enumerate(zip(components_prev, components_LO, components_HI)):
-            # Skip components if specified.
-            if idx in self.skip_error_indices:
-                continue
-            # Estimate the error using the difference between full and half-step approximations.
-            error_est = (comp_LO - comp_HI) / (2**p - 1)
-            # Compute the tolerance for the component.
-            etol = self.atol + self.rtol * np.maximum(np.abs(comp_HI), np.abs(comp_prev))
-            # Scale the error.
-            scaled_error = error_est / etol
-            all_scaled_errors.append(scaled_error.flatten())
-            if self.verbose:
-                err_str = ", ".join(f"{e:.3e}" for e in scaled_error.flatten())
-                print(f"Component {idx+1} scaled errors: [{err_str}]")
-
-        # Combine the scaled errors.
-        if all_scaled_errors:
-            all_scaled_errors = np.concatenate(all_scaled_errors)
-            E = np.sqrt(np.mean(all_scaled_errors**2))
-        else:
-            E = 0.0
-
-        # Determine if the step is acceptable.
+        # Scaled RMS error
+        E = self._scaled_error(y, y_full, y_hi)
         success = (E <= 1.0)
+        h_new = self._propose_h(h, E)
+        self._E_prev = E
 
-        # Adjust the step size using the computed error.
-        s = self.h_up if E == 0 else (1.0 / E)**(self.q)
-        h_new = min(self.h_up * h, s * h)
-        h_new = min(max(h_new, self.h_min), self.h_max)
-
-        # If the error is too large and we are already at h_min, abort gracefully.
         if not success:
-            # If the adaptive step fails, reduce the step size and try again.
-            h_new = self.h_down*h
             if self.verbose:
-                print(f"Step at t={t:.5f} rejected. Reducing step size to {h:.5e}.")
-            return y, fk_full, h_new, E, False, solver_error_full, iter_full
+                print(f"[adaptive] reject @ t={t:.6g}, E={E:.3e} ⇒ h -> {h_new:.3e}")
+            # reject: keep y, try smaller h
+            return y, fk_full, h_new, E, False, solver_err, it_full
 
-        return y_half_full, fk_half_full, h_new, E, success, solver_error_full, iter_full
+        # accept: use HI solution and residual
+        return y_hi, fk_hi, h_new, E, True, solver_err, it_full

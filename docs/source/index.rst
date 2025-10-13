@@ -6,13 +6,13 @@
 solve_ivp_ns documentation
 ==========================
 
-Add your content using ``reStructuredText`` syntax. See the
-`reStructuredText <https://www.sphinx-doc.org/en/master/usage/restructuredtext/index.html>`_
-documentation for details.
+This site documents the public API and provides guidance for using the solvers and projections.
 
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
 
-   solve_ivp_ns
+   quickstart
+   examples
+   Solve_IVP_NS

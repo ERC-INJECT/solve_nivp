@@ -3,3 +3,12 @@ Name: Solve_IVP_NS
 Version: 0.1.0
 Summary: A solver package for implicit ODEs and projection-based solvers
 Author: David Riley
+Requires-Dist: numpy>=1.20
+Requires-Dist: scipy>=1.8
+Provides-Extra: test
+Requires-Dist: pytest>=7; extra == "test"
+Provides-Extra: rl
+Requires-Dist: gymnasium>=0.29; extra == "rl"
+Requires-Dist: stable-baselines3>=2.2; extra == "rl"
+Requires-Dist: sb3-contrib>=2.2; extra == "rl"
+Requires-Dist: matplotlib>=3.5; extra == "rl"
