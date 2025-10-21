@@ -68,6 +68,17 @@ class Projection(ABC):
     def tangent_cone(self, candidate, current_state, rhok=None, t=None, Fk_val=None):
         pass
 
+    # Optional batched APIs (default fallbacks preserve behavior)
+    def project_batch(self, current_state, candidates, rhok=None, t=None, Fk_val=None):
+        candidates = np.asarray(candidates)
+        if candidates.ndim == 1:
+            return self.project(current_state, candidates, rhok=rhok, t=t, Fk_val=Fk_val)
+        out = np.empty_like(candidates)
+        # Default: row-wise call (safe but not fast); subclasses may override
+        for i in range(candidates.shape[0]):
+            out[i] = self.project(current_state, candidates[i], rhok=rhok, t=t, Fk_val=Fk_val)
+        return out
+
 
 ##############################################################################
 # IdentityProjection
@@ -83,6 +94,9 @@ class IdentityProjection(Projection):
     def tangent_cone(self, candidate, current_state, rhok=None, t=None, Fk_val=None):
         n = candidate.shape[0]
         return np.eye(n)
+
+    def project_batch(self, current_state, candidates, rhok=None, t=None, Fk_val=None):
+        return np.asarray(candidates)
 
 
 ##############################################################################
@@ -156,6 +170,19 @@ class SignProjection(Projection):
                 D[j_w, j_s] = 0.5 * float(tau_val)
 
         return D
+
+    def project_batch(self, current_state, candidates, rhok=None, t=None, Fk_val=None):
+        C = np.asarray(candidates)
+        if C.ndim == 1:
+            return self.project(current_state, C, rhok=rhok, t=t, Fk_val=Fk_val)
+        out = C.copy()
+        y = np.atleast_2d(out[:, np.atleast_1d(self.y_indices)])
+        w = np.atleast_2d(out[:, np.atleast_1d(self.w_indices)])
+        tau = self.tau if rhok is None else rhok
+        z = w + tau * y
+        w_new = np.clip(z, -1.0, 1.0)
+        out[:, np.atleast_1d(self.w_indices)] = w_new
+        return out
 
 
 
@@ -255,6 +282,50 @@ class CoulombProjection(Projection):
         return J
 
     @staticmethod
+    def _gather_rhok_ci(rhok, ci, component_slices):
+        """Return rhok values aligned to constrained indices ``ci`` without building a full array.
+
+        Accepts:
+        - scalar rhok -> broadcast scalar
+        - array-like matching state length -> direct indexing by ci
+        - array-like matching number of component_slices -> broadcast per-slice values onto ci
+        """
+        if rhok is None:
+            return 1.0  # scalar broadcast
+        if np.isscalar(rhok):
+            return float(rhok)
+        rhok_arr = np.asarray(rhok)
+        # If length matches state length, we can index directly
+        # Otherwise, try per-slice mapping
+        if rhok_arr.ndim == 1:
+            # Heuristic: when provided per-slice
+            if (component_slices is not None
+                and len(component_slices) > 0
+                and rhok_arr.size == len(component_slices)):
+                rh_ci = np.empty(ci.size, dtype=float)
+                # Map each ci to its owning slice index and assign corresponding rhok
+                # This loop is over number of slices (typically small) and only fills ci positions
+                pos = 0
+                for k, sl in enumerate(component_slices):
+                    # intersect ci with slice range
+                    start = sl.start if hasattr(sl, 'start') else sl[0]
+                    stop = sl.stop if hasattr(sl, 'stop') else sl[-1] + 1
+                    mask = (ci >= start) & (ci < stop)
+                    count = int(np.count_nonzero(mask))
+                    if count:
+                        rh_ci[pos:pos+count] = float(rhok_arr[k])
+                        pos += count
+                if pos != ci.size:
+                    # Fallback: direct gather with clipping to bounds if slices unconventional
+                    rh_ci = rhok_arr[np.clip(ci, 0, rhok_arr.size-1)]
+                return rh_ci
+            # Direct indexing (assumes rhok provided per-state)
+            if rhok_arr.size >= np.max(ci)+1:
+                return rhok_arr[ci]
+        # Fallback: treat as scalar 1.0 to preserve robustness
+        return 1.0
+
+    @staticmethod
     def _projD_optimized(v, z, friction_vals):
         v = np.asarray(v)
         z = np.asarray(z)
@@ -281,8 +352,13 @@ class CoulombProjection(Projection):
         return out_v, out_z
 
     @staticmethod
-    def _projD(y, con_force_func, state, rhok, constraint_indices, t=None, Fk_val=None, use_numba=False):
-        # Flexible call for con_force
+    def _projD(y, con_force_func, state, rhok, constraint_indices, t=None, Fk_val=None, use_numba=False, component_slices=None):
+        # Normalize indices and early-out when no constraints
+        ci = np.asarray(constraint_indices)
+        if ci.size == 0:
+            return _to_numpy_if_needed(y)
+
+        # Flexible call for con_force (avoid if early-out above)
         try:
             conf = con_force_func(state, t, Fk_val)
         except TypeError:
@@ -290,48 +366,46 @@ class CoulombProjection(Projection):
                 conf = con_force_func(state, t)
             except TypeError:
                 conf = con_force_func(state)
-        second_column = conf.copy()
-        ci = np.asarray(constraint_indices)
-        if ci.size>0:
-            # Use abs(state[ci]) instead of auxiliary state[ci+1]
-            st_ci_abs = np.abs(_to_numpy_if_needed(state[ci]))
-            rhok_ci = _to_numpy_if_needed(rhok[ci])
-            conf_ci = _to_numpy_if_needed(conf[ci])
-            newvals = st_ci_abs - (rhok_ci*conf_ci)
-            second_column[ci] = newvals
+
+        second_column = _to_numpy_if_needed(conf).copy()
+        # Use abs(state[ci]) instead of auxiliary state[ci+1]
+        st_ci_abs = np.abs(_to_numpy_if_needed(state[ci]))
+        # Support scalar, per-state, or per-slice rhok without building a full-length array
+        rhok_ci = CoulombProjection._gather_rhok_ci(rhok, ci, component_slices)
+        conf_ci = _to_numpy_if_needed(second_column[ci])
+        newvals = st_ci_abs - (rhok_ci * conf_ci)
+        second_column[ci] = newvals
+
         y_np = _to_numpy_if_needed(y)
         second_np = _to_numpy_if_needed(second_column)
-        # Optional numba acceleration
         fv = _to_numpy_if_needed(conf)
+
         if use_numba and _NUMBA_OK:
-            v_proj, z_proj = projD_optimized_nb(y_np.astype(float), second_np.astype(float), fv.astype(float))
+            # Ensure contiguous float64 arrays for best Numba performance
+            y_c = np.ascontiguousarray(y_np, dtype=np.float64)
+            sc_c = np.ascontiguousarray(second_np, dtype=np.float64)
+            fv_c = np.ascontiguousarray(fv, dtype=np.float64)
+            v_proj, z_proj = projD_optimized_nb(y_c, sc_c, fv_c)
         else:
             v_proj, z_proj = CoulombProjection._projD_optimized(y_np, second_np, fv)
         # No augmented state: do not write to ci+1
         return v_proj
 
     def project(self, current_state, candidate, rhok, t=None, Fk_val=None):
-        n = candidate.shape[0]
-        if rhok is None:
-            big_rhok = np.ones(n, dtype=candidate.dtype)
-        elif np.isscalar(rhok):
-            val = float(rhok)
-            big_rhok = np.full((n,), val, dtype=candidate.dtype)
-        else:
-            big_rhok = np.zeros(n, dtype=candidate.dtype)
-            for i, sl in enumerate(self.component_slices):
-                if hasattr(sl, 'start'):
-                    big_rhok[sl] = float(rhok[i])
-                else:
-                    big_rhok[sl] = rhok[i]
+        # Early-out when there are no constrained indices
+        ci = np.asarray(getattr(self, 'constraint_indices', np.array([])))
+        if ci.size == 0:
+            return candidate
+        # Accept scalar or array rhok; avoid constructing a full-sized vector per call
+        rhok_eff = 1.0 if rhok is None else rhok
         # decide on numba usage here
         if isinstance(self.use_numba, str):
             use_nb = (_NUMBA_OK and self.use_numba == 'auto')
         else:
             use_nb = bool(self.use_numba) and _NUMBA_OK
         return CoulombProjection._projD(
-            candidate, self.con_force_func, current_state, big_rhok, self.constraint_indices,
-            t=t, Fk_val=Fk_val, use_numba=use_nb
+            candidate, self.con_force_func, current_state, rhok_eff, self.constraint_indices,
+            t=t, Fk_val=Fk_val, use_numba=use_nb, component_slices=self.component_slices
         )
 
     def tangent_cone(self, candidate, current_state, rhok=None, t=None, Fk_val=None):
@@ -380,13 +454,15 @@ class CoulombProjection(Projection):
             use_nb = bool(self.use_numba) and _NUMBA_OK
 
         # Precompute per-index v and z_tilde for classification (no augmented z)
-        valid_indices = [idx for idx in ci if idx < n]
-        if not valid_indices:
+        valid_mask = ci < n
+        if not np.any(valid_mask):
             return sp.eye(n, format='csr')
-        v_arr = np.array([candidate[idx] for idx in valid_indices], dtype=float)
-        zt_arr = np.array([
-            np.abs(current_state[idx]) - rhok_full[idx] * conf[idx] for idx in valid_indices
-        ], dtype=float)
+        valid_indices = ci[valid_mask]
+        v_arr = _to_numpy_if_needed(candidate[valid_indices]).astype(float, copy=False)
+        zt_arr = (
+            np.abs(_to_numpy_if_needed(current_state[valid_indices]))
+            - _to_numpy_if_needed(rhok_full[valid_indices]) * _to_numpy_if_needed(conf[valid_indices])
+        ).astype(float, copy=False)
 
         # Region codes: try numba classifier first when requested
         codes = None
@@ -612,6 +688,7 @@ class MuScaledSOCProjection(Projection):
         z_work = np.asarray(z, float).copy()
 
         g = y[3]  # q_y is the vertical gap
+        print(f'gap: {g}')
         if g > 0:  # No contact
             # print('no contact')
             # z_work[self.constraint_indices] = 0.0
@@ -643,15 +720,17 @@ class MuScaledSOCProjection(Projection):
             z_soc_proj = np.array([max(z_soc[0], 0.0), z_soc[1]], float)
         else:
             z_soc_proj = self._proj_mu_scaled_soc(z_soc, 1.0/mu)  # <-- NOTE 1/mu
+
+            # z_soc_proj = self._proj_mu_scaled_soc(z_soc, 1.0/mu)  # <-- NOTE 1/mu
         # invert Θ once to get u
-        e = 1.0
+        e = 0.5
         theta = 0.5
         uN_prev = prev_state[1] if prev_state is not None else 0.0
         tilde_u_N, tilde_u_T = z_soc_proj[0], z_soc_proj[1]
         u_T = tilde_u_T
         # gamma= 1/2*(1+e)-1
 
-        u_N = tilde_u_N - ( theta *(1+e)-1 ) * uN_prev  - mu*abs(tilde_u_T)
+        u_N = tilde_u_N - e * uN_prev - mu * abs(tilde_u_T)
 
         z_work[self.constraint_indices] = np.array([u_T, u_N], float)  # back to [T,N]
         return z_work

@@ -1,8 +1,0 @@
-{
-  "alpha": 100.0,
-  "algorithm": "TD3",
-  "total_timesteps": 20000,
-  "training_wall_time_sec": 465.09537506103516,
-  "model_path": "rl_runs/alpha_100p0/TD3/model.zip",
-  "vecnorm_path": "rl_runs/alpha_100p0/TD3/vec_norm.pkl"
-}

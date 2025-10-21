@@ -1,3 +1,4 @@
+LICENSE
 README.md
 pyproject.toml
 setup.py
@@ -27,6 +28,7 @@ tests/test_globalization.py
 tests/test_import_and_api.py
 tests/test_integrators_added.py
 tests/test_nonlinear_solvers_added.py
+tests/test_projection_batch_equivalence.py
 tests/test_projections_added.py
 tests/test_sparse_semismooth_newton.py
 tests/test_threading_time_and_fk.py

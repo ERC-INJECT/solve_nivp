@@ -15,4 +15,5 @@ This site documents the public API and provides guidance for using the solvers a
 
    quickstart
    examples
-   Solve_IVP_NS
+   modules
+   development

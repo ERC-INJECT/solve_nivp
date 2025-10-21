@@ -97,6 +97,7 @@ class AdaptiveStepping:
 
         # Small buffers to reduce allocations in error computation
         self._etol_buf = None
+        self._err_buf = None
 
     def _infer_method_order(self, integrator) -> int:
         # Respect explicit attribute if present
@@ -114,38 +115,53 @@ class AdaptiveStepping:
         return 1
 
     def _scaled_error(self, y_prev, y_lo, y_hi) -> float:
-        """Global RMS scaled error using Richardson with denom max-clamped."""
+        """Global RMS scaled error using Richardson with denom max-clamped.
+
+        Optimized to reuse shared buffers and avoid temporary allocations.
+        """
         denom = max(1e-14, (2.0 ** self.p) - 1.0)
         accum = 0.0
         count = 0
 
         if self.component_slices is None:
-            err = (y_lo - y_hi) / denom
+            # Allocate or resize buffers
+            if self._err_buf is None or self._err_buf.shape != y_hi.shape:
+                self._err_buf = np.empty_like(y_hi)
             if self._etol_buf is None or self._etol_buf.shape != y_hi.shape:
                 self._etol_buf = np.empty_like(y_hi)
-            # etol = atol + rtol*max(|y_hi|, |y_prev|)
+            # err = (y_lo - y_hi) / denom  (in-place)
+            np.subtract(y_lo, y_hi, out=self._err_buf)
+            self._err_buf /= denom
+            # etol = atol + rtol*max(|y_hi|, |y_lo|)  (in-place)
             np.maximum(np.abs(y_hi), np.abs(y_lo), out=self._etol_buf)
             self._etol_buf *= self.rtol
             self._etol_buf += self.atol
-            se = err / self._etol_buf
-            accum = float(np.dot(se, se))
-            count = se.size
+            # se = err / etol  (reuse err buffer)
+            np.divide(self._err_buf, self._etol_buf, out=self._err_buf)
+            accum = float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
+            count = self._err_buf.size
         else:
             for i, sl in enumerate(self.component_slices):
                 if i in self.skip_error_indices:
                     continue
-                prev = y_prev[sl]
                 lo = y_lo[sl]
                 hi = y_hi[sl]
-                err = (lo - hi) / denom
+                # Allocate or resize buffers for this block
+                if self._err_buf is None or self._err_buf.shape != hi.shape:
+                    self._err_buf = np.empty_like(hi)
                 if self._etol_buf is None or self._etol_buf.shape != hi.shape:
                     self._etol_buf = np.empty_like(hi)
+                # err = (lo - hi) / denom
+                np.subtract(lo, hi, out=self._err_buf)
+                self._err_buf /= denom
+                # etol = atol + rtol*max(|hi|, |lo|)
                 np.maximum(np.abs(hi), np.abs(lo), out=self._etol_buf)
                 self._etol_buf *= self.rtol
                 self._etol_buf += self.atol
-                se = err / self._etol_buf
-                accum += float(np.dot(se.ravel(), se.ravel()))
-                count += se.size
+                # se = err / etol
+                np.divide(self._err_buf, self._etol_buf, out=self._err_buf)
+                accum += float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
+                count += self._err_buf.size
 
         return 0.0 if count == 0 else math.sqrt(accum / count)
 

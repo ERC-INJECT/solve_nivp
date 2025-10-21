@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+title: "Solve_IVP_NS: A Python toolkit for integrating nonsmooth dynamical systems"
+version: 0.1.0
+authors:
+  - family-names: Riley
+    given-names: David
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+  - family-names: Stefanou
+    given-names: Ioannis
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+repository-code: "https://github.com/your-org/Solve_ivp_ns"
+license: MIT
+keywords:
+  - nonsmooth dynamics
+  - ODE
+  - DAE
+  - variational inequalities
+  - semismooth Newton
+  - projection methods
+message: "If you use this software, please cite it as below."

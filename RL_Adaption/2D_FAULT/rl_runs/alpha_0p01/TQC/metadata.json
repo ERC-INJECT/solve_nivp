@@ -1,8 +1,0 @@
-{
-  "alpha": 0.01,
-  "algorithm": "TQC",
-  "total_timesteps": 20000,
-  "training_wall_time_sec": 474.0118873119354,
-  "model_path": "rl_runs/alpha_0p01/TQC/model.zip",
-  "vecnorm_path": "rl_runs/alpha_0p01/TQC/vec_norm.pkl"
-}

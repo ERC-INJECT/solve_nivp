@@ -24,7 +24,16 @@ rl = [
   "sb3-contrib>=2.2",
   "matplotlib>=3.5",
 ]
+docs = [
+  "sphinx>=6",
+  "sphinx-rtd-theme>=1.2",
+]
 
 [project.scripts]
 solve_ivp_ns-selftest = "Solve_IVP_NS._selftest:main"
+
+[project.urls]
+Homepage = "https://github.com/ERC-INJECT/Solve_ivp_ns"
+Documentation = "https://github.com/ERC-INJECT/Solve_ivp_ns/tree/main/docs"
+Issues = "https://github.com/ERC-INJECT/Solve_ivp_ns/issues"
 

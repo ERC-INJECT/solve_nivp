@@ -1,6 +1,7 @@
 import numpy as np
 import math
 from abc import ABC, abstractmethod
+import scipy.sparse as sp
 from .nonlinear_solvers import ImplicitEquationSolver  # Relative import for a solver class
 
 
@@ -49,6 +50,7 @@ class BackwardEuler(IntegrationMethod):
     """
 
     # Cache for identity matrices to avoid repeated allocation.
+    # Keys: ('dense'| 'csr', n)
     _ID_CACHE = {}
 
     def __init__(self, solver=None, A=None, pass_prev_state=False, pass_step_size=False):
@@ -192,23 +194,37 @@ class BackwardEuler(IntegrationMethod):
         """
         Retrieve or compute the appropriate matrix A of size (n x n).
 
-        If no specific matrix A is provided during initialization, the identity matrix is used.
-        Identity matrices are cached to avoid repeated computation.
+        If no specific matrix A is provided during initialization, return an identity
+        matrix. For large systems (as indicated by the solver's sparse preference),
+        a CSR identity is returned to avoid allocating a dense n×n array.
 
-        Parameters:
-            n: int
-                The size of the square matrix needed.
-
-        Returns:
-            np.array: The matrix A (either the identity matrix or the user-specified matrix).
+        Returns a numpy.ndarray or scipy.sparse.csr_matrix matching the chosen path.
         """
-        # NOTE: Assumes constant A and default float dtype; if you add float32,
-        # consider keying by (n, dtype) instead of just n.
-        if self.use_identity:
-            if n not in self._ID_CACHE:
-                self._ID_CACHE[n] = np.eye(n)
-            return self._ID_CACHE[n]
-        return self.A
+        if not self.use_identity:
+            return self.A
+
+        # Prefer sparse identity for large n (same heuristic as solver sparse path if available)
+        want_sparse = False
+        try:
+            want_sparse = bool(self.solver._sparse_active(n))  # may not exist for custom solvers
+        except Exception:
+            # Fallback heuristic using solver's threshold when present
+            thr = getattr(self.solver, 'sparse_threshold', 200)
+            try:
+                want_sparse = (n >= int(thr))
+            except Exception:
+                want_sparse = (n >= 200)
+
+        if want_sparse:
+            key = ('csr', n)
+            if key not in self._ID_CACHE:
+                self._ID_CACHE[key] = sp.eye(n, format='csr')
+            return self._ID_CACHE[key]
+        else:
+            key = ('dense', n)
+            if key not in self._ID_CACHE:
+                self._ID_CACHE[key] = np.eye(n)
+            return self._ID_CACHE[key]
 
     def step(self, fun, t, y, h):
         """Perform one implicit Backward Euler step.
@@ -318,9 +334,21 @@ class AlgebraicBackwardEuler(IntegrationMethod):
         self.use_identity = A is None
 
     def _get_A(self, n):
-        if self.use_identity:
-            return np.eye(n)
-        return self.A
+        if not self.use_identity:
+            return self.A
+        # Prefer CSR identity for large n to reduce memory/compute
+        want_sparse = False
+        try:
+            want_sparse = bool(self.solver._sparse_active(n))
+        except Exception:
+            thr = getattr(self.solver, 'sparse_threshold', 200)
+            try:
+                want_sparse = (n >= int(thr))
+            except Exception:
+                want_sparse = (n >= 200)
+        if want_sparse:
+            return sp.eye(n, format='csr')
+        return np.eye(n)
 
     def step(self, fun, t, y, h):
         n = len(y)
@@ -688,9 +716,20 @@ class EmbeddedBETR(IntegrationMethod):
         self.order = 2
 
     def _get_A(self, n):
-        if self.use_identity:
-            return np.eye(n)
-        return self.A
+        if not self.use_identity:
+            return self.A
+        want_sparse = False
+        try:
+            want_sparse = bool(self.solver._sparse_active(n))
+        except Exception:
+            thr = getattr(self.solver, 'sparse_threshold', 200)
+            try:
+                want_sparse = (n >= int(thr))
+            except Exception:
+                want_sparse = (n >= 200)
+        if want_sparse:
+            return sp.eye(n, format='csr')
+        return np.eye(n)
 
     def _attach_be_jac(self, A_local, t, h):
         rhs_jac = getattr(self.solver, 'rhs_jacobian', None)

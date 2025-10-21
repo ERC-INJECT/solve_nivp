@@ -26,3 +26,18 @@ Makefile
 *.so
 *.dll
 *.dylib
+
+# Sphinx Docs build artifacts
+docs/_build/
+
+# Numba cache artifacts (in addition to __pycache__)
+**/*.nbi
+**/*.nbc
+
+# RL experiments (large, non-essential artifacts)
+RL_Adaption/**/rl_results*.npz
+RL_Adaption/**/metadata.json
+RL_Adaption/**/Images/
+
+# Ensure Python bytecode caches are ignored everywhere
+**/__pycache__/

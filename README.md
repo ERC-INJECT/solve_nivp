@@ -1,13 +1,22 @@
 # Solve_IVP_NS
 
-A solver package for implicit ODEs with nonsmooth projections.
+A Python toolkit for integrating nonsmooth ODE/DAE systems via projection-based constraints and semismooth Newton solves. It provides implicit integrators (Backward Euler, Trapezoidal, theta/composite), projection operators (identity, sign, Coulomb-like, SOC), and an adaptive controller with optional acceleration.
 
 ## Installation
 
+Recommended developer install:
+
 ```bash
-pip install Solve_IVP_NS
-# or from source (editable):
+python3 -m venv .venv && source .venv/bin/activate
+pip install -U pip
 pip install -e .[test]
+```
+
+Optional extras:
+
+```bash
+# RL experiments
+pip install -e .[rl]
 ```
 
 ## Quickstart
@@ -35,9 +44,30 @@ sol = solve_ivp_ns(
 print(sol[0][:5], sol[1][:5])  # t, y samples
 ```
 
-## Dependencies
-- numpy, scipy
-- optional: numba (for certain accelerated paths). You can disable projector numba usage by passing `use_numba=False` to the projection constructor.
+See `examples/` for notebooks on friction stick–slip, bouncing ball (contact/impact), SOC constraints, and sliding-mode control.
 
-## Contributing
-See CONTRIBUTING.md
+## Running tests
+
+```bash
+pytest -q
+```
+
+## Building the documentation
+
+```bash
+cd docs
+make clean html
+```
+Open `docs/_build/html/index.html`.
+
+## RL experiments (optional)
+
+The `RL_Adaption/` folder contains optional experiments (TD3/TQC) for learned adaptivity on challenging nonsmooth problems. Large artifacts are ignored by Git and not required for core installation or testing.
+
+## Citation
+
+See `CITATION.cff`. If you use this software, please cite the JOSS paper once available.
+
+## License
+
+MIT License (see `LICENSE`).

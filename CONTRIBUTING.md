@@ -4,23 +4,28 @@ Thanks for your interest in contributing!
 
 ## Development setup
 
-- Python 3.10–3.13 recommended.
-- Create a virtual environment and install the project in editable mode:
-
-```
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -U pip
 pip install -e .[test]
 ```
 
 ## Running tests
 
-```
+```bash
 pytest -q
+```
+
+## Building documentation
+
+```bash
+cd docs && make clean html
 ```
 
 ## Style
 
 - Keep public APIs stable.
-- Add docstrings (Args/Returns/Shapes/Example).
+- Use NumPy-style docstrings (Args/Returns/Shapes/Example).
 - Prefer small PRs with focused changes.
 
 ## Pull requests
