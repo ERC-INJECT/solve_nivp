@@ -94,6 +94,7 @@ def solve_ivp_ns(
   verbose=False,
   A=None,
   skip_error_indices=None,
+  return_attempts=False,
 ):
   """Integrate an ODE / simple index–1 DAE with optional nonsmooth projection.
 
@@ -144,6 +145,10 @@ def solve_ivp_ns(
   skip_error_indices : iterable[int] or None
     Indices (w.r.t. ``component_slices`` order) to exclude from adaptive error norm
     (useful for algebraic / projected-only components).
+  return_attempts : bool, default False
+    When ``True`` (and adaptive stepping is enabled) capture every attempted
+    step size along with acceptance, error estimate, and reason. Returning this
+    diagnostic data introduces minor overhead and is therefore opt-in.
 
   Returns
   -------
@@ -157,6 +162,9 @@ def solve_ivp_ns(
     Residual / implicit function evaluations associated with accepted steps.
   info : list of tuple
     Per-step diagnostics: ``(solver_error, success, iterations)``.
+  attempts : dict or None, optional
+    Only returned when ``return_attempts`` is True. Contains arrays describing
+    each attempted adaptive step (time, proposed ``h``, accepted flag, etc.).
 
   Notes
   -----
@@ -247,6 +255,7 @@ def solve_ivp_ns(
     rtol=rtol,
     component_slices=component_slices,
     verbose=verbose,
+    record_attempts=return_attempts,
   )
 
   # Optionally tune the adaptive controller
@@ -268,6 +277,14 @@ def solve_ivp_ns(
       _set('atol', float)
       _set('rtol', float)
       _set('verbose', bool)
+
+      # Ratio / digital-filter controller knobs
+      _set('mode', lambda v: str(v))
+      _set('controller', lambda v: str(v))
+      _set('b_param', float)
+      _set('r_min', float)
+      _set('r_max', float)
+      _set('reject_reboot_thresh', int)
 
       # Method order (alias 'p') needs alpha/beta refresh
       mo = None
@@ -310,4 +327,4 @@ def solve_ivp_ns(
 
   # 5) Integrate
   solver_obj = ODESolver(system, t_span, h=initial_h)
-  return solver_obj.solve()
+  return solver_obj.solve(return_attempts=return_attempts)

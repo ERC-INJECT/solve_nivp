@@ -60,7 +60,8 @@ class ODESystem:
                  rtol: float = 1e-3,
                  component_slices: Optional[list] = None,
                  verbose: bool = False,
-                 A: Optional[np.ndarray] = None):
+                 A: Optional[np.ndarray] = None,
+                 record_attempts: bool = False):
         self.fun = fun
         self.y0 = np.array(y0, dtype=float)
         self.current_y = self.y0.copy()
@@ -70,6 +71,7 @@ class ODESystem:
         self.verbose = verbose
         self.component_slices = component_slices
         self.A = A
+        self.record_attempts = bool(record_attempts)
 
         # If method is an instance of IntegrationMethod, use it directly.
         if isinstance(method, IntegrationMethod):
@@ -100,7 +102,8 @@ class ODESystem:
                     component_slices=self.component_slices,
                     atol=self.atol,
                     rtol=self.rtol,
-                    verbose=self.verbose
+                    verbose=self.verbose,
+                    record_attempts=self.record_attempts,
                 )
 
     def _select_method(self, method_name: str, a: float, A: Optional[np.ndarray]):

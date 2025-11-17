@@ -1,5 +1,4 @@
 import numpy as np
-from tqdm import tqdm
 from typing import Any, Tuple, List
 
 class ODESolver:
@@ -34,8 +33,14 @@ class ODESolver:
         self.error_estimates: List[Tuple[Any, bool, int]] = []
         self.fk: List[Any] = []
 
-    def solve(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Tuple[Any, bool, int]]]:
+    def solve(self, return_attempts: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Tuple[Any, bool, int]]]:
         """Integrate from ``t0`` to ``tf``.
+
+        Parameters
+        ----------
+        return_attempts : bool, default False
+            When ``True`` and adaptive stepping is enabled with attempt logging,
+            include the raw attempt log as a sixth return value.
 
         Returns
         -------
@@ -50,9 +55,15 @@ class ODESolver:
         error_estimates : list[tuple]
             Per-step tuples ``(solver_error, success, iterations)`` coming from
             the nonlinear solver (solver_error is typically final residual norm).
+        attempts : dict or None, optional
+            Only returned when ``return_attempts`` is ``True``. Contains arrays of
+            attempted times, step sizes, acceptance flags, etc., if recorded.
         """
         t = self.t0
         h = self.h_initial
+        stepper = getattr(self.system, 'adaptive_stepper', None)
+        if stepper is not None and hasattr(stepper, 'reset_attempt_log'):
+            stepper.reset_attempt_log()
         
         # Initialize progress bar for integration.
         # pbar = tqdm(total=self.tf - self.t0, desc='Integration Progress', unit='time unit')
@@ -91,8 +102,15 @@ class ODESolver:
                 self.system.current_y = y_new
             # pbar.update(h_step)
         # pbar.close()
-        return (np.array(self.t_values),
-                np.array(self.y_values),
-                np.array(self.h_values),
-                np.array(self.fk, dtype=object),
-                self.error_estimates)
+        t_arr = np.array(self.t_values)
+        y_arr = np.array(self.y_values)
+        h_arr = np.array(self.h_values)
+        fk_arr = np.array(self.fk, dtype=object)
+
+        if return_attempts:
+            attempt_log = None
+            if stepper is not None and hasattr(stepper, 'get_attempt_log'):
+                attempt_log = stepper.get_attempt_log()
+            return t_arr, y_arr, h_arr, fk_arr, self.error_estimates, attempt_log
+
+        return t_arr, y_arr, h_arr, fk_arr, self.error_estimates

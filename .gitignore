@@ -41,3 +41,9 @@ RL_Adaption/**/Images/
 
 # Ensure Python bytecode caches are ignored everywhere
 **/__pycache__/
+
+# Evaluation artifacts
+metadata.json
+model.zip
+vec_norm.pkl
+*.npy

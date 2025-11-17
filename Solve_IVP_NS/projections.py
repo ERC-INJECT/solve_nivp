@@ -592,7 +592,7 @@ class MuScaledSOCProjection(Projection):
     def __init__(self, *, blocks=None, component_slices=None,
                  blocks_func=None, prefill_func=None, constraint_indices=None, get_mu =None):
         super().__init__(component_slices=component_slices)
-        self.blocks = self._normalize_blocks(blocks, component_slices) if (blocks is not None or component_slices) else None
+        # self.blocks = self._normalize_blocks(blocks, component_slices) if (blocks is not None or component_slices) else None
         self.blocks_func = blocks_func
         self.prefill_func = prefill_func
         self.constraint_indices = constraint_indices
@@ -735,7 +735,7 @@ class MuScaledSOCProjection(Projection):
         z_work[self.constraint_indices] = np.array([u_T, u_N], float)  # back to [T,N]
         return z_work
 
-    def tangent_cone(self, candidate, current_state, rhok=None, t=None, Fk_val=None, prev_state=None, step_size=None, **kw):
+    def tangent_cone(self, candidate, current_state, rhok=None, t=None, Fk_val=None, prev_stat=None, step_size=None, **kw):
         y = np.asarray(current_state, float)
         z_work = np.asarray(candidate, float)
         n = z_work.size

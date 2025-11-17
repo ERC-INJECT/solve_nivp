@@ -695,7 +695,7 @@ class CompositeMethod(IntegrationMethod):
         except Exception:
             pass
 
-        y_guess = y_half #(2.0 * y_half) - y
+        y_guess = y_half
         y_new, Fk_new, err_new, success_new, iters_new = self.backward_euler.solver.solve(implicit_eq, y_guess)
         total_iters = iters_half + iters_new
         overall_success = success_half and success_new

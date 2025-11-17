@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from typing import Callable, Iterable, Sequence
@@ -102,7 +103,7 @@ class AdaptiveStepperEnv(gym.Env):
         self.nparams = nparams
 
         self.computational_time = 0.0
-
+        self.p = 1.0  # Numerical order of the integrator (assumed constant)
         self.error = 0.0
         self.iter_error = 0.0
         self.finished = False
@@ -134,6 +135,16 @@ class AdaptiveStepperEnv(gym.Env):
 
         # Small buffer reused in error computation to minimize allocations
         self._etol_buf = None  # type: ignore[assignment]
+        # controller memory shared by both modes
+        # previous step's normalized error
+        self._E_prev = None
+        # previous step-size ratio rho_n = h_n / h_{n-1} (for ratio mode)
+        self._rho_prev = 1.0
+
+        # for scratch allocation in _scaled_error
+        self._etol_buf = None
+        self._err_buf = None
+        self._solver_perf_buf = np.zeros(12, dtype=float)
 
         self.reset()
 
@@ -149,68 +160,75 @@ class AdaptiveStepperEnv(gym.Env):
             self.rt_min_est = max(0.0, qlo - 0.1 * span)
             self.rt_max_est = qhi + 0.1 * span
 
-    def _get_E(self, y_prev: np.ndarray, y_full: np.ndarray, y_half_full: np.ndarray) -> float:
-        """Compute global RMS scaled error using Richardson, mirroring AdaptiveStepping.
-
-        Uses denom = max(1e-14, 2**p - 1), with p derived from q via p = 1/q - 1.
-        Applies block-wise exclusion via skip_error_indices when component_slices is provided.
-        Allocation is minimized by reusing an internal buffer for etol.
+    def _get_E(self, y_prev, y_lo, y_hi) -> float:
         """
-        # Determine Richardson denominator (clamped for safety)
-        p = 1.0 / self.q - 1.0
-        denom = max(1e-14, (2.0 ** p) - 1.0)
+        Compute normalized error E via Richardson step-doubling:
+            raw_err = (y_lo - y_hi) / (2^p - 1)
+        scale each component by atol + rtol * max(|.|),
+        then RMS over included components.
 
+        E <= 1   => "good enough" in classic sense.
+        """
+        denom = max(1e-14, (2.0 ** self.p) - 1.0)
         accum = 0.0
         count = 0
 
         if self.component_slices is None:
-            # Vectorized path for full state
-            err = (y_full - y_half_full) / denom
-            # Reuse buffer for etol
-            if self._etol_buf is None or self._etol_buf.shape != y_half_full.shape:
-                self._etol_buf = np.empty_like(y_half_full)
-            # etol = atol + rtol*max(|y_half|, |y_full|)
-            np.maximum(np.abs(y_half_full), np.abs(y_full), out=self._etol_buf)
+            if self._err_buf is None or self._err_buf.shape != y_hi.shape:
+                self._err_buf = np.empty_like(y_hi)
+            if self._etol_buf is None or self._etol_buf.shape != y_hi.shape:
+                self._etol_buf = np.empty_like(y_hi)
+
+            # raw_err
+            np.subtract(y_lo, y_hi, out=self._err_buf)
+            self._err_buf /= denom
+
+            # tol scaling
+            np.maximum(np.abs(y_lo), np.abs(y_hi), out=self._etol_buf)
             self._etol_buf *= self.rtol
             self._etol_buf += self.atol
-            se = err / self._etol_buf
-            # sum of squares
-            accum = float(np.dot(se.ravel(), se.ravel()))
-            count = se.size
+
+            # scaled error per component
+            np.divide(self._err_buf, self._etol_buf, out=self._err_buf)
+
+            accum = float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
+            count = self._err_buf.size
         else:
-            # Block-wise path with optional exclusions
-            if not isinstance(self.component_slices, list):
-                raise ValueError("component_slices must be a list of slice objects or indices.")
-            for idx, sl in enumerate(self.component_slices):
-                if idx in self.skip_error_indices:
+            for i, sl in enumerate(self.component_slices):
+                if i in self.skip_error_indices:
                     continue
-                prev = y_prev[sl]
-                lo = y_full[sl]
-                hi = y_half_full[sl]
-                err = (lo - hi) / denom
-                # Reuse buffer, resizing only when needed
+                lo = y_lo[sl]
+                hi = y_hi[sl]
+
+                # (re)allocate to match current block
+                if self._err_buf is None or self._err_buf.shape != hi.shape:
+                    self._err_buf = np.empty_like(hi)
                 if self._etol_buf is None or self._etol_buf.shape != hi.shape:
                     self._etol_buf = np.empty_like(hi)
-                np.maximum(np.abs(hi), np.abs(lo), out=self._etol_buf)
+
+                # raw_err block
+                np.subtract(lo, hi, out=self._err_buf)
+                self._err_buf /= denom
+
+                np.maximum(np.abs(lo), np.abs(hi), out=self._etol_buf)
                 self._etol_buf *= self.rtol
                 self._etol_buf += self.atol
-                se = err / self._etol_buf
-                accum += float(np.dot(se.ravel(), se.ravel()))
-                count += se.size
 
-                if self.verbose:
-                    # Summarized diagnostic to avoid huge prints
-                    rms_comp = float(np.sqrt(np.mean((se.ravel()) ** 2))) if se.size else 0.0
-                    print(f"Component {idx + 1}: RMS Scaled Error = {rms_comp:.3e}")
+                np.divide(self._err_buf, self._etol_buf, out=self._err_buf)
 
-        return 0.0 if count == 0 else float(np.sqrt(accum / count))
+                accum += float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
+                count += self._err_buf.size
+        # print(f"error is: {math.sqrt(accum / count) if count>0 else 0.0}")
+        return 0.0 if count == 0 else math.sqrt(accum / count)
 
     # ------------------------------------------------------------------
     # Gym API
     # ------------------------------------------------------------------
     def step(self, action):  # type: ignore[override]
-        action = np.asarray(action, dtype=float)
-        dt_norm = float(action[0])
+        try:
+            dt_norm = float(action[0])
+        except TypeError:
+            dt_norm = float(action)
         # Clamp and compute dt using cached range to reduce per-step overhead
         if dt_norm < 0.0:
             dt_norm = 0.0
@@ -223,7 +241,7 @@ class AdaptiveStepperEnv(gym.Env):
         runtime_inc, dts, error_LO, error_lil1, error_HI, error, \
             success_LO, success_lil1, success_HI, kiter_LO, iter_lil1, kiter_HI = solver_perf
 
-        self._update_runtime_bounds(runtime_inc)
+        # self._update_runtime_bounds(runtime_inc)
 
         reward = self.reward_fn(solver_perf, dt_attempt, self.xk, self)
         done = self.t_k >= self.tnmax
@@ -260,7 +278,7 @@ class AdaptiveStepperEnv(gym.Env):
     # ------------------------------------------------------------------
     def increment_env(self, t, xks, fks, h, nparams):
         tol, max_iter = nparams
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         FK1 = fks
         xk1 = xks
@@ -278,9 +296,7 @@ class AdaptiveStepperEnv(gym.Env):
         if success_LO:
             yk1_lil1, FK1_lil1, error_lil1, success_lil1, iter_lil1 = self.integrator.step(self.system, t, xks, h / 2.0)
             if success_lil1:
-                xK_HI, FK_HI, error_HI, success_HI, kiter_HI = self.integrator.step(
-                    self.system, t + h / 2.0, yk1_lil1, h / 2.0
-                )
+                xK_HI, FK_HI, error_HI, success_HI, kiter_HI = self.integrator.step(self.system, t + h / 2.0, yk1_lil1, h / 2.0)
 
             if success_HI:
                 E = self._get_E(xks, xk_LO, xK_HI)
@@ -288,21 +304,20 @@ class AdaptiveStepperEnv(gym.Env):
                 FK1 = FK_HI
                 t_k1 = t + h
 
-        end_time = time.time()
+        end_time = time.perf_counter()
         run_time = end_time - start_time
-        solver_perf = [
-            run_time,
-            t_k1 - t,
-            error_LO,
-            error_lil1,
-            error_HI,
-            E,
-            success_LO,
-            success_lil1,
-            success_HI,
-            kiter_LO,
-            iter_lil1,
-            kiter_HI,
-        ]
+        solver_perf = self._solver_perf_buf
+        solver_perf[0] = run_time
+        solver_perf[1] = t_k1 - t
+        solver_perf[2] = error_LO
+        solver_perf[3] = error_lil1
+        solver_perf[4] = error_HI
+        solver_perf[5] = E
+        solver_perf[6] = success_LO
+        solver_perf[7] = success_lil1
+        solver_perf[8] = success_HI
+        solver_perf[9] = kiter_LO
+        solver_perf[10] = iter_lil1
+        solver_perf[11] = kiter_HI
         self.computational_time += run_time
         return solver_perf, None, t_k1, xk1, FK1

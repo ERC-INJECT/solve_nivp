@@ -63,7 +63,6 @@ class ImplicitEquationSolver:
         self.tol = tol
         self.max_iter = max_iter
         self.proj = proj
-        self.rho0 = rho0
         self.delta = delta
         self.component_slices = component_slices
         self.use_autodiff = False
@@ -89,7 +88,14 @@ class ImplicitEquationSolver:
         self.eisenstat_c = float(eisenstat_c)
         self.eisenstat_exp = float(eisenstat_exp)
         self.adaptive_lam = bool(adaptive_lam)
-        self.lam_update_strategy = lam_update_strategy or 'vi'
+        strategy = (lam_update_strategy or 'vi').lower()
+        if strategy not in ('vi', 'none'):
+            raise ValueError(
+                "Unsupported lam_update_strategy. Use 'vi' for variational inequality adaptation or 'none'."
+            )
+        if self.adaptive_lam and strategy == 'none':
+            self.adaptive_lam = False
+        self.lam_update_strategy = strategy
         self.globalization = (globalization or 'none').lower()
         if self.globalization not in ('none', 'linesearch'):
             self.globalization = 'none'
@@ -125,6 +131,9 @@ class ImplicitEquationSolver:
 
         # Identity caches
         self._I_cache = {}
+
+        # Initialize rho state (scalar default + structured cache)
+        self._set_initial_rho(rho0)
 
         # Basic checks
         if self.method == 'VI':
@@ -238,6 +247,28 @@ class ImplicitEquationSolver:
                     return P.tangent_cone(cand, cur, **kw)
 
         self._tangent = _tangent
+
+
+    # ---------- Rho helpers ----------
+    def _rho_scalar_value(self, rho):
+        arr = np.asarray(rho, dtype=float)
+        if arr.ndim == 0:
+            val = float(arr)
+        else:
+            val = float(np.mean(arr))
+        if not np.isfinite(val) or val <= 0.0:
+            val = 1.0
+        val = float(np.clip(val, self.rho_min, self.rho_max))
+        return val
+
+    def _set_rho_last(self, rho, *, update_default=False):
+        rho_struct = float(rho) if np.isscalar(rho) else np.asarray(rho, dtype=float).copy()
+        self.rho_last = rho_struct
+        if update_default:
+            self.rho0 = self._rho_scalar_value(rho_struct)
+
+    def _set_initial_rho(self, rho):
+        self._set_rho_last(rho, update_default=True)
 
 
     # ---------- Public API ----------
@@ -449,31 +480,37 @@ class ImplicitEquationSolver:
             # Globalization (optional)
             if self.globalization == 'linesearch':
                 phi0 = 0.5 * errF * errF
-                grad_dir = -errF * errF
+
+                def _apply_JT_local(v):
+                    Dt = Dproj.T @ v
+                    return v - Dt + lam * (J_in.T @ Dt)
+
+                grad_phi = _apply_JT_local(F_buf)
+                grad_dir = float(np.dot(grad_phi, delta))
+
                 alpha = 1.0
                 backtracks = 0
+                accepted = False
 
-                y_trial = y + alpha * delta
-                phi_trial = self._phi(y_trial)
-                while (phi_trial > phi0 + self.ls_c1 * alpha * grad_dir
-                       and backtracks < self.max_backtracks
-                       and alpha > self.ls_min_alpha):
-                    alpha *= self.ls_beta
+                if np.isfinite(grad_dir) and grad_dir < 0.0:
                     y_trial = y + alpha * delta
                     phi_trial = self._phi(y_trial)
-                    backtracks += 1
+                    while (phi_trial > phi0 + self.ls_c1 * alpha * grad_dir
+                           and backtracks < self.max_backtracks
+                           and alpha > self.ls_min_alpha):
+                        alpha *= self.ls_beta
+                        y_trial = y + alpha * delta
+                        phi_trial = self._phi(y_trial)
+                        backtracks += 1
 
-                if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir:
-                    if self.use_broyden and not sparse_active:
-                        self._y_prev_broyden = y.copy()
-                        self._F_prev_broyden = F_in.copy()
-                    y = y_trial
-                else:
-                    # Steepest descent fallback
-                    if sp.issparse(J):
-                        grad_phi = J.T.dot(F_buf)
-                    else:
-                        grad_phi = J.T @ F_buf
+                    if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir:
+                        if self.use_broyden and not sparse_active:
+                            self._y_prev_broyden = y.copy()
+                            self._F_prev_broyden = F_in.copy()
+                        y = y_trial
+                        accepted = True
+
+                if not accepted:
                     nrm_g = np.linalg.norm(grad_phi)
                     if nrm_g == 0.0:
                         return (y, F_in, errF, False, iteration)
@@ -608,7 +645,7 @@ class ImplicitEquationSolver:
             rho = float(getattr(self, 'rho_last', self.rho0))
         # Sanitize initial rho and persist immediately so bad values don't leak into next solves
         rho = _sanitize_rho(rho, context="init")
-        self.rho_last = rho
+        self._set_rho_last(rho)
         tcur = getattr(self, 'current_time', None)
         prev = getattr(self, 'prev_state', None)
         if debug:
@@ -787,8 +824,7 @@ class ImplicitEquationSolver:
         success = (err <= self.tol)
         # Persist last rho for subsequent solves (both cached and default field)
         rho = _sanitize_rho(rho, context="final")
-        self.rho0 = rho
-        self.rho_last = rho
+        self._set_rho_last(rho, update_default=True)
         F_final = func(yk)
         self.last_Fk_val = F_final
         if debug:
@@ -812,7 +848,7 @@ class ImplicitEquationSolver:
     #     Fk_val = func(yk)
     #     self.last_Fk_val = Fk_val
     #     y_proj = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
-    #     err = np.linalg.norm(yk - y_proj)
+    #     err = np.linalg.norm(yk - y_proj)/math.sqrt(n)
 
     #     while err > self.tol and k < self.max_iter:
     #         rho = self._update_rho(func, yk, rho)
@@ -877,6 +913,30 @@ class ImplicitEquationSolver:
                 rho = (1.0 / self.nu) * rho
         # Clamp
         rho = float(np.clip(rho, self.rho_min, self.rho_max))
+        return rho
+
+    def _get_rk(self, func, yk1, yk, rho):
+        num = rho * np.linalg.norm(func(yk1) - func(yk))
+        den = np.linalg.norm(yk1 - yk)
+        return 0.0 if den == 0.0 else (num / den)
+
+
+
+    # ---- VI stepsize update (unchanged math, but uses fast projection) ----
+    def _update_rho(self, func, yk, rho):
+        tcur = getattr(self, 'current_time', None)
+        prev = getattr(self, 'prev_state', None)
+
+        Fk_val = func(yk)
+        self.last_Fk_val = Fk_val
+        yk1 = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
+        rk = self._get_rk(func, yk1, yk, rho)
+        while rk > self.L:
+            rho = self.nu * rho
+            yk1 = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
+            rk = self._get_rk(func, yk1, yk, rho)
+        if rk <= self.Lmin:
+            rho = (1.0 / self.nu) * rho
         return rho
 
     def _get_rk(self, func, yk1, yk, rho):

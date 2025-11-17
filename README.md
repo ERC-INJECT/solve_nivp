@@ -1,5 +1,26 @@
 # Solve_IVP_NS
 
+## RL experiments (optional, user-defined)
+
+The `RL_Adaption/` folder contains optional experiments where
+`Solve_IVP_NS` is wrapped in a Gym-style environment and controlled by
+reinforcement-learning agents (for example, TD3 or TQC from Stable
+Baselines3).
+
+In these notebooks the reward signal, observation mapping, and policy
+configuration are defined directly in notebook cells. The core
+`Solve_IVP_NS` package only supplies the nonsmooth solvers and the
+`AdaptiveStepperEnv` wrapper; all RL-specific choices are intentionally
+left to the user so they can adapt the workflow to their own
+applications.
+
+These experiments are not required for installing, testing, or using the
+library. To try them out install the optional RL dependencies:
+
+```bash
+pip install -e .[rl]
+```
+
 A Python toolkit for integrating nonsmooth ODE/DAE systems via projection-based constraints and semismooth Newton solves. It provides implicit integrators (Backward Euler, Trapezoidal, theta/composite), projection operators (identity, sign, Coulomb-like, SOC), and an adaptive controller with optional acceleration.
 
 ## Installation
