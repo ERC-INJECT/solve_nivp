@@ -38,6 +38,7 @@ docs/_build/
 RL_Adaption/**/rl_results*.npz
 RL_Adaption/**/metadata.json
 RL_Adaption/**/Images/
+RL_Adaption/2D_FAULT/cache/
 
 # Ensure Python bytecode caches are ignored everywhere
 **/__pycache__/
