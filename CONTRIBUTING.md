@@ -1,4 +1,4 @@
-# Contributing to Solve_IVP_NS
+# Contributing to solve_nivp
 
 Thanks for your interest in contributing!
 

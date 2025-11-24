@@ -2,8 +2,8 @@ import numpy as np
 import scipy.sparse as sp
 import time
 
-from Solve_IVP_NS.nonlinear_solvers import ImplicitEquationSolver
-from Solve_IVP_NS.projections import IdentityProjection
+from solve_nivp.nonlinear_solvers import ImplicitEquationSolver
+from solve_nivp.projections import IdentityProjection
 
 
 def test_vi_convergence_monotone_identity():

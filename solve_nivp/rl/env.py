@@ -14,7 +14,7 @@ try:  # pragma: no cover - import guard
     from gymnasium import spaces  # type: ignore
 except ImportError as exc:  # pragma: no cover - raised at import time
     raise ImportError(
-        "AdaptiveStepperEnv requires 'gymnasium'. Install Solve_IVP_NS[rl] or add gymnasium manually."
+        "AdaptiveStepperEnv requires 'gymnasium'. Install solve_nivp[rl] or add gymnasium manually."
     ) from exc
 
 # Type aliases for readability

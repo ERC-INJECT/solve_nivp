@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: "Solve_IVP_NS: A Python toolkit for integrating nonsmooth dynamical systems"
+title: "solve_nivp: A Python toolkit for integrating nonsmooth dynamical systems"
 version: 0.1.0
 authors:
   - family-names: Riley
@@ -8,7 +8,7 @@ authors:
   - family-names: Stefanou
     given-names: Ioannis
     orcid: "https://orcid.org/0000-0000-0000-0000"
-repository-code: "https://github.com/your-org/Solve_ivp_ns"
+repository-code: "https://github.com/your-org/solve_nivp"
 license: MIT
 keywords:
   - nonsmooth dynamics

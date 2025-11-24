@@ -18,13 +18,13 @@ class BuildSphinx(Command):
 
     def run(self):
         # First, automatically run sphinx-apidoc to generate .rst files.
-        # This will document only the subpackage Solve_IVP_NS.
+        # This documents only the solve_nivp subpackage.
         from sphinx.ext.apidoc import main as sphinx_apidoc_main
         apidoc_args = [
             '--force',         # Overwrite existing .rst files.
             '--module-first',  # Put module documentation before submodule docs.
             '-o', os.path.join('docs', 'source'),  # Output directory for the .rst files.
-            'Solve_IVP_NS'     # Path to the package to document.
+            'solve_nivp'       # Path to the package to document.
         ]
         sphinx_apidoc_main(apidoc_args)
 
@@ -49,7 +49,7 @@ class BuildSphinx(Command):
             print("PDF generated in:", os.path.join(latex_dir, 'Documentation.pdf'))
 
 setup(
-    name="Solve_IVP_NS",
+    name="solve_nivp",
     version="0.1.0",
     packages=find_packages(),  # automatically discovers packages
     description="A solver package for implicit ODEs and projection-based solvers",

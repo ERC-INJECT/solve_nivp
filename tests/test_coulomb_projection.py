@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.sparse as sp
 
-from Solve_IVP_NS.projections import CoulombProjection
+from solve_nivp.projections import CoulombProjection
 
 
 def test_coulomb_tangent_cone_tip_zero():

@@ -1,9 +1,9 @@
 import numpy as np
 
-from Solve_IVP_NS.integrations import BackwardEuler, Trapezoidal, CompositeMethod
-from Solve_IVP_NS.nonlinear_solvers import ImplicitEquationSolver
-from Solve_IVP_NS.projections import IdentityProjection
-from Solve_IVP_NS.adaptive_integrator import AdaptiveStepping
+from solve_nivp.integrations import BackwardEuler, Trapezoidal, CompositeMethod
+from solve_nivp.nonlinear_solvers import ImplicitEquationSolver
+from solve_nivp.projections import IdentityProjection
+from solve_nivp.adaptive_integrator import AdaptiveStepping
 
 
 def _rhs(t, y):
@@ -44,7 +44,7 @@ def test_adaptive_controller_skip_indices_and_no_stall():
 
 
 def test_api_imports_and_solve_shapes():
-    from Solve_IVP_NS import solve_ivp_ns, SignProjection, CoulombProjection, IdentityProjection
+    from solve_nivp import solve_ivp_ns, SignProjection, CoulombProjection, IdentityProjection
 
     t, y, h, fk, info = solve_ivp_ns(
         fun=_rhs,

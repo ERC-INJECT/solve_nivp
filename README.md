@@ -1,15 +1,15 @@
-# Solve_IVP_NS
+# solve_nivp
 
 ## RL experiments (optional, user-defined)
 
 The `RL_Adaption/` folder contains optional experiments where
-`Solve_IVP_NS` is wrapped in a Gym-style environment and controlled by
+`solve_nivp` is wrapped in a Gym-style environment and controlled by
 reinforcement-learning agents (for example, TD3 or TQC from Stable
 Baselines3).
 
 In these notebooks the reward signal, observation mapping, and policy
 configuration are defined directly in notebook cells. The core
-`Solve_IVP_NS` package only supplies the nonsmooth solvers and the
+`solve_nivp` package only supplies the nonsmooth solvers and the
 `AdaptiveStepperEnv` wrapper; all RL-specific choices are intentionally
 left to the user so they can adapt the workflow to their own
 applications.
@@ -44,7 +44,7 @@ pip install -e .[rl]
 
 ```python
 import numpy as np
-from Solve_IVP_NS import solve_ivp_ns
+from solve_nivp import solve_ivp_ns
 
 # simple smooth rhs: y' = -y
 rhs = lambda t, y: -y

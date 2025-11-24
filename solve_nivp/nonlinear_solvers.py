@@ -867,58 +867,58 @@ class ImplicitEquationSolver:
     #     success = (err <= self.tol)
     #     return (yk, func(yk), err, success, k)
     
-    # ---- VI stepsize update (unchanged math, but uses fast projection) ----
-    def _update_rho(self, func, yk, rho):
-        # guard against bad rho
-        if not np.isscalar(rho) or not np.isfinite(rho) or rho <= 0:
-            base = self.rho0 if (np.isscalar(self.rho0) and np.isfinite(self.rho0) and self.rho0 > 0) else 1.0
-            rho = float(base)
+    # # ---- VI stepsize update (unchanged math, but uses fast projection) ----
+    # def _update_rho(self, func, yk, rho):
+    #     # guard against bad rho
+    #     if not np.isscalar(rho) or not np.isfinite(rho) or rho <= 0:
+    #         base = self.rho0 if (np.isscalar(self.rho0) and np.isfinite(self.rho0) and self.rho0 > 0) else 1.0
+    #         rho = float(base)
 
-        tcur = getattr(self, 'current_time', None)
-        prev = getattr(self, 'prev_state', None)
+    #     tcur = getattr(self, 'current_time', None)
+    #     prev = getattr(self, 'prev_state', None)
 
-        Fk_val = func(yk)
-        self.last_Fk_val = Fk_val
-        # Use per-index rho_vec consistently for projection
-        slices = getattr(self, 'component_slices', None)
-        if slices is not None and len(slices) > 0:
-            rho_vec = np.empty_like(yk, dtype=float)
-            # expand scalar rho to blocks then to vector
-            rb = np.full(len(slices), float(rho), dtype=float)
-            for v, s in zip(rb, slices):
-                rho_vec[s] = v
-        else:
-            rho_vec = float(rho) * np.ones_like(yk, dtype=float)
-        yk1 = self._project(yk, yk - rho_vec * Fk_val, rho_vec, tcur, Fk_val, prev)
-        # Stuck detection for scalar path
-        den = np.linalg.norm(yk1 - yk)
-        stuck_thresh = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + np.linalg.norm(yk))
-        if den >= stuck_thresh:
-            rk = self._get_rk(func, yk1, yk, rho)
-            while rk > self.L:
-                rho = self.nu * rho
-                # refresh rho_vec
-                if slices is not None and len(slices) > 0:
-                    rb = np.full(len(slices), float(rho), dtype=float)
-                    for v, s in zip(rb, slices):
-                        rho_vec[s] = v
-                else:
-                    rho_vec.fill(float(rho))
-                yk1 = self._project(yk, yk - rho_vec * Fk_val, rho_vec, tcur, Fk_val, prev)
-                den = np.linalg.norm(yk1 - yk)
-                if den < stuck_thresh:
-                    break
-                rk = self._get_rk(func, yk1, yk, rho)
-            if rk < self.Lmin:
-                rho = (1.0 / self.nu) * rho
-        # Clamp
-        rho = float(np.clip(rho, self.rho_min, self.rho_max))
-        return rho
+    #     Fk_val = func(yk)
+    #     self.last_Fk_val = Fk_val
+    #     # Use per-index rho_vec consistently for projection
+    #     slices = getattr(self, 'component_slices', None)
+    #     if slices is not None and len(slices) > 0:
+    #         rho_vec = np.empty_like(yk, dtype=float)
+    #         # expand scalar rho to blocks then to vector
+    #         rb = np.full(len(slices), float(rho), dtype=float)
+    #         for v, s in zip(rb, slices):
+    #             rho_vec[s] = v
+    #     else:
+    #         rho_vec = float(rho) * np.ones_like(yk, dtype=float)
+    #     yk1 = self._project(yk, yk - rho_vec * Fk_val, rho_vec, tcur, Fk_val, prev)
+    #     # Stuck detection for scalar path
+    #     den = np.linalg.norm(yk1 - yk)
+    #     stuck_thresh = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + np.linalg.norm(yk))
+    #     if den >= stuck_thresh:
+    #         rk = self._get_rk(func, yk1, yk, rho)
+    #         while rk > self.L:
+    #             rho = self.nu * rho
+    #             # refresh rho_vec
+    #             if slices is not None and len(slices) > 0:
+    #                 rb = np.full(len(slices), float(rho), dtype=float)
+    #                 for v, s in zip(rb, slices):
+    #                     rho_vec[s] = v
+    #             else:
+    #                 rho_vec.fill(float(rho))
+    #             yk1 = self._project(yk, yk - rho_vec * Fk_val, rho_vec, tcur, Fk_val, prev)
+    #             den = np.linalg.norm(yk1 - yk)
+    #             if den < stuck_thresh:
+    #                 break
+    #             rk = self._get_rk(func, yk1, yk, rho)
+    #         if rk < self.Lmin:
+    #             rho = (1.0 / self.nu) * rho
+    #     # Clamp
+    #     rho = float(np.clip(rho, self.rho_min, self.rho_max))
+    #     return rho
 
-    def _get_rk(self, func, yk1, yk, rho):
-        num = rho * np.linalg.norm(func(yk1) - func(yk))
-        den = np.linalg.norm(yk1 - yk)
-        return 0.0 if den == 0.0 else (num / den)
+    # def _get_rk(self, func, yk1, yk, rho):
+    #     num = rho * np.linalg.norm(func(yk1) - func(yk))
+    #     den = np.linalg.norm(yk1 - yk)
+    #     return 0.0 if den == 0.0 else (num / den)
 
 
 

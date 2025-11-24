@@ -2,7 +2,7 @@ import numpy as np
 
 
 def test_fun_receives_time_and_fk():
-    import Solve_IVP_NS as sivp
+    import solve_nivp as sivp
 
     calls = []
 
@@ -37,7 +37,7 @@ def test_fun_receives_time_and_fk():
 
 
 def test_projection_receives_time_and_fk_in_vi():
-    import Solve_IVP_NS as sivp
+    import solve_nivp as sivp
     received = {"t": None, "fk": None}
 
     # trivial fun
@@ -59,10 +59,10 @@ def test_projection_receives_time_and_fk_in_vi():
     t_span = (0.0, 0.01)
 
     # Use lower-level API to plug our projection
-    from Solve_IVP_NS.nonlinear_solvers import ImplicitEquationSolver
-    from Solve_IVP_NS.integrations import BackwardEuler
-    from Solve_IVP_NS.ODESystem import ODESystem
-    from Solve_IVP_NS.ODESolver import ODESolver
+    from solve_nivp.nonlinear_solvers import ImplicitEquationSolver
+    from solve_nivp.integrations import BackwardEuler
+    from solve_nivp.ODESystem import ODESystem
+    from solve_nivp.ODESolver import ODESolver
 
     solver = ImplicitEquationSolver(method='VI', proj=ProbeProjection(), component_slices=[slice(0,2)])
     integrator = BackwardEuler(solver=solver)

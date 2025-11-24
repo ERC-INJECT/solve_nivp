@@ -1,17 +1,17 @@
 
-Solve_IVP_NS API
-================
+solve_nivp API
+==============
 
 .. autosummary::
    :toctree: api
    :recursive:
    :caption: Public modules
 
-   Solve_IVP_NS
-   Solve_IVP_NS.ODESystem
-   Solve_IVP_NS.ODESolver
-   Solve_IVP_NS.integrations
-   Solve_IVP_NS.adaptive_integrator
-   Solve_IVP_NS.nonlinear_solvers
-   Solve_IVP_NS.projections
-   Solve_IVP_NS.rl
+   solve_nivp
+   solve_nivp.ODESystem
+   solve_nivp.ODESolver
+   solve_nivp.integrations
+   solve_nivp.adaptive_integrator
+   solve_nivp.nonlinear_solvers
+   solve_nivp.projections
+   solve_nivp.rl

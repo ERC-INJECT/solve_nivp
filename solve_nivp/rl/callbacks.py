@@ -11,7 +11,7 @@ try:  # pragma: no cover - import guard
     from stable_baselines3.common.callbacks import BaseCallback  # type: ignore
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "Callback utilities require stable-baselines3. Install Solve_IVP_NS[rl] or add the dependency manually."
+        "Callback utilities require stable-baselines3. Install solve_nivp[rl] or add the dependency manually."
     ) from exc
 
 try:  # pragma: no cover - optional plotting

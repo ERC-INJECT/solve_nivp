@@ -2,7 +2,7 @@ import numpy as np
 import scipy.sparse as sp
 import pytest
 
-from Solve_IVP_NS.projections import IdentityProjection, SignProjection, CoulombProjection
+from solve_nivp.projections import IdentityProjection, SignProjection, CoulombProjection
 
 
 def test_identity_tangent_is_identity_any_y():

@@ -1,4 +1,4 @@
-"""Solve_IVP_NS: Nonsmooth implicit IVP / (simple) DAE solver tooling.
+"""solve_nivp: Nonsmooth implicit IVP / (simple) DAE solver tooling.
 
 This package provides building blocks for integrating systems of the form::
 
@@ -38,7 +38,7 @@ implicit equation residual (e.g. Backward Euler) not the projected gap.
 Quick start
 -----------
 >>> import numpy as np
->>> from Solve_IVP_NS import solve_ivp_ns, CoulombProjection
+>>> from solve_nivp import solve_ivp_ns, CoulombProjection
 >>> def rhs(t, y):
 ...     return -y  # simple stable linear test
 >>> t, y, h, fk, info = solve_ivp_ns(rhs, (0.0, 1.0), y0=np.array([1.0]), method='backward_euler')

@@ -3,19 +3,19 @@ def main():
     Run the project's test suite with visible output and a brief environment summary.
 
     Usage:
-        solve_ivp_ns-selftest
+        solve_nivp-selftest
     """
     import sys
     import os
     import platform
     from importlib import import_module
 
-    print("\n=== Solve_IVP_NS self-test ===")
+    print("\n=== solve_nivp self-test ===")
     try:
-        import Solve_IVP_NS as sivp
-        print(f"Package: Solve_IVP_NS {getattr(sivp, '__version__', '0.1.0')} @ {os.path.dirname(sivp.__file__)}")
+        import solve_nivp as sivp
+        print(f"Package: solve_nivp {getattr(sivp, '__version__', '0.1.0')} @ {os.path.dirname(sivp.__file__)}")
     except Exception as e:
-        print("Could not import Solve_IVP_NS:", e)
+        print("Could not import solve_nivp:", e)
         return 1
 
     try:

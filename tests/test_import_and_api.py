@@ -2,7 +2,7 @@ import numpy as np
 
 
 def test_package_import_and_basic_api():
-    import Solve_IVP_NS as sivp
+    import solve_nivp as sivp
 
     # Simple linear ODE: dy/dt = -y
     def fun(t, y):

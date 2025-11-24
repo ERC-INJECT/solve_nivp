@@ -1,5 +1,5 @@
 import numpy as np
-from Solve_IVP_NS.projections import CoulombProjection
+from solve_nivp.projections import CoulombProjection
 
 def conf(y, t=None, Fk_val=None):
     # Simple linear map for testing

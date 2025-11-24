@@ -4,7 +4,7 @@ Quickstart
 Install
 -------
 
-- Stable: ``pip install Solve_IVP_NS``
+- Stable: ``pip install solve_nivp``
 - From source (editable): ``pip install -e .[test]``
 
 Minimal example
@@ -13,7 +13,7 @@ Minimal example
 .. code-block:: python
 
     import numpy as np
-    from Solve_IVP_NS import solve_ivp_ns
+    from solve_nivp import solve_ivp_ns
 
     # y' = -y with identity projection
     rhs = lambda t, y: -y

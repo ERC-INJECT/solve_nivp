@@ -1,4 +1,4 @@
-"""Optional dependency helpers for the Solve_IVP_NS RL subpackage."""
+"""Optional dependency helpers for the solve_nivp RL subpackage."""
 
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ def ensure_rl_dependencies() -> None:
             missing.append(name)
 
     if missing:
-        extras = "Solve_IVP_NS[rl]"
+        extras = "solve_nivp[rl]"
         missing_str = ", ".join(sorted(missing))
         raise ImportError(
-            "The Solve_IVP_NS RL utilities require optional packages that are not installed. "
+            "The solve_nivp RL utilities require optional packages that are not installed. "
             f"Missing: {missing_str}. Install them via 'pip install {extras}'."
         )

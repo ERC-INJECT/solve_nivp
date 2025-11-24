@@ -6,7 +6,7 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = 'solve_ivp_ns'
+project = 'solve_nivp'
 copyright = '2025, David Riley'
 author = 'David Riley'
 release = 'March 26, 2025'

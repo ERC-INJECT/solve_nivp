@@ -3,7 +3,7 @@ import numpy as np
 
 def test_semismooth_sparse_path_runs():
     # A moderately sized linear system to trigger sparse code path
-    import Solve_IVP_NS as sivp
+    import solve_nivp as sivp
     n = 300
     A = np.eye(n)
 
