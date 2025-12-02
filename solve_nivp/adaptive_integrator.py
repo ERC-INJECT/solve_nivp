@@ -100,7 +100,7 @@ class AdaptiveStepping:
         self.record_attempts = bool(record_attempts)
 
         # numerical order p of the base integrator
-        self.p = 1.0 #int(method_order) if method_order is not None else self._infer_method_order(integrator)
+        self.p = int(method_order) if method_order is not None else self._infer_method_order(integrator)
 
         # ----- classic PI controller parameters -----
         self.safety = float(safety)

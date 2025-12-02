@@ -88,12 +88,21 @@ class IdentityProjection(Projection):
 
     tangent_cone returns the identity matrix of appropriate shape.
     """
+
+    def __init__(self, component_slices=None):
+        super().__init__(component_slices=component_slices)
+        self._eye_cache = {}
+
     def project(self, current_state, candidate, rhok=None, t=None, Fk_val=None):
         return candidate
 
     def tangent_cone(self, candidate, current_state, rhok=None, t=None, Fk_val=None):
         n = candidate.shape[0]
-        return np.eye(n)
+        eye = self._eye_cache.get(n)
+        if eye is None:
+            eye = sp.eye(n, format='csr')
+            self._eye_cache[n] = eye
+        return eye
 
     def project_batch(self, current_state, candidates, rhok=None, t=None, Fk_val=None):
         return np.asarray(candidates)

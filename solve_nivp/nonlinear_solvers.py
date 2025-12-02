@@ -1,5 +1,3 @@
-
-
 # nonlinear_solvers.py  (fast-path projector dispatch)
 
 from __future__ import annotations
@@ -33,7 +31,7 @@ class ImplicitEquationSolver:
         sparse: bool | str = 'auto',
         sparse_threshold: int = 200,
         linear_solver: str = 'gmres',
-        precond_reuse_steps: int = 5,
+        precond_reuse_steps: int = 20,
         ilu_drop_tol: float = 1e-4,
         ilu_fill_factor: float = 10.0,
         gmres_tol: float = 1e-6,
@@ -129,8 +127,22 @@ class ImplicitEquationSolver:
         self._last_shape = None
         self._last_pattern = None
 
+        # SPLU cache
+        self._lu = None
+        self._lu_use_count = 0
+        self._lu_pattern = None
+        self._lu_shape = None
+
         # Identity caches
         self._I_cache = {}
+
+        # Jacobian structure cache (for dense-to-sparse optimization)
+        self._J_cached = None
+        self._J_rows = None
+
+        # Tangent structure cache (for dense-to-sparse optimization)
+        self._D_cached = None
+        self._D_rows = None
 
         # Initialize rho state (scalar default + structured cache)
         self._set_initial_rho(rho0)
@@ -435,11 +447,8 @@ class ImplicitEquationSolver:
                 J_in = self._B
                 used_broyden = True
             else:
-                if self.jacobian is not None:
-                    J_in = self.jacobian(y)
-                else:
-                    mode = 'cs' if getattr(self, 'autodiff_mode', 'numerical') == 'cs' else 'fd'
-                    J_in = self._numerical_jacobian(func, y, sparse=sparse_active, mode=mode)
+                # Use optimized Jacobian computation with caching
+                J_in = self._compute_jacobian_csr(func, y, sparse_active)
 
             # Eisenstat–Walker tol for GMRES if enabled
             rtol_dyn = self.gmres_tol
@@ -448,21 +457,29 @@ class ImplicitEquationSolver:
                 rtol_dyn = max(self.gmres_tol, eta)
 
             if sparse_active:
-                # Use matrix-free linear operator to avoid forming (I - D) + lam * D @ J_in
+                # Sparse path: either use matrix-free GMRES (default) or explicit matrix + SPLU.
                 J_in = self._to_csr(J_in)
-                Dproj = self._to_csr(self._tangent(candidate, y, lam, tcur, F_in, prev), n)
+                Dproj = self._compute_tangent_csr(candidate, y, lam, tcur, F_in, prev, n)
                 rhs = -F_buf
 
-                # Define matvec and rmatvec for LinearOperator: J = I - D + lam * D @ J_in
-                def _matvec(v, _D=Dproj, _J=J_in, _lam=lam):
-                    return (v - _D @ v) + _lam * (_D @ (_J @ v))
+                if self.linear_solver == 'splu':
+                    # Form explicit sparse Jacobian: J = I - D + lam * D @ J_in
+                    J_mat = I - Dproj + lam * (Dproj @ J_in)
+                    if not sp.issparse(J_mat):
+                        J_mat = self._to_csr(J_mat, n)
+                    delta, ok = self._solve_linear_sparse(J_mat, rhs, rtol=rtol_dyn, pattern_hint=None)
+                else:
+                    # Matrix-free LinearOperator path: GMRES (with optional ILU preconditioning)
+                    def _matvec(v, _D=Dproj, _J=J_in, _lam=lam):
+                        return (v - _D @ v) + _lam * (_D @ (_J @ v))
 
-                def _rmatvec(w, _D=Dproj, _J=J_in, _lam=lam):
-                    # J^T = I - D^T + lam * J_in^T @ D^T
-                    return (w - _D.T @ w) + _lam * (_J.T @ (_D.T @ w))
+                    def _rmatvec(w, _D=Dproj, _J=J_in, _lam=lam):
+                        # J^T = I - D^T + lam * J_in^T @ D^T
+                        return (w - _D.T @ w) + _lam * (_J.T @ (_D.T @ w))
 
-                J = spla.LinearOperator((n, n), matvec=_matvec, rmatvec=_rmatvec)
-                delta, ok = self._solve_linear_sparse(J, rhs, rtol=rtol_dyn, pattern_hint=None)
+                    J = spla.LinearOperator((n, n), matvec=_matvec, rmatvec=_rmatvec)
+                    delta, ok = self._solve_linear_sparse(J, rhs, rtol=rtol_dyn, pattern_hint=None)
+
                 if not ok:
                     return (y, F_in, errF, False, iteration)
             else:
@@ -974,10 +991,125 @@ class ImplicitEquationSolver:
         use_sparse = self._sparse_active(n) if sparse is None else bool(sparse)
         return J if not use_sparse else sp.csr_matrix(J)
 
+    def _compute_jacobian_csr(self, func, y, sparse_active):
+        """Compute Jacobian and return as CSR, using caching to avoid dense-to-sparse overhead."""
+        # 1. Compute raw Jacobian (dense or sparse)
+        if self.jacobian is not None:
+            J_raw = self.jacobian(y)
+        else:
+            mode = 'cs' if getattr(self, 'autodiff_mode', 'numerical') == 'cs' else 'fd'
+            J_raw = self._numerical_jacobian(func, y, sparse=sparse_active, mode=mode)
+
+        if not sparse_active:
+            return J_raw
+
+        # Check if cache needs reset due to shape change
+        if self._J_cached is not None and self._J_cached.shape != (len(y), len(y)):
+            self._J_cached = None
+            self._J_rows = None
+
+        # 2. Convert/Cache for Sparse
+        if self._J_cached is not None:
+            if sp.issparse(J_raw):
+                # Assume constant pattern: copy data
+                if self._J_cached.data.size == J_raw.data.size:
+                     self._J_cached.data[:] = J_raw.data
+                     return self._J_cached
+                else:
+                     # Pattern changed? Rebuild
+                     self._J_cached = self._to_csr(J_raw)
+                     self._J_rows = None
+                     return self._J_cached
+            elif isinstance(J_raw, np.ndarray):
+                # Dense update into sparse cache
+                if self._J_rows is None:
+                     n = self._J_cached.shape[0]
+                     self._J_rows = np.repeat(np.arange(n), np.diff(self._J_cached.indptr))
+                
+                # Fast update using fancy indexing
+                try:
+                    self._J_cached.data[:] = J_raw[self._J_rows, self._J_cached.indices]
+                    return self._J_cached
+                except Exception:
+                    pass
+
+        # 3. Build Cache (First time or fallback)
+        J_csr = self._to_csr(J_raw)
+        self._J_cached = J_csr
+        
+        # If J_raw was dense, prepare rows for future fast updates
+        if isinstance(J_raw, np.ndarray) and not sp.issparse(J_raw):
+             n = J_csr.shape[0]
+             self._J_rows = np.repeat(np.arange(n), np.diff(J_csr.indptr))
+        
+        return J_csr
+
+    def _compute_tangent_csr(self, candidate, y, lam, tcur, F_in, prev, n):
+        """Compute Tangent and return as CSR, using caching to avoid dense-to-sparse overhead."""
+        # 1. Compute raw Tangent (dense or sparse)
+        D_raw = self._tangent(candidate, y, lam, tcur, F_in, prev)
+
+        # Check if cache needs reset due to shape change
+        if self._D_cached is not None and self._D_cached.shape != (n, n):
+            self._D_cached = None
+            self._D_rows = None
+
+        # 2. Convert/Cache for Sparse
+        if self._D_cached is not None:
+            if sp.issparse(D_raw):
+                # Assume constant pattern: copy data
+                if self._D_cached.data.size == D_raw.data.size:
+                     self._D_cached.data[:] = D_raw.data
+                     return self._D_cached
+                else:
+                     # Pattern changed? Rebuild
+                     self._D_cached = self._to_csr(D_raw, n)
+                     self._D_rows = None
+                     return self._D_cached
+            elif isinstance(D_raw, np.ndarray):
+                # Dense update into sparse cache
+                if self._D_rows is None:
+                     # If D_raw is 1D (diagonal), handle separately or treat as dense diagonal
+                     if D_raw.ndim == 1:
+                         # 1D array -> diagonal matrix. 
+                         # If cached structure matches diagonal, we can update data directly?
+                         # Usually sp.diags is fast, but let's see if we can update in place.
+                         # For diagonal CSR, indices are 0..n-1, indptr is 0..n.
+                         # It's safer/easier to just use sp.diags unless we really want to cache structure.
+                         # Given profiling showed _to_csr cost, let's cache the diagonal structure too.
+                         pass
+                     else:
+                         self._D_rows = np.repeat(np.arange(n), np.diff(self._D_cached.indptr))
+                
+                # Fast update using fancy indexing
+                try:
+                    if D_raw.ndim == 1:
+                        # Special case: D_raw is diagonal vector, D_cached is CSR diagonal
+                        # CSR diagonal data is just the vector itself if constructed via sp.diags(v).tocsr()
+                        # But let's be safe:
+                        self._D_cached.data[:] = D_raw
+                    else:
+                        self._D_cached.data[:] = D_raw[self._D_rows, self._D_cached.indices]
+                    return self._D_cached
+                except Exception:
+                    pass
+
+        # 3. Build Cache (First time or fallback)
+        D_csr = self._to_csr(D_raw, n)
+        self._D_cached = D_csr
+        
+        # If D_raw was dense, prepare rows for future fast updates
+        if isinstance(D_raw, np.ndarray) and not sp.issparse(D_raw):
+             if D_raw.ndim == 2:
+                 self._D_rows = np.repeat(np.arange(n), np.diff(D_csr.indptr))
+             # For 1D, we don't need rows, we just copy 1:1 if structure matches
+        
+        return D_csr
+
     # ---------- Sparse helpers ----------
     def _to_csr(self, A, n=None):
         if sp.issparse(A):
-            return A.tocsr()
+            return A if isinstance(A, sp.csr_matrix) else A.tocsr()
         if isinstance(A, np.ndarray):
             if A.ndim == 1:
                 return sp.diags(A, format='csr')
@@ -1004,18 +1136,66 @@ class ImplicitEquationSolver:
             return (x, info == 0)
 
         if self.linear_solver == 'splu':
-            try:
-                lu = spla.splu(J.tocsc(), permc_spec=self.splu_permc_spec)
-                x = lu.solve(b)
-                return x, True
-            except Exception:
-                x, info = self._gmres(
-                    J, b,
-                    rtol=(self.gmres_tol if rtol is None else rtol),
-                    maxiter=self.gmres_maxiter,
-                    restart=self.gmres_restart,
-                )
-                return (x, info == 0)
+            nnz = getattr(J, 'nnz', None)
+            pattern_key = (J.shape, nnz, pattern_hint)
+            reuse_budget = int(self.precond_reuse_steps)
+
+            def _build_lu():
+                matrix = J
+                if not sp.issparse(matrix):
+                    matrix = sp.csc_matrix(matrix)
+                elif not sp.isspmatrix_csc(matrix):
+                    matrix = matrix.tocsc()
+                self._lu = spla.splu(matrix, permc_spec=self.splu_permc_spec)
+                self._lu_use_count = 0
+                self._lu_pattern = pattern_key
+                self._lu_shape = J.shape
+
+            need_rebuild = (
+                self._lu is None
+                or self._lu_shape != J.shape
+                or self._lu_pattern != pattern_key
+                or reuse_budget <= 0
+                or self._lu_use_count >= reuse_budget
+            )
+
+            if need_rebuild:
+                try:
+                    _build_lu()
+                except Exception:
+                    self._lu = None
+                    self._lu_pattern = None
+                    self._lu_shape = None
+
+            if self._lu is not None:
+                try:
+                    x = self._lu.solve(b)
+                    self._lu_use_count += 1
+                    return x, True
+                except Exception:
+                    # Drop stale factorization and try a single rebuild before falling back
+                    self._lu = None
+                    self._lu_pattern = None
+                    self._lu_shape = None
+                    try:
+                        _build_lu()
+                    except Exception:
+                        self._lu = None
+                        self._lu_pattern = None
+                        self._lu_shape = None
+                    else:
+                        x = self._lu.solve(b)
+                        self._lu_use_count += 1
+                        return x, True
+
+            # Fallback to GMRES if SPLU failed
+            x, info = self._gmres(
+                J, b,
+                rtol=(self.gmres_tol if rtol is None else rtol),
+                maxiter=self.gmres_maxiter,
+                restart=self.gmres_restart,
+            )
+            return (x, info == 0)
         else:
             M = None
             need_rebuild = (
