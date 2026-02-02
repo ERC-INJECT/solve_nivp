@@ -185,7 +185,6 @@ def solve_ivp_ns(
   proj_instance = None
   if projection is not None:
     p = projection.lower()
-    print(p)
     if p == 'coulomb':
       proj_instance = CoulombProjection(**projection_opts)
     elif p == 'sign':

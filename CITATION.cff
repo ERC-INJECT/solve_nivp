@@ -3,12 +3,12 @@ title: "solve_nivp: A Python toolkit for integrating nonsmooth dynamical systems
 version: 0.1.0
 authors:
   - family-names: Riley
-    given-names: David
-    orcid: "https://orcid.org/0000-0000-0000-0000"
+    given-names: David Michael
+    orcid: "https://orcid.org/0000-0002-5463-5357"
   - family-names: Stefanou
     given-names: Ioannis
-    orcid: "https://orcid.org/0000-0000-0000-0000"
-repository-code: "https://github.com/your-org/solve_nivp"
+    orcid: "https://orcid.org/0000-0002-4552-7717"
+repository-code: "https://github.com/ERC-INJECT/solve_nivp"
 license: MIT
 keywords:
   - nonsmooth dynamics

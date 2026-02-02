@@ -10,7 +10,7 @@ def test_identity_tangent_is_identity_any_y():
     P = IdentityProjection()
     D = P.tangent_cone(candidate=y, current_state=y)
     assert D.shape == (3, 3)
-    np.testing.assert_allclose(D, np.eye(3))
+    np.testing.assert_allclose(D.toarray(), np.eye(3))
 
 
 def test_sign_projection_project_and_tangent():
