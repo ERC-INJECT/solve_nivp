@@ -35,9 +35,9 @@ napoleon_numpy_docstring = True
 
 # Intersphinx mappings for cross-references
 intersphinx_mapping = {
-    'python': ('https://docs.python.org/3', {}),
-    'numpy': ('https://numpy.org/doc/stable/', {}),
-    'scipy': ('https://docs.scipy.org/doc/scipy/', {}),
+    'python': ('https://docs.python.org/3', None),
+    'numpy': ('https://numpy.org/doc/stable/', None),
+    'scipy': ('https://docs.scipy.org/doc/scipy/', None),
 }
 
 templates_path = ['_templates']
