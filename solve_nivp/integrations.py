@@ -702,6 +702,191 @@ class CompositeMethod(IntegrationMethod):
         return (y_new, Fk_new, err_new, overall_success, total_iters)
 
 
+class SDIRK2(BackwardEuler):
+    r"""Two-stage, L-stable, singly diagonally implicit Runge–Kutta method of
+    order 2 with an embedded order-1 error estimate.
+
+    Butcher tableau (Alexander 1977)::
+
+        γ   | γ     0
+        1   | 1-γ   γ
+        ----|----------
+            | 1-γ   γ     ← order 2
+            | 1     0     ← order 1 (embedded)
+
+    where γ = 1 − √2/2 ≈ 0.2929.
+
+    Each stage requires one implicit solve with the *same* diagonal
+    coefficient γ, which means the iteration matrix
+    ``(A/(γh) − df/dy)`` can in principle be reused across both stages.
+
+    The embedded pair yields a cheap local-truncation-error estimate
+    expressed purely in terms of the stage values (mass-matrix agnostic)::
+
+        err = (Y₂ − y_shift) − (Y₁ − y)
+
+    where ``y_shift = y + ((1−γ)/γ)(Y₁ − y)``.  This is returned as
+    the ``err`` component of the 5-tuple.  The adaptive stepper
+    (:class:`AdaptiveStepping`) can therefore skip the three-solve
+    Richardson extrapolation when this integrator is used.
+
+    Parameters
+    ----------
+    solver : ImplicitEquationSolver, optional
+        Nonlinear solver instance.
+    A : ndarray or sparse matrix, optional
+        Mass / descriptor matrix; identity if *None*.
+    pass_prev_state, pass_step_size : bool
+        Forwarded to :class:`BackwardEuler`.
+    """
+
+    # Diagonal coefficient  γ = 1 − √2/2
+    _GAMMA = 1.0 - math.sqrt(2.0) / 2.0
+
+    def __init__(self, solver=None, A=None, **kwargs):
+        super().__init__(solver=solver, A=A, **kwargs)
+        self.order = 2  # method order for the adaptive controller
+        self.has_embedded_error = True  # bypass Richardson in AdaptiveStepping
+
+    # ------------------------------------------------------------------
+    def step(self, fun, t, y, h):
+        r"""Advance by one SDIRK2 step of size *h*.
+
+        Returns
+        -------
+        y_new : ndarray
+            State at ``t + h`` (second-order accurate).
+        Fk_new : ndarray or None
+            Residual at the converged iterate of stage 2.
+        err : ndarray
+            Element-wise embedded error estimate ``(Y₂ − y_shift) − (Y₁ − y)``,
+            equivalent to ``h γ (K₂ − K₁)`` where ``K_i`` are the stage
+            derivatives.  Mass-matrix agnostic.
+        success : bool
+            True if *both* stage solves converged.
+        iterations : int
+            Sum of nonlinear iterations over the two stages.
+        """
+        gamma = self._GAMMA
+        n = len(y)
+        A_local = self._get_A(n)
+        gh = gamma * h  # diagonal sub-step length
+
+        # -- helpers for flexible RHS calling ----------------------------
+        prev_state_arg = y if self.pass_prev_state else None
+        step_size_arg = h if self.pass_step_size else None
+        _rhs = self._get_bound_wrapper(
+            fun,
+            has_prev=(prev_state_arg is not None),
+            has_h=(step_size_arg is not None),
+            cache=self._fun_bindings,
+        )
+
+        def _call_fun(tt, yy, Fk=None):
+            return _rhs(tt, yy, Fk, prev_state_arg, step_size_arg)
+
+        # ================================================================
+        # Stage 1:  solve  A (Y1 − y)/(γh) − f(t + γh, Y1) = 0
+        # ================================================================
+        def implicit_s1(Y1):
+            return A_local @ ((Y1 - y) / gh) - _call_fun(
+                t + gh, Y1, getattr(self.solver, 'last_Fk_val', None)
+            )
+
+        # Exact Jacobian for stage 1 (if available)
+        rhs_jac = getattr(self.solver, 'rhs_jacobian', None)
+        if callable(rhs_jac) and getattr(self.solver, 'method', None) != 'VI':
+            A_over_gh = A_local / gh
+
+            def jac_s1(Y1, _Aogh=A_over_gh, _t=t, _gh=gh):
+                fk_val = getattr(self.solver, 'last_Fk_val', None)
+                _jac = self._get_bound_wrapper(
+                    rhs_jac,
+                    has_prev=(prev_state_arg is not None),
+                    has_h=(step_size_arg is not None),
+                    cache=self._jac_bindings,
+                )
+                J_rhs = _jac(_t + _gh, Y1, fk_val, prev_state_arg, step_size_arg)
+                return _Aogh - J_rhs
+
+            self.solver.jacobian = jac_s1
+
+        # Thread step-context for stage 1
+        try:
+            self.solver.current_time = t + gh
+            self.solver.prev_state = y
+            self.solver.prev_time = t
+            self.solver.prev_step = gh
+        except Exception:
+            pass
+
+        Y1, Fk1, err1, ok1, it1 = self.solver.solve(implicit_s1, y)
+        if not ok1:
+            return y, Fk1, np.zeros(n), False, it1
+
+        # ================================================================
+        # Stage 2:  solve  A (Y2 − y_shift) / (γh) − f(t+h, Y2) = 0
+        #
+        # The Butcher stage derivative K1 = (Y1 − y)/(γh).  The stage-2
+        # shift uses K1 directly (no f evaluation or M⁻¹ needed):
+        #   y_shift = y + (1−γ)h K1 = y + ((1−γ)/γ)(Y1 − y)
+        # ================================================================
+        dY1 = Y1 - y                                   # stage-1 increment
+        y_shift = y + ((1.0 - gamma) / gamma) * dY1    # mass-matrix agnostic
+
+        def implicit_s2(Y2):
+            return A_local @ ((Y2 - y_shift) / gh) - _call_fun(
+                t + h, Y2, getattr(self.solver, 'last_Fk_val', None)
+            )
+
+        # Exact Jacobian for stage 2 (same structure, different time)
+        if callable(rhs_jac) and getattr(self.solver, 'method', None) != 'VI':
+            A_over_gh = A_local / gh
+
+            def jac_s2(Y2, _Aogh=A_over_gh, _t=t, _h=h):
+                fk_val = getattr(self.solver, 'last_Fk_val', None)
+                _jac = self._get_bound_wrapper(
+                    rhs_jac,
+                    has_prev=(prev_state_arg is not None),
+                    has_h=(step_size_arg is not None),
+                    cache=self._jac_bindings,
+                )
+                J_rhs = _jac(_t + _h, Y2, fk_val, prev_state_arg, step_size_arg)
+                return _Aogh - J_rhs
+
+            self.solver.jacobian = jac_s2
+
+        # Thread step-context for stage 2
+        try:
+            self.solver.current_time = t + h
+            self.solver.prev_state = Y1
+            self.solver.prev_time = t + gh
+            self.solver.prev_step = gh
+        except Exception:
+            pass
+
+        # Good initial guess: extrapolate from stage 1
+        Y2_guess = y_shift
+        Y2, Fk2, err2, ok2, it2 = self.solver.solve(implicit_s2, Y2_guess)
+        if not ok2:
+            return y, Fk2, np.zeros(n), False, it1 + it2
+
+        # ================================================================
+        # Output
+        # ================================================================
+        # y_{n+1} = Y2  (already the second-order solution)
+        y_new = Y2
+
+        # Embedded error estimate (mass-matrix agnostic, uses stage values):
+        #   err = h γ (K2 − K1)
+        #       = (Y2 − y_shift) − (Y1 − y)
+        #       = (Y2 − y_shift) − dY1
+        err_embed = (Y2 - y_shift) - dY1
+
+        total_iters = it1 + it2
+        return y_new, Fk2, err_embed, True, total_iters
+
+
 class EmbeddedBETR(IntegrationMethod):
     """
     Trapezoidal implicit integrator (kept under the historical name EmbeddedBETR).

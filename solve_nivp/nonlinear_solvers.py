@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import warnings
 import math
+
+# Configure logger for PETSc timing (works in VS Code Jupyter)
+_petsc_logger = logging.getLogger('solve_nivp.petsc')
+_petsc_logger.setLevel(logging.DEBUG)
+if not _petsc_logger.handlers:
+    _handler = logging.StreamHandler()  # stderr by default
+    _handler.setFormatter(logging.Formatter('%(message)s'))
+    _petsc_logger.addHandler(_handler)
+
+# Optional PETSc support
+try:
+    from petsc4py import PETSc
+    PETSC_AVAILABLE = True
+except ImportError:
+    PETSC_AVAILABLE = False
+    PETSc = None
 
 class ImplicitEquationSolver:
     """Solve F(y)=0 with projection-aware VI or semismooth Newton (fast path)."""
@@ -53,6 +70,9 @@ class ImplicitEquationSolver:
         # VI strict per-block Lipschitz enforcement (opt-in)
         vi_strict_block_lipschitz: bool = True,
         vi_max_block_adjust_iters: int = 10,
+        # PETSc options
+        petsc_options: dict | None = None,
+        petsc_reuse_steps: int = 10,
     ) -> None:
         if method not in ['VI', 'semismooth_newton']:
             raise ValueError("Unsupported solver method. Use 'VI' or 'semismooth_newton'.")
@@ -111,6 +131,19 @@ class ImplicitEquationSolver:
         # VI strict block Lipschitz options
         self.vi_strict_block_lipschitz = bool(vi_strict_block_lipschitz)
         self.vi_max_block_adjust_iters = int(vi_max_block_adjust_iters)
+
+        # PETSc configuration
+        self.petsc_options = petsc_options if petsc_options is not None else {
+            'ksp_type': 'gmres',
+            'pc_type': 'hypre',
+            'pc_hypre_type': 'boomeramg',
+        }
+        self.petsc_reuse_steps = int(petsc_reuse_steps)
+        self._petsc_ksp = None
+        self._petsc_mat = None
+        self._petsc_build_count = 0
+        self._petsc_shape = None
+        self._petsc_field_is = None  # Index sets for field-split
 
         # Rho adaptation safeguards (bounds and "stuck" thresholds)
         # These are conservative defaults; they can be adjusted by users after construction if needed.
@@ -174,6 +207,8 @@ class ImplicitEquationSolver:
                 return False
 
         P = self.proj
+        _self = self  # avoid closure over self for step_size lookup
+
         # --- detect what the projector exposes ---
         has_prev_p = _supports(P.project, 'prev_state')
         has_step_p = _supports(P.project, 'step_size')
@@ -183,44 +218,58 @@ class ImplicitEquationSolver:
         has_Fk_p   = _supports(P.project, 'Fk_val')
 
         # ---- PROJECT BINDER ----
-        if has_prev_p:
-            def _project(cur, cand, rho, t, Fk, prev):
-                # Only pass parameters the projector actually accepts
-                kw = {}
-                if has_t_p:   kw['t'] = t
-                if has_Fk_p:  kw['Fk_val'] = Fk
-                if has_step_p:
-                    kw['step_size'] = getattr(self, 'prev_step', None)
-                kw['prev_state'] = prev
+        # Build a specialized closure that directly passes only the needed args,
+        # avoiding the construction of a kwargs dict on every call.
+        _proj_fn = P.project
 
-                if has_rhok_p:
-                    # projector expects keyword rhok
-                    kw['rhok'] = rho
-                    return P.project(cur, cand, **kw)
-                elif has_rho_p:
-                    # projector expects a 'rho' parameter (positional-or-keyword) — pass positionally
-                    return P.project(cur, cand, rho, **kw)
-                else:
-                    # projector doesn't want any stepsize param
-                    return P.project(cur, cand, **kw)
+        # Precompute a bitmask of which kwargs are needed
+        # bits: 1=t, 2=Fk, 4=step_size, 8=prev_state, 16=rhok-keyword, 32=rho-positional
+        p_mask = 0
+        if has_t_p:    p_mask |= 1
+        if has_Fk_p:   p_mask |= 2
+        if has_step_p: p_mask |= 4
+        if has_prev_p: p_mask |= 8
+        if has_rhok_p: p_mask |= 16
+        elif has_rho_p: p_mask |= 32
+
+        if p_mask == 16:  # common: just rhok keyword
+            def _project(cur, cand, rho, t, Fk, prev):
+                return _proj_fn(cur, cand, rhok=rho)
+        elif p_mask == 32:  # just rho positional
+            def _project(cur, cand, rho, t, Fk, prev):
+                return _proj_fn(cur, cand, rho)
+        elif p_mask == 0:  # no extras
+            def _project(cur, cand, rho, t, Fk, prev):
+                return _proj_fn(cur, cand)
+        elif p_mask == (1 | 2 | 16):  # t + Fk + rhok
+            def _project(cur, cand, rho, t, Fk, prev):
+                return _proj_fn(cur, cand, rhok=rho, t=t, Fk_val=Fk)
+        elif p_mask == (1 | 2 | 8 | 16):  # t + Fk + prev + rhok
+            def _project(cur, cand, rho, t, Fk, prev):
+                return _proj_fn(cur, cand, rhok=rho, t=t, Fk_val=Fk, prev_state=prev)
+        elif p_mask == (1 | 2 | 4 | 8 | 16):  # everything with rhok
+            def _project(cur, cand, rho, t, Fk, prev):
+                return _proj_fn(cur, cand, rhok=rho, t=t, Fk_val=Fk,
+                                step_size=getattr(_self, 'prev_step', None), prev_state=prev)
         else:
+            # Generic fallback — still builds a dict, but rare
             def _project(cur, cand, rho, t, Fk, prev):
                 kw = {}
                 if has_t_p:   kw['t'] = t
                 if has_Fk_p:  kw['Fk_val'] = Fk
-                if has_step_p:
-                    kw['step_size'] = getattr(self, 'prev_step', None)
+                if has_step_p: kw['step_size'] = getattr(_self, 'prev_step', None)
+                if has_prev_p: kw['prev_state'] = prev
                 if has_rhok_p:
                     kw['rhok'] = rho
-                    return P.project(cur, cand, **kw)
+                    return _proj_fn(cur, cand, **kw)
                 elif has_rho_p:
-                    return P.project(cur, cand, rho, **kw)
+                    return _proj_fn(cur, cand, rho, **kw)
                 else:
-                    return P.project(cur, cand, **kw)
+                    return _proj_fn(cur, cand, **kw)
 
         self._project = _project
 
-        # ---- TANGENT BINDER (unchanged except we accept both rhok/rho too) ----
+        # ---- TANGENT BINDER ----
         has_prev_t = _supports(P.tangent_cone, 'prev_state')
         has_step_t = _supports(P.tangent_cone, 'step_size')
         has_rhok_t = _supports(P.tangent_cone, 'rhok')
@@ -228,37 +277,58 @@ class ImplicitEquationSolver:
         has_t_t    = _supports(P.tangent_cone, 't')
         has_Fk_t   = _supports(P.tangent_cone, 'Fk_val')
 
-        if has_prev_t:
+        _tang_fn = P.tangent_cone
+        t_mask = 0
+        if has_t_t:    t_mask |= 1
+        if has_Fk_t:   t_mask |= 2
+        if has_step_t: t_mask |= 4
+        if has_prev_t: t_mask |= 8
+        if has_rhok_t: t_mask |= 16
+        elif has_rho_t: t_mask |= 32
+
+        if t_mask == 16:
             def _tangent(cand, cur, rho, t, Fk, prev):
-                kw = {}
-                if has_t_t:   kw['t'] = t
-                if has_Fk_t:  kw['Fk_val'] = Fk
-                if has_step_t:
-                    kw['step_size'] = getattr(self, 'prev_step', None)
-                kw['prev_state'] = prev
-                if has_rhok_t:
-                    kw['rhok'] = rho
-                    return P.tangent_cone(cand, cur, **kw)
-                elif has_rho_t:
-                    return P.tangent_cone(cand, cur, rho, **kw)
-                else:
-                    return P.tangent_cone(cand, cur, **kw)
+                return _tang_fn(cand, cur, rhok=rho)
+        elif t_mask == 32:
+            def _tangent(cand, cur, rho, t, Fk, prev):
+                return _tang_fn(cand, cur, rho)
+        elif t_mask == 0:
+            def _tangent(cand, cur, rho, t, Fk, prev):
+                return _tang_fn(cand, cur)
+        elif t_mask == (1 | 2 | 16):
+            def _tangent(cand, cur, rho, t, Fk, prev):
+                return _tang_fn(cand, cur, rhok=rho, t=t, Fk_val=Fk)
+        elif t_mask == (1 | 2 | 8 | 16):
+            def _tangent(cand, cur, rho, t, Fk, prev):
+                return _tang_fn(cand, cur, rhok=rho, t=t, Fk_val=Fk, prev_state=prev)
+        elif t_mask == (1 | 2 | 4 | 8 | 16):
+            def _tangent(cand, cur, rho, t, Fk, prev):
+                return _tang_fn(cand, cur, rhok=rho, t=t, Fk_val=Fk,
+                                step_size=getattr(_self, 'prev_step', None), prev_state=prev)
         else:
             def _tangent(cand, cur, rho, t, Fk, prev):
                 kw = {}
                 if has_t_t:   kw['t'] = t
                 if has_Fk_t:  kw['Fk_val'] = Fk
-                if has_step_t:
-                    kw['step_size'] = getattr(self, 'prev_step', None)
+                if has_step_t: kw['step_size'] = getattr(_self, 'prev_step', None)
+                if has_prev_t: kw['prev_state'] = prev
                 if has_rhok_t:
                     kw['rhok'] = rho
-                    return P.tangent_cone(cand, cur, **kw)
+                    return _tang_fn(cand, cur, **kw)
                 elif has_rho_t:
-                    return P.tangent_cone(cand, cur, rho, **kw)
+                    return _tang_fn(cand, cur, rho, **kw)
                 else:
-                    return P.tangent_cone(cand, cur, **kw)
+                    return _tang_fn(cand, cur, **kw)
 
         self._tangent = _tangent
+
+        # Identity projection fast-path flag: when True, solve() bypasses all
+        # projection machinery (tangent, lam adaptation, sparse assembly) and
+        # runs a standard Newton or Richardson iteration directly.
+        self._is_identity_proj = (
+            type(self.proj).__name__ == 'IdentityProjection'
+            or getattr(self.proj, 'is_identity', False)
+        )
 
 
     # ---------- Rho helpers ----------
@@ -298,9 +368,306 @@ class ImplicitEquationSolver:
     def solve(self, func, y0):
         self.set_func(func)
         if self.method == 'VI':
+            if self._is_identity_proj:
+                return self._solve_vi_identity(func, y0)
             return self._solve_with_VI(func, y0)
         else:
+            if self._is_identity_proj:
+                return self._solve_newton_identity(func, y0)
             return self._solve_with_semismooth_newton(func, y0)
+
+    # ================================================================
+    # Identity-projection fast paths (no projection overhead at all)
+    # ================================================================
+
+    def _solve_newton_identity(self, func, y0):
+        """Standard Newton solver — fast path for IdentityProjection.
+
+        Bypasses *all* projection machinery that the general semismooth Newton
+        path performs:
+
+        * No ``_update_rho`` / lam adaptation  (saves 2+ func evals / iter)
+        * No projection call                   (saves function-call overhead)
+        * No tangent-cone computation           (D = I is trivial)
+        * No sparse assembly ``I - D + lam*D@J`` (saves 3 large sparse ops)
+
+        Additionally implements **modified Newton**: the Jacobian (and its
+        SPLU factorization when on the sparse path) is reused across
+        iterations within a solve, and only recomputed when the error
+        did not at least halve compared to the previous iteration.
+        The SPLU factorization is also persisted across successive
+        ``solve()`` calls (via ``self._lu``), so back-to-back time steps
+        that share a similar Jacobian benefit from factorization reuse
+        — analogous to what SciPy's BDF does internally.
+
+        For multi-stage SDIRK methods this is especially beneficial:
+        every stage within one time step shares the *same* diagonal
+        coefficient γh and (for constant-Jacobian problems) the same
+        iteration matrix ``A/(γh) − J``, so the SPLU from stage 1 is
+        reused for stage 2 with zero refactorisation cost.
+        """
+        y = y0.copy()
+        n = len(y)
+        sparse_active = self._sparse_active(n)
+
+        # ---- Modified-Newton state ----
+        # Seed from persistent cache so that back-to-back solve() calls
+        # (e.g. SDIRK2 stage 1 → stage 2, or consecutive time steps with
+        # the same step size and constant Jacobian) reuse the factorisation.
+        J_local = None          # current Jacobian (dense or CSR)
+        lu_local = self._lu if (self._lu is not None and self._lu_shape == (n, n)) else None
+        prev_errF = np.inf      # previous *iteration's* errF (always updated)
+
+        for iteration in range(1, self.max_iter + 1):
+            F_in = func(y)
+            self.last_Fk_val = F_in
+            errF = float(np.linalg.norm(F_in))
+
+            if errF < self.tol:
+                return (y.copy(), F_in, errF, True, iteration)
+
+            # --- Decide whether to recompute J (modified Newton) ---
+            # Recompute J when convergence factor > 0.5 (error didn't at
+            # least halve since last iteration).  On the very first
+            # iteration, if we inherited a cached SPLU from a prior
+            # solve() call, *skip* the Jacobian computation and try the
+            # cached factorisation directly (cross-call modified Newton).
+            # This is the key path for SDIRK multi-stage reuse: both
+            # stages share the same iteration matrix A/(γh)−J, so stage 2
+            # re-uses stage 1's factorisation at zero extra cost.
+            need_J = (
+                (J_local is None and lu_local is None)
+                or errF > 0.5 * prev_errF
+            )
+            prev_errF = errF          # always track for next iteration
+
+            if need_J:
+                J_local = self._compute_jacobian_csr(func, y, sparse_active)
+                lu_local = None               # invalidate cached factorization
+                self._lu = None               # also invalidate persistent cache
+                self._lu_shape = None
+
+            # --- Linear solve: J @ delta = -F_in ---
+            rhs = -F_in
+
+            if sparse_active:
+                # When J_local is available, prepare CSR form for fallback paths
+                J_csr = None
+                if J_local is not None:
+                    J_csr = self._to_csr(J_local) if not sp.issparse(J_local) else J_local
+
+                # Prefer direct SPLU with factorization reuse within this solve
+                # (and across consecutive solve() calls via self._lu).
+                # Fall back to the general _solve_linear_sparse (GMRES/ILU/PETSc)
+                # if SPLU fails (e.g. singular or very large system).
+                if lu_local is not None:
+                    try:
+                        delta = lu_local.solve(rhs)
+                    except Exception:
+                        lu_local = None
+                        self._lu = None
+                        self._lu_shape = None
+
+                if lu_local is None:
+                    # If we still don't have J (cache miss + LU failure), compute now
+                    if J_csr is None:
+                        J_local = self._compute_jacobian_csr(func, y, sparse_active)
+                        J_csr = self._to_csr(J_local) if not sp.issparse(J_local) else J_local
+                    try:
+                        J_csc = J_csr.tocsc() if not sp.isspmatrix_csc(J_csr) else J_csr
+                        lu_local = spla.splu(J_csc, permc_spec=self.splu_permc_spec)
+                        # Persist for cross-call reuse (SDIRK stages, same-h steps)
+                        self._lu = lu_local
+                        self._lu_shape = (n, n)
+                        delta = lu_local.solve(rhs)
+                    except Exception:
+                        # SPLU failed — fall back to configured linear solver
+                        lu_local = None
+                        rtol_dyn = self.gmres_tol
+                        if self.linear_solver == 'gmres' and self.linear_tol_strategy != 'fixed':
+                            eta = min(0.5, self.eisenstat_c * (errF ** self.eisenstat_exp))
+                            rtol_dyn = max(self.gmres_tol, eta)
+                        delta, ok = self._solve_linear_sparse(J_csr, rhs, rtol=rtol_dyn)
+                        if not ok:
+                            # Last resort: recompute J if we hadn't already
+                            if not need_J:
+                                J_local = self._compute_jacobian_csr(func, y, sparse_active)
+                                J_csr = self._to_csr(J_local)
+                                delta, ok = self._solve_linear_sparse(J_csr, rhs, rtol=rtol_dyn)
+                            if not ok:
+                                return (y, F_in, errF, False, iteration)
+            else:
+                J_dense = J_local.toarray() if sp.issparse(J_local) else J_local
+                try:
+                    delta = np.linalg.solve(J_dense, rhs)
+                except np.linalg.LinAlgError:
+                    return (y, F_in, errF, False, iteration)
+
+            # --- Globalization (optional Armijo line search) ---
+            # When J_local is None (using cached LU from a prior solve call),
+            # skip linesearch and accept the full Newton step.  The merit
+            # function gradient requires J^T F which we cannot compute
+            # without J.  In practice this only happens when the cached
+            # factorisation is very close to the true Jacobian (e.g. SDIRK
+            # stage reuse or consecutive same-h steps).
+            if self.globalization == 'linesearch' and J_local is not None:
+                phi0 = 0.5 * errF * errF
+                if sp.issparse(J_local):
+                    grad_phi = J_local.T @ F_in
+                else:
+                    grad_phi = J_local.T @ F_in
+                grad_dir = float(np.dot(grad_phi, delta))
+
+                alpha = 1.0
+                accepted = False
+
+                if np.isfinite(grad_dir) and grad_dir < 0.0:
+                    for _ in range(self.max_backtracks):
+                        y_trial = y + alpha * delta
+                        F_trial = func(y_trial)
+                        phi_trial = 0.5 * float(np.dot(F_trial, F_trial))
+                        if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir:
+                            y = y_trial
+                            accepted = True
+                            break
+                        alpha *= self.ls_beta
+                        if alpha < self.ls_min_alpha:
+                            break
+
+                if not accepted:
+                    # Steepest-descent fallback
+                    nrm_g = float(np.linalg.norm(grad_phi))
+                    if nrm_g == 0.0:
+                        return (y, F_in, errF, False, iteration)
+                    delta_g = -grad_phi
+                    grad_dir_g = -nrm_g * nrm_g
+                    alpha = 1.0
+                    for _ in range(self.max_backtracks):
+                        y_trial = y + alpha * delta_g
+                        F_trial = func(y_trial)
+                        phi_trial = 0.5 * float(np.dot(F_trial, F_trial))
+                        if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir_g:
+                            y = y_trial
+                            accepted = True
+                            break
+                        alpha *= self.ls_beta
+                    if not accepted:
+                        return (y, F_in, errF, False, iteration)
+            else:
+                np.add(y, delta, out=y)
+
+        # Max iterations exhausted
+        F_in = func(y)
+        self.last_Fk_val = F_in
+        errF = float(np.linalg.norm(F_in))
+        return (y, F_in, errF, False, self.max_iter)
+
+    def _solve_vi_identity(self, func, y0):
+        """Fast VI for IdentityProjection — pure Richardson iteration.
+
+        For identity projection the fixed-point map is simply
+        ``y_{k+1} = y_k - rho * F(y_k)`` with no projection calls.
+        The natural residual is ``rho * F(y)`` and the error metric
+        matches the relative block-L2 norm used by the general VI path.
+
+        .. note::
+
+           Richardson iteration converges only linearly.  For stiff PDE
+           systems the semismooth Newton path (``method='semismooth_newton'``)
+           will converge in far fewer iterations.
+        """
+        y = y0.copy()
+        n_vi = y.size
+        slices = self.component_slices
+
+        # --- rho initialisation (mirrors general VI) ---
+        if slices is not None and len(slices) > 0:
+            last = getattr(self, 'rho_last', self.rho0)
+            m = len(slices)
+            if np.isscalar(last):
+                rho_blk = np.full(m, float(last), dtype=float)
+            else:
+                arr = np.asarray(last, dtype=float).reshape(-1)
+                rho_blk = arr.copy() if arr.size == m else np.full(m, float(np.mean(arr)), dtype=float)
+            np.clip(rho_blk, self.rho_min, self.rho_max, out=rho_blk)
+            rho_vec = np.empty(n_vi, dtype=float)
+            for v, s in zip(rho_blk, slices):
+                rho_vec[s] = float(v)
+        else:
+            rho_scalar = float(getattr(self, 'rho_last', self.rho0))
+            if not (np.isfinite(rho_scalar) and rho_scalar > 0):
+                rho_scalar = 1.0
+            rho_scalar = float(np.clip(rho_scalar, self.rho_min, self.rho_max))
+            rho_vec = np.full(n_vi, rho_scalar, dtype=float)
+            rho_blk = rho_scalar  # kept for _set_rho_last
+
+        # --- helper: block-relative error (same metric as general VI) ---
+        def _err(r_vec, y_vec):
+            if slices is not None and len(slices) > 0:
+                vals = []
+                for s in slices:
+                    rs, ys = r_vec[s], y_vec[s]
+                    nn = max(1, rs.size)
+                    nr = float(np.linalg.norm(rs)) / math.sqrt(nn)
+                    ny = float(np.linalg.norm(ys)) / math.sqrt(nn)
+                    vals.append(nr / (1.0 + ny))
+                return max(vals) if vals else 0.0
+            nn = max(1, r_vec.size)
+            return (float(np.linalg.norm(r_vec)) / math.sqrt(nn)
+                    / (1.0 + float(np.linalg.norm(y_vec)) / math.sqrt(nn)))
+
+        # --- buffers ---
+        _r_buf = np.empty(n_vi, dtype=float)
+
+        Fk = func(y)
+        self.last_Fk_val = Fk
+        np.multiply(rho_vec, Fk, out=_r_buf)          # residual = rho * F
+        err = _err(_r_buf, y)
+
+        k = 0
+        while err > self.tol and k < self.max_iter:
+            # Richardson step: y_new = y - rho * F(y)
+            y_new = y - rho_vec * Fk
+            Fk_new = func(y_new)
+
+            # --- rho adaptation (scalar or per-block) ---
+            if slices is not None and len(slices) > 0:
+                for i, s in enumerate(slices):
+                    den = float(np.linalg.norm(y_new[s] - y[s]))
+                    stuck = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + float(np.linalg.norm(y[s])))
+                    if den < stuck:
+                        continue
+                    rk_i = rho_blk[i] * float(np.linalg.norm(Fk_new[s] - Fk[s])) / den
+                    if rk_i > self.L:
+                        rho_blk[i] *= self.nu
+                    elif rk_i < self.Lmin:
+                        rho_blk[i] /= self.nu
+                np.clip(rho_blk, self.rho_min, self.rho_max, out=rho_blk)
+                for v, s in zip(rho_blk, slices):
+                    rho_vec[s] = float(v)
+            else:
+                den = float(np.linalg.norm(y_new - y))
+                stuck = self.stuck_eps_abs + self.stuck_eps_rel * (1.0 + float(np.linalg.norm(y)))
+                if den >= stuck:
+                    rk = rho_vec[0] * float(np.linalg.norm(Fk_new - Fk)) / den
+                    if rk > self.L:
+                        rho_vec *= self.nu
+                    elif rk < self.Lmin:
+                        rho_vec /= self.nu
+                    np.clip(rho_vec, self.rho_min, self.rho_max, out=rho_vec)
+                    rho_blk = float(rho_vec[0])
+
+            y = y_new
+            Fk = Fk_new
+            self.last_Fk_val = Fk
+
+            np.multiply(rho_vec, Fk, out=_r_buf)
+            err = _err(_r_buf, y)
+            k += 1
+
+        success = (err <= self.tol)
+        self._set_rho_last(rho_blk, update_default=True)
+        return (y, Fk, err, success, k)
 
     # ---------------- Semismooth Newton ----------------
     def _phi(self, y):
@@ -341,78 +708,79 @@ class ImplicitEquationSolver:
             self._y_prev_broyden = None
             self._F_prev_broyden = None
 
+        # --- Cache batch projection detection (done once, not every iteration) ---
+        _use_batch = False
+        _batch_row_slices = None
+        P = self.proj
+        try:
+            _has_batch = hasattr(P, 'project_batch') and callable(P.project_batch)
+            _ci = getattr(P, 'constraint_indices', None)
+            if _has_batch and _ci is not None and np.size(_ci) > 0:
+                _ci = np.asarray(_ci)
+                _ci_sorted = np.sort(_ci)
+                _diffs = np.diff(_ci_sorted)
+                _boundaries = np.where(_diffs > 1)[0] + 1
+                _runs = np.split(_ci_sorted, _boundaries)
+                _block_len = None
+                _ok = True
+                _batch_row_slices = []
+                for _r in _runs:
+                    if _r.size == 0:
+                        continue
+                    _start, _stop = int(_r[0]), int(_r[-1] + 1)
+                    if _block_len is None:
+                        _block_len = _stop - _start
+                    elif _block_len != (_stop - _start):
+                        _ok = False
+                        break
+                    _batch_row_slices.append(slice(_start, _stop))
+                _use_batch = _ok and (len(_batch_row_slices) > 0)
+                if _use_batch:
+                    _batch_dim = _batch_row_slices[0].stop - _batch_row_slices[0].start
+                    _batch_rows = len(_batch_row_slices)
+                    _Yv = np.empty((_batch_rows, _batch_dim), dtype=y.dtype)
+                    _Cv = np.empty_like(_Yv)
+        except Exception:
+            _use_batch = False
+
+        # Track whether we have a cached F_in from a previous _update_rho call
+        _cached_F_in = None
+
         for iteration in range(1, self.max_iter + 1):
             # cache context once per iteration
             tcur = getattr(self, 'current_time', None)
             prev = getattr(self, 'prev_state', None)
 
-            # Optional adaptive lam
+            # Optional adaptive lam — pass cached F_in to avoid redundant func eval
             if self.adaptive_lam and self.lam_update_strategy == 'vi':
                 try:
-                    lam = self._update_rho(func, y, lam)
+                    lam = self._update_rho(func, y, lam, Fk_val=_cached_F_in)
                     self.lam = lam
                 except Exception:
                     pass
 
             F_in = func(y)
             self.last_Fk_val = F_in  # cheap attribute write
+            _cached_F_in = F_in  # cache for next iteration's _update_rho
 
             # candidate = y - lam F(y)
             np.subtract(y, lam * F_in, out=candidate)
 
-            # projection (fastpath)
+            # projection (fastpath) — batch detection already cached
             proj_val = None
-            P = self.proj
-            # Use batched path only when projector exposes a project_batch and indices are contiguous blocks
             try:
-                has_batch = hasattr(P, 'project_batch') and callable(P.project_batch)
-                ci = getattr(P, 'constraint_indices', None)
-                # decide if indices form contiguous ranges we can view as rows
-                use_batch = False
-                row_slices = None
-                if has_batch and ci is not None and np.size(ci) > 0:
-                    ci = np.asarray(ci)
-                    ci_sorted = np.sort(ci)
-                    # detect consecutive runs
-                    diffs = np.diff(ci_sorted)
-                    # form run boundaries where diff > 1
-                    boundaries = np.where(diffs > 1)[0] + 1
-                    runs = np.split(ci_sorted, boundaries)
-                    # batch only if runs are identical-length blocks (heuristic for [n, t1..tk] layout)
-                    block_len = None
-                    ok = True
-                    row_slices = []
-                    for r in runs:
-                        if r.size == 0:
-                            continue
-                        start, stop = int(r[0]), int(r[-1] + 1)
-                        if block_len is None:
-                            block_len = stop - start
-                        elif block_len != (stop - start):
-                            ok = False
-                            break
-                        row_slices.append(slice(start, stop))
-                    use_batch = ok and (len(row_slices) > 0)
-                if use_batch:
-                    # Create a view of constrained blocks stacked as rows
-                    rows = len(row_slices)
-                    dim = row_slices[0].stop - row_slices[0].start
-                    Yv = np.empty((rows, dim), dtype=candidate.dtype)
-                    Cv = np.empty_like(Yv)
-                    for i, sl in enumerate(row_slices):
-                        Yv[i] = y[sl]
-                        Cv[i] = candidate[sl]
-                    # Call batched projection once
-                    Pv = P.project_batch(Yv, Cv, rhok=lam, t=tcur, Fk_val=F_in)
-                    # Write back into proj_val buffer
-                    proj_val = candidate.copy()
-                    for i, sl in enumerate(row_slices):
-                        proj_val[sl] = Pv[i]
-                    # For unconstrained entries, the identity projection applies (candidate unchanged)
+                if _use_batch:
+                    for i, sl in enumerate(_batch_row_slices):
+                        _Yv[i] = y[sl]
+                        _Cv[i] = candidate[sl]
+                    Pv = P.project_batch(_Yv, _Cv, rhok=lam, t=tcur, Fk_val=F_in)
+                    proj_z[:] = candidate
+                    for i, sl in enumerate(_batch_row_slices):
+                        proj_z[sl] = Pv[i]
+                    proj_val = proj_z
                 else:
                     proj_val = self._project(y, candidate, lam, tcur, F_in, prev)
             except Exception:
-                # Fallback to scalar path on any unexpected condition
                 proj_val = self._project(y, candidate, lam, tcur, F_in, prev)
             proj_z[:] = proj_val
 
@@ -457,25 +825,56 @@ class ImplicitEquationSolver:
                 rtol_dyn = max(self.gmres_tol, eta)
 
             if sparse_active:
-                # Sparse path: either use matrix-free GMRES (default) or explicit matrix + SPLU.
+                # Sparse path: either use matrix-free GMRES (default) or explicit matrix + SPLU/PETSc.
                 J_in = self._to_csr(J_in)
                 Dproj = self._compute_tangent_csr(candidate, y, lam, tcur, F_in, prev, n)
                 rhs = -F_buf
 
-                if self.linear_solver == 'splu':
-                    # Form explicit sparse Jacobian: J = I - D + lam * D @ J_in
-                    J_mat = I - Dproj + lam * (Dproj @ J_in)
+                # Detect diagonal D for fast assembly (avoid expensive D @ J matmul).
+                # D is diagonal when it has exactly n nonzeros and they sit on the diagonal.
+                _D_is_diag = False
+                _D_diag_vals = None
+                if sp.issparse(Dproj) and Dproj.nnz <= n:
+                    # Quick check: CSR with exactly one entry per row on the diagonal
+                    _dptr = Dproj.indptr
+                    if np.all(np.diff(_dptr) == 1):
+                        _didx = Dproj.indices
+                        if np.array_equal(_didx, np.arange(n)):
+                            _D_is_diag = True
+                            _D_diag_vals = Dproj.data  # length-n diagonal
+
+                if self.linear_solver in ('splu', 'petsc'):
+                    if _D_is_diag:
+                        # Fast diagonal assembly:  J = I - D + lam * D @ J_in
+                        # = diag(1 - d) + lam * diag(d) @ J_in
+                        # = diag(1 - d) + J_in scaled row-wise by lam*d
+                        d = _D_diag_vals
+                        # Scale J_in rows by lam*d (creates a new CSR)
+                        _scale = lam * d
+                        J_mat = J_in.multiply(_scale[:, None]) if hasattr(J_in, 'multiply') else sp.diags(_scale) @ J_in
+                        # Add diagonal (1 - d)
+                        _one_minus_d = 1.0 - d
+                        J_mat = J_mat + sp.diags(_one_minus_d, format='csr')
+                    else:
+                        # General: J = I - D + lam * D @ J_in
+                        J_mat = I - Dproj + lam * (Dproj @ J_in)
                     if not sp.issparse(J_mat):
                         J_mat = self._to_csr(J_mat, n)
                     delta, ok = self._solve_linear_sparse(J_mat, rhs, rtol=rtol_dyn, pattern_hint=None)
                 else:
-                    # Matrix-free LinearOperator path: GMRES (with optional ILU preconditioning)
-                    def _matvec(v, _D=Dproj, _J=J_in, _lam=lam):
-                        return (v - _D @ v) + _lam * (_D @ (_J @ v))
-
-                    def _rmatvec(w, _D=Dproj, _J=J_in, _lam=lam):
-                        # J^T = I - D^T + lam * J_in^T @ D^T
-                        return (w - _D.T @ w) + _lam * (_J.T @ (_D.T @ w))
+                    if _D_is_diag:
+                        d = _D_diag_vals
+                        _scale = lam * d
+                        _one_minus_d = 1.0 - d
+                        def _matvec(v, _s=_scale, _omd=_one_minus_d, _J=J_in):
+                            return _omd * v + _s * (_J @ v)
+                        def _rmatvec(w, _s=_scale, _omd=_one_minus_d, _J=J_in):
+                            return _omd * w + _J.T @ (_s * w)
+                    else:
+                        def _matvec(v, _D=Dproj, _J=J_in, _lam=lam):
+                            return (v - _D @ v) + _lam * (_D @ (_J @ v))
+                        def _rmatvec(w, _D=Dproj, _J=J_in, _lam=lam):
+                            return (w - _D.T @ w) + _lam * (_J.T @ (_D.T @ w))
 
                     J = spla.LinearOperator((n, n), matvec=_matvec, rmatvec=_rmatvec)
                     delta, ok = self._solve_linear_sparse(J, rhs, rtol=rtol_dyn, pattern_hint=None)
@@ -498,12 +897,27 @@ class ImplicitEquationSolver:
             if self.globalization == 'linesearch':
                 phi0 = 0.5 * errF * errF
 
-                def _apply_JT_local(v):
-                    Dt = Dproj.T @ v
-                    return v - Dt + lam * (J_in.T @ Dt)
+                if sparse_active and _D_is_diag:
+                    d = _D_diag_vals
+                    _omd = 1.0 - d
+                    _s_ls = lam * d
+                    def _apply_JT_local(v):
+                        return _omd * v + J_in.T @ (_s_ls * v)
+                else:
+                    def _apply_JT_local(v):
+                        Dt = Dproj.T @ v
+                        return v - Dt + lam * (J_in.T @ Dt)
 
                 grad_phi = _apply_JT_local(F_buf)
                 grad_dir = float(np.dot(grad_phi, delta))
+
+                # Inline _phi: phi(y') = 0.5 * ||y' - proj(y', y' - lam*F(y'))||^2
+                def _phi_inline(y_t):
+                    Fk_t = func(y_t)
+                    cand_t = y_t - lam * Fk_t
+                    proj_t = self._project(y_t, cand_t, lam, tcur, Fk_t, prev)
+                    r_t = y_t - proj_t
+                    return 0.5 * float(np.dot(r_t, r_t))
 
                 alpha = 1.0
                 backtracks = 0
@@ -511,13 +925,13 @@ class ImplicitEquationSolver:
 
                 if np.isfinite(grad_dir) and grad_dir < 0.0:
                     y_trial = y + alpha * delta
-                    phi_trial = self._phi(y_trial)
+                    phi_trial = _phi_inline(y_trial)
                     while (phi_trial > phi0 + self.ls_c1 * alpha * grad_dir
                            and backtracks < self.max_backtracks
                            and alpha > self.ls_min_alpha):
                         alpha *= self.ls_beta
                         y_trial = y + alpha * delta
-                        phi_trial = self._phi(y_trial)
+                        phi_trial = _phi_inline(y_trial)
                         backtracks += 1
 
                     if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir:
@@ -537,14 +951,14 @@ class ImplicitEquationSolver:
                     alpha = 1.0
                     backtracks = 0
                     y_trial = y + alpha * delta_g
-                    phi_trial = self._phi(y_trial)
+                    phi_trial = _phi_inline(y_trial)
 
                     while (phi_trial > phi0 + self.ls_c1 * alpha * grad_dir
                            and backtracks < self.max_backtracks
                            and alpha > self.ls_min_alpha):
                         alpha *= self.ls_beta
                         y_trial = y + alpha * delta_g
-                        phi_trial = self._phi(y_trial)
+                        phi_trial = _phi_inline(y_trial)
                         backtracks += 1
 
                     if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir:
@@ -620,22 +1034,32 @@ class ImplicitEquationSolver:
 
 
         # Expand block-wise rho (length = number of component_slices) to a per-index vector (length = n)
+        # Pre-allocated buffer for rho expansion (filled in-place)
+        _rho_vec_buf = None
+
         def _expand_rho_to_vec(rho_in, n, slices):
-            # scalar -> full vector
+            nonlocal _rho_vec_buf
+            # Allocate or resize the cached buffer once
+            if _rho_vec_buf is None or _rho_vec_buf.size != n:
+                _rho_vec_buf = np.empty(n, dtype=float)
+            buf = _rho_vec_buf
             if np.isscalar(rho_in):
-                return float(rho_in) * np.ones(n, dtype=float)
+                buf[:] = float(rho_in)
+                return buf
             arr = np.asarray(rho_in, dtype=float)
             if arr.ndim == 0:
-                return float(arr) * np.ones(n, dtype=float)
+                buf[:] = float(arr)
+                return buf
             if arr.size == n:
-                return arr.astype(float, copy=False)
+                buf[:] = arr
+                return buf
             if slices is not None and arr.size == len(slices):
-                vec = np.empty(n, dtype=float)
                 for v, s in zip(arr, slices):
-                    vec[s] = float(v)
-                return vec
+                    buf[s] = float(v)
+                return buf
             # Fallback: broadcast mean
-            return float(np.mean(arr)) * np.ones(n, dtype=float)
+            buf[:] = float(np.mean(arr))
+            return buf
 
         # Initialize block rho from last solve (if available). If scalar, broadcast to blocks when slices exist.
         def _init_block_rho():
@@ -653,6 +1077,11 @@ class ImplicitEquationSolver:
 
         k = 0
         yk = y0.copy()
+        n_vi = yk.size
+        # Pre-allocate reusable buffers for the VI iteration hot loop
+        _candidate_buf = np.empty(n_vi, dtype=float)
+        _proj_cand_buf = np.empty(n_vi, dtype=float)
+        _r_buf = np.empty(n_vi, dtype=float)
         debug = bool(getattr(self, 'debug_vi', False))
 
         # Use per-block rho when component_slices is defined; otherwise scalar
@@ -674,30 +1103,30 @@ class ImplicitEquationSolver:
         Fk_val = func(yk)
         self.last_Fk_val = Fk_val
         # Candidate uses per-index scaling; projector must receive the same per-index rho
-        rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
+        rho_vec = _expand_rho_to_vec(rho, n_vi, self.component_slices)
         # Guard against non-finite rho_vec
         if not np.all(np.isfinite(rho_vec)):
             rho = _sanitize_rho(rho, context="expand-init")
-            rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
-        candidate = yk - rho_vec * Fk_val
-        if not np.all(np.isfinite(candidate)):
+            rho_vec = _expand_rho_to_vec(rho, n_vi, self.component_slices)
+        np.subtract(yk, rho_vec * Fk_val, out=_candidate_buf)
+        if not np.all(np.isfinite(_candidate_buf)):
             # Reduce rho and try once more
             rho = _sanitize_rho(rho * 0.1 if np.isscalar(rho) else rho * 0.1, context="candidate-init")
-            rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
-            candidate = yk - rho_vec * Fk_val
-        y_proj = self._project(yk, candidate, rho_vec, tcur, Fk_val, prev)
+            rho_vec = _expand_rho_to_vec(rho, n_vi, self.component_slices)
+            np.subtract(yk, rho_vec * Fk_val, out=_candidate_buf)
+        y_proj = self._project(yk, _candidate_buf, rho_vec, tcur, Fk_val, prev)
 
         # Block-wise L2 natural residual at yk
-        r0 = (yk - y_proj)
-        err = _rel_block_l2(r0, yk, self.component_slices)
+        np.subtract(yk, y_proj, out=_r_buf)
+        err = _rel_block_l2(_r_buf, yk, self.component_slices)
         if not np.isfinite(err):
             # If projection resulted in non-finite error, reset rho to safe value and recompute once
             rho = _sanitize_rho(self.rho0 if np.isfinite(self.rho0) else 1.0, context="err-init-reset")
-            rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
-            candidate = yk - rho_vec * Fk_val
-            y_proj = self._project(yk, candidate, rho_vec, tcur, Fk_val, prev)
-            r0 = (yk - y_proj)
-            err = _rel_block_l2(r0, yk, self.component_slices)
+            rho_vec = _expand_rho_to_vec(rho, n_vi, self.component_slices)
+            np.subtract(yk, rho_vec * Fk_val, out=_candidate_buf)
+            y_proj = self._project(yk, _candidate_buf, rho_vec, tcur, Fk_val, prev)
+            np.subtract(yk, y_proj, out=_r_buf)
+            err = _rel_block_l2(_r_buf, yk, self.component_slices)
         if debug:
             print(f"[VI] k={k} err={err:.3e}")
 
@@ -706,36 +1135,37 @@ class ImplicitEquationSolver:
             tcur = getattr(self, 'current_time', None)
             prev = getattr(self, 'prev_state', None)
 
-            Fk_val = func(yk)
+            # Fk_val is carried forward from previous iteration (or init);
+            # no redundant func(yk) call needed.
             self.last_Fk_val = Fk_val
             rho = _sanitize_rho(rho, context="iter-pre")
-            rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
-            candidate = yk - rho_vec * Fk_val
-            if not np.all(np.isfinite(candidate)):
+            rho_vec = _expand_rho_to_vec(rho, n_vi, self.component_slices)
+            np.subtract(yk, rho_vec * Fk_val, out=_candidate_buf)
+            if not np.all(np.isfinite(_candidate_buf)):
                 rho = _sanitize_rho(rho * 0.5 if np.isscalar(rho) else rho * 0.5, context="iter-candidate")
-                rho_vec = _expand_rho_to_vec(rho, len(yk), self.component_slices)
-                candidate = yk - rho_vec * Fk_val
-            yk1 = self._project(yk, candidate, rho_vec, tcur, Fk_val, prev)
+                rho_vec = _expand_rho_to_vec(rho, n_vi, self.component_slices)
+                np.subtract(yk, rho_vec * Fk_val, out=_candidate_buf)
+            yk1 = self._project(yk, _candidate_buf, rho_vec, tcur, Fk_val, prev)
 
             # Evaluate at new point and compute residual for error
             Fk_val_1 = func(yk1)
             rho = _sanitize_rho(rho, context="iter-post-proj")
-            rho_vec1 = _expand_rho_to_vec(rho, len(yk1), self.component_slices)
-            proj_candidate = yk1 - rho_vec1 * Fk_val_1
-            proj_yk1 = self._project(yk1, proj_candidate, rho_vec1, tcur, Fk_val_1, prev)
+            rho_vec1 = _expand_rho_to_vec(rho, n_vi, self.component_slices)
+            np.subtract(yk1, rho_vec1 * Fk_val_1, out=_proj_cand_buf)
+            proj_yk1 = self._project(yk1, _proj_cand_buf, rho_vec1, tcur, Fk_val_1, prev)
 
             # Block-wise L2 natural residual at yk1
-            r1 = (yk1 - proj_yk1)
-            err = _rel_block_l2(r1, yk1, self.component_slices)
+            np.subtract(yk1, proj_yk1, out=_r_buf)
+            err = _rel_block_l2(_r_buf, yk1, self.component_slices)
             if not np.isfinite(err):
                 if debug:
                     print(f"[VI] non-finite err encountered; shrinking rho and retrying one step")
                 rho = _sanitize_rho(rho * 0.5 if np.isscalar(rho) else rho * 0.5, context="iter-err-reset")
-                rho_vec1 = _expand_rho_to_vec(rho, len(yk1), self.component_slices)
-                proj_candidate = yk1 - rho_vec1 * Fk_val_1
-                proj_yk1 = self._project(yk1, proj_candidate, rho_vec1, tcur, Fk_val_1, prev)
-                r1 = (yk1 - proj_yk1)
-                err = _rel_block_l2(r1, yk1, self.component_slices)
+                rho_vec1 = _expand_rho_to_vec(rho, n_vi, self.component_slices)
+                np.subtract(yk1, rho_vec1 * Fk_val_1, out=_proj_cand_buf)
+                proj_yk1 = self._project(yk1, _proj_cand_buf, rho_vec1, tcur, Fk_val_1, prev)
+                np.subtract(yk1, proj_yk1, out=_r_buf)
+                err = _rel_block_l2(_r_buf, yk1, self.component_slices)
 
             # Update rho per block
             if self.component_slices is not None and len(self.component_slices) > 0:
@@ -755,7 +1185,7 @@ class ImplicitEquationSolver:
                         rk_i = np.inf
                         # Increase rho[i] until Lipschitz satisfied or max iters
                         while iter_count < self.vi_max_block_adjust_iters:
-                            rho_vec_rb = _expand_rho_to_vec(rb, len(yk), self.component_slices)
+                            rho_vec_rb = _expand_rho_to_vec(rb, n_vi, self.component_slices)
                             candidate = yk - rho_vec_rb * Fk_val
                             yk_temp = self._project(yk, candidate, rho_vec_rb, tcur, Fk_val, prev)
                             Fk_temp = func(yk_temp)
@@ -781,7 +1211,7 @@ class ImplicitEquationSolver:
                             # We do not re-check after decrease (to match scalar path semantics)
 
                         # Recompute current state after this block's rho change
-                        rho_vec_rb = _expand_rho_to_vec(rb, len(yk), self.component_slices)
+                        rho_vec_rb = _expand_rho_to_vec(rb, n_vi, self.component_slices)
                         candidate = yk - rho_vec_rb * Fk_val
                         yk_current = self._project(yk, candidate, rho_vec_rb, tcur, Fk_val, prev)
                         Fk_current = func(yk_current)
@@ -836,13 +1266,16 @@ class ImplicitEquationSolver:
                     print(f"[VI] k={k+1} err={err:.3e} rho={rho:.3e}")
 
             yk = yk1
+            # Carry forward Fk_val_1 as next iteration's Fk_val (avoids redundant func call)
+            Fk_val = Fk_val_1
             k += 1
 
         success = (err <= self.tol)
         # Persist last rho for subsequent solves (both cached and default field)
         rho = _sanitize_rho(rho, context="final")
         self._set_rho_last(rho, update_default=True)
-        F_final = func(yk)
+        # Fk_val is already up-to-date from the last iteration (or init if 0 iterations)
+        F_final = Fk_val
         self.last_Fk_val = F_final
         if debug:
             if isinstance(rho, np.ndarray):
@@ -940,12 +1373,13 @@ class ImplicitEquationSolver:
 
 
     # ---- VI stepsize update (unchanged math, but uses fast projection) ----
-    def _update_rho(self, func, yk, rho):
+    def _update_rho(self, func, yk, rho, Fk_val=None):
         tcur = getattr(self, 'current_time', None)
         prev = getattr(self, 'prev_state', None)
 
-        Fk_val = func(yk)
-        self.last_Fk_val = Fk_val
+        if Fk_val is None:
+            Fk_val = func(yk)
+            self.last_Fk_val = Fk_val
         yk1 = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
         rk = self._get_rk(func, yk1, yk, rho)
         while rk > self.L:
@@ -964,31 +1398,52 @@ class ImplicitEquationSolver:
     # ---------- Numerical Jacobian ----------
     def _numerical_jacobian(self, func, y, eps: float | None = None, sparse: bool | None = None, mode: str = 'fd'):
         n = len(y)
-        J = np.empty((n, n), dtype=y.dtype)
+        use_sparse = self._sparse_active(n) if sparse is None else bool(sparse)
 
         if (mode or 'fd').lower() == 'cs':
             try:
                 h = 1e-30
-                y_cs = y.astype(complex)
+                # Vectorized complex-step: perturb all columns at once
+                Y_cs = np.tile(y.astype(complex), (n, 1))  # (n, n)
+                Y_cs[np.arange(n), np.arange(n)] += 1j * h
+                # Evaluate all perturbed points
+                J = np.empty((n, n), dtype=float)
                 for i in range(n):
-                    y_cs_i = y_cs.copy()
-                    y_cs_i[i] += 1j * h
-                    Fi = func(y_cs_i)
-                    J[:, i] = np.imag(Fi) / h
-                use_sparse = self._sparse_active(n) if sparse is None else bool(sparse)
+                    J[:, i] = np.imag(func(Y_cs[i])) / h
                 return J if not use_sparse else sp.csr_matrix(J)
             except Exception:
                 pass
 
+        # --- Coloring-based sparse Jacobian when sparsity pattern is known ---
+        sparsity = getattr(self, '_jacobian_sparsity', None)
+        if sparsity is not None and use_sparse:
+            try:
+                from scipy.optimize._numdiff import approx_derivative
+                J_csr = approx_derivative(
+                    func, y, method='2-point',
+                    sparsity=sparsity,
+                    rel_step=eps,
+                )
+                if sp.issparse(J_csr):
+                    return J_csr.tocsr()
+                return sp.csr_matrix(J_csr)
+            except Exception:
+                pass  # fall through to vectorized FD
+
+        # --- Vectorized finite differences ---
         F0 = func(y)
         base = np.sqrt(np.finfo(float).eps) if eps is None else float(eps)
+        h_vec = base * np.maximum(1.0, np.abs(y))  # (n,) per-column step sizes
+
+        # Build all perturbed states at once: Y_pert[i,:] = y with y[i] += h_vec[i]
+        Y_pert = np.tile(y, (n, 1))  # (n, n)
+        Y_pert[np.arange(n), np.arange(n)] += h_vec
+
+        # Evaluate all perturbed points (n func calls, but avoid per-call y.copy())
+        J = np.empty((n, n), dtype=y.dtype)
         for i in range(n):
-            h = base * max(1.0, abs(y[i]))
-            y_eps = y.copy()
-            y_eps[i] += h
-            F_eps = func(y_eps)
-            J[:, i] = (F_eps - F0) / h
-        use_sparse = self._sparse_active(n) if sparse is None else bool(sparse)
+            J[:, i] = (func(Y_pert[i]) - F0) / h_vec[i]
+
         return J if not use_sparse else sp.csr_matrix(J)
 
     def _compute_jacobian_csr(self, func, y, sparse_active):
@@ -1135,6 +1590,18 @@ class ImplicitEquationSolver:
             )
             return (x, info == 0)
 
+        # PETSc path (optional, requires petsc4py)
+        if self.linear_solver == 'petsc':
+            if not PETSC_AVAILABLE:
+                warnings.warn(
+                    "PETSc not available. Install with: pip install solve_nivp[petsc] "
+                    "or conda install -c conda-forge petsc4py. Falling back to GMRES+ILU.",
+                    UserWarning,
+                )
+                # Fall through to ILU path below
+            else:
+                return self._solve_with_petsc(J, b, rtol=rtol)
+
         if self.linear_solver == 'splu':
             nnz = getattr(J, 'nnz', None)
             pattern_key = (J.shape, nnz, pattern_hint)
@@ -1241,3 +1708,258 @@ class ImplicitEquationSolver:
                 return n >= self.sparse_threshold
             return True
         return bool(self.sparse)
+
+    def _solve_with_petsc(self, J, b, rtol=None):
+        """Solve linear system using PETSc with configurable Krylov solver and preconditioner.
+
+        Parameters
+        ----------
+        J : scipy.sparse matrix or numpy.ndarray
+            The system matrix.
+        b : numpy.ndarray
+            Right-hand side vector.
+        rtol : float, optional
+            Relative tolerance for the iterative solver.
+
+        Returns
+        -------
+        x : numpy.ndarray
+            Solution vector.
+        success : bool
+            True if the solver converged.
+        
+        Notes
+        -----
+        For GPU acceleration, set in petsc_options:
+            'mat_type': 'aijcusparse',  # GPU sparse matrix
+            'vec_type': 'cuda',          # GPU vectors
+        And set environment variable before importing:
+            os.environ['PETSC_OPTIONS'] = '-use_gpu_aware_mpi 0'
+        """
+        n = J.shape[0]
+        opts = self.petsc_options
+
+        # Check for GPU types
+        use_gpu = opts.get('mat_type') in ('aijcusparse', 'aijkokkos') or opts.get('vec_type') == 'cuda'
+
+        # Convert J to CSR if needed
+        if not sp.issparse(J):
+            J_csr = sp.csr_matrix(J)
+        elif not sp.isspmatrix_csr(J):
+            J_csr = J.tocsr()
+        else:
+            J_csr = J
+
+        # Determine if we need to rebuild the KSP
+        need_rebuild = (
+            self._petsc_ksp is None
+            or self._petsc_shape != J.shape
+            or self._petsc_build_count >= self.petsc_reuse_steps
+        )
+
+        # Check if this is a direct solver (LU/Cholesky) - these cache factorizations
+        is_direct_solver = opts.get('ksp_type') == 'preonly' and opts.get('pc_type') in ('lu', 'cholesky')
+
+        # For direct solvers, we want to reuse the factorization like SPLU does.
+        # The key insight: SPLU reuses stale factorizations for precond_reuse_steps solves.
+        # This works because Newton iteration is self-correcting.
+        # 
+        # Track a separate counter for direct solver factorization reuse:
+        if is_direct_solver and not need_rebuild:
+            # Reuse existing factorization without updating matrix
+            # This is the key optimization that makes MUMPS competitive with SPLU
+            pass  # Skip to solve phase
+        elif need_rebuild:
+            # Destroy old objects if they exist
+            if self._petsc_mat is not None:
+                try:
+                    self._petsc_mat.destroy()
+                except Exception:
+                    pass
+            if self._petsc_ksp is not None:
+                try:
+                    self._petsc_ksp.destroy()
+                except Exception:
+                    pass
+
+            # Create PETSc matrix from scipy CSR
+            if use_gpu and opts.get('mat_type') == 'aijcusparse':
+                # Create GPU matrix via cuSPARSE
+                # Ensure indices are the correct type (int32 for most PETSc builds)
+                indptr = J_csr.indptr.astype(PETSc.IntType, copy=False)
+                indices = J_csr.indices.astype(PETSc.IntType, copy=False)
+                data = np.ascontiguousarray(J_csr.data, dtype=PETSc.ScalarType)
+                
+                self._petsc_mat = PETSc.Mat().create(comm=PETSc.COMM_SELF)
+                self._petsc_mat.setType('aijcusparse')
+                self._petsc_mat.setSizes(J_csr.shape)
+                self._petsc_mat.setPreallocationCSR((indptr, indices))
+                self._petsc_mat.setUp()  # Required before setValuesCSR for GPU
+                self._petsc_mat.setValuesCSR(indptr, indices, data)
+            else:
+                # Standard CPU matrix - use COMM_SELF for independent per-rank solves
+                self._petsc_mat = PETSc.Mat().createAIJ(
+                    size=J_csr.shape,
+                    csr=(J_csr.indptr.astype(PETSc.IntType, copy=False),
+                         J_csr.indices.astype(PETSc.IntType, copy=False),
+                         J_csr.data),
+                    comm=PETSc.COMM_SELF,  # Each rank solves independently
+                )
+            self._petsc_mat.assemble()
+
+            # Create KSP (Krylov solver) - also on COMM_SELF
+            self._petsc_ksp = PETSc.KSP().create(comm=PETSc.COMM_SELF)
+            self._petsc_ksp.setOperators(self._petsc_mat)
+
+            # Apply user options
+            opts = self.petsc_options
+            if 'ksp_type' in opts:
+                self._petsc_ksp.setType(opts['ksp_type'])
+            
+            pc = self._petsc_ksp.getPC()
+            if 'pc_type' in opts:
+                pc.setType(opts['pc_type'])
+            if opts.get('pc_type') == 'hypre' and 'pc_hypre_type' in opts:
+                pc.setHYPREType(opts['pc_hypre_type'])
+            
+            # For direct solvers, set the solver type (MUMPS, SuperLU_dist, etc.)
+            if opts.get('pc_type') in ('lu', 'cholesky') and 'pc_factor_mat_solver_type' in opts:
+                pc.setFactorSolverType(opts['pc_factor_mat_solver_type'])
+                # CRITICAL: Tell PETSc to reuse the factorization on subsequent solves!
+                pc.setReusePreconditioner(True)
+
+            # Set tolerances - prefer petsc_options values, fall back to class defaults
+            effective_rtol = opts.get('ksp_rtol', rtol if rtol is not None else self.gmres_tol)
+            effective_maxiter = opts.get('ksp_max_it', self.gmres_maxiter or 1000)
+            self._petsc_ksp.setTolerances(rtol=effective_rtol, atol=1e-50, max_it=effective_maxiter)
+            
+            # Set GMRES restart if specified
+            if opts.get('ksp_type') == 'gmres' and 'ksp_gmres_restart' in opts:
+                self._petsc_ksp.setGMRESRestart(opts['ksp_gmres_restart'])
+
+            # =========================================================================
+            # Push ALL user options into PETSc options database with prefix FIRST
+            # This MUST happen before setFieldSplitIS so sub-solver options are visible
+            # =========================================================================
+            prefix = 'nivp_'
+            self._petsc_ksp.setOptionsPrefix(prefix)
+            petsc_opts_db = PETSc.Options()
+            for k, v in opts.items():
+                # Skip keys we've already handled manually
+                if k in ('ksp_type', 'pc_type', 'pc_hypre_type', 'pc_factor_mat_solver_type',
+                         'ksp_rtol', 'ksp_max_it', 'ksp_gmres_restart'):
+                    continue
+                # Handle flag options (value is None or True)
+                if v is None or v is True:
+                    petsc_opts_db[prefix + k] = ''
+                else:
+                    petsc_opts_db[prefix + k] = str(v)
+            
+            # Field-split preconditioner for saddle-point systems
+            # MUST be configured AFTER options are in database so sub-solver options work
+            if opts.get('pc_type') == 'fieldsplit':
+                if self.component_slices is not None and len(self.component_slices) >= 2:
+                    # Create index sets for each field
+                    # CRITICAL: Use numeric names '0', '1' to match option keys 'fieldsplit_0_*'
+                    self._petsc_field_is = []
+                    for i, sl in enumerate(self.component_slices):
+                        indices = np.arange(sl.start, sl.stop, dtype=PETSc.IntType)
+                        is_field = PETSc.IS().createGeneral(indices, comm=PETSc.COMM_SELF)
+                        self._petsc_field_is.append(is_field)
+                        pc.setFieldSplitIS((str(i), is_field))  # '0', '1' not 'field0', 'field1'
+                    
+                    # Set fieldsplit type
+                    fs_type = opts.get('pc_fieldsplit_type', 'schur')
+                    pc.setFieldSplitType(getattr(PETSc.PC.CompositeType, fs_type.upper(), 
+                                                  PETSc.PC.CompositeType.SCHUR))
+                else:
+                    warnings.warn("fieldsplit PC requires component_slices to define fields")
+
+            # Allow command-line overrides and finalize setup
+            self._petsc_ksp.setFromOptions()
+
+            self._petsc_shape = J.shape
+            self._petsc_build_count = 0
+            self._petsc_use_gpu = use_gpu
+            self._petsc_pc_needs_update = True  # First solve needs PC setup
+        else:
+            # Reuse existing KSP - only update matrix values if needed
+            # For direct solvers, skip matrix update entirely (reuse factorization)
+            # For iterative solvers, update matrix but reuse preconditioner
+            if not is_direct_solver:
+                # Only update matrix values every petsc_reuse_steps
+                if self._petsc_build_count % max(1, self.petsc_reuse_steps) == 0:
+                    try:
+                        # Update the matrix values
+                        self._petsc_mat.setValuesCSR(
+                            J_csr.indptr.astype(PETSc.IntType, copy=False),
+                            J_csr.indices.astype(PETSc.IntType, copy=False),
+                            J_csr.data,
+                        )
+                        self._petsc_mat.assemble()
+                        self._petsc_pc_needs_update = True
+                    except Exception:
+                        # If in-place update fails, rebuild
+                        self._petsc_build_count = self.petsc_reuse_steps
+                        return self._solve_with_petsc(J, b, rtol=rtol)
+                
+                # Update preconditioner only when matrix changed
+                if getattr(self, '_petsc_pc_needs_update', True):
+                    pc = self._petsc_ksp.getPC()
+                    pc.setUp()
+                    self._petsc_pc_needs_update = False
+
+        self._petsc_build_count += 1
+
+        # Create PETSc vectors (GPU or CPU)
+        opts = self.petsc_options
+        if getattr(self, '_petsc_use_gpu', False) and opts.get('vec_type') == 'cuda':
+            # GPU vectors - ensure contiguous array
+            b_arr = np.ascontiguousarray(b, dtype=np.float64)
+            
+            b_petsc = PETSc.Vec().create(comm=PETSc.COMM_SELF)
+            b_petsc.setType('cuda')
+            b_petsc.setSizes(n)
+            b_petsc.setUp()
+            b_petsc.setArray(b_arr)
+            
+            x_petsc = PETSc.Vec().create(comm=PETSc.COMM_SELF)
+            x_petsc.setType('cuda')
+            x_petsc.setSizes(n)
+            x_petsc.setUp()
+        else:
+            # CPU vectors - use COMM_SELF for independent per-rank solves
+            b_petsc = PETSc.Vec().createWithArray(b.copy(), comm=PETSc.COMM_SELF)
+            x_petsc = self._petsc_mat.createVecRight()
+
+        # Solve
+        self._petsc_ksp.solve(b_petsc, x_petsc)
+
+        # Extract solution (copy from GPU if needed)
+        x = x_petsc.getArray().copy()
+
+        # Check convergence
+        reason = self._petsc_ksp.getConvergedReason()
+        iters = self._petsc_ksp.getIterationNumber()
+        success = reason > 0  # Positive values indicate convergence
+
+        # Log divergence reason for debugging
+        if not success and reason < 0:
+            reason_names = {
+                -2: 'NULL', -3: 'MAX_ITERATIONS', -4: 'DTOL', -5: 'BREAKDOWN',
+                -6: 'BREAKDOWN_BICG', -7: 'NONSYMMETRIC', -8: 'INDEFINITE_PC',
+                -9: 'NANORINF', -10: 'INDEFINITE_MAT'
+            }
+            reason_str = reason_names.get(reason, f'UNKNOWN({reason})')
+            warnings.warn(
+                f"PETSc solver diverged: {reason_str} after {iters} iterations. "
+                f"For indefinite/saddle-point matrices, use ksp_type='gmres' instead of 'cg'.",
+                RuntimeWarning
+            )
+
+        # Cleanup vectors (but keep KSP and Mat for reuse)
+        b_petsc.destroy()
+        x_petsc.destroy()
+
+        return (x, success)
+

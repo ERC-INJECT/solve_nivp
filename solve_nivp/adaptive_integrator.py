@@ -255,6 +255,59 @@ class AdaptiveStepping:
         # print(f"error is: {math.sqrt(accum / count) if count>0 else 0.0}")
         return 0.0 if count == 0 else math.sqrt(accum / count)
 
+    def _scaled_error_embedded(self, y_new, err_vec) -> float:
+        """Compute normalised RMS error from an embedded error vector.
+
+        Unlike :meth:`_scaled_error` (which builds the raw error from two
+        Richardson solutions), this method takes the element-wise error
+        estimate directly from the integrator (e.g. SDIRK2) and scales it
+        by the same tolerance formula::
+
+            tol_i = atol + rtol * |y_new_i|
+            E     = rms( err_i / tol_i )
+
+        Returns ``E`` with the same semantics: ``E <= 1`` means acceptable.
+        """
+        accum = 0.0
+        count = 0
+
+        if self.component_slices is None:
+            if self._err_buf is None or self._err_buf.shape != y_new.shape:
+                self._err_buf = np.empty_like(y_new)
+            if self._etol_buf is None or self._etol_buf.shape != y_new.shape:
+                self._etol_buf = np.empty_like(y_new)
+
+            # tol scaling: atol + rtol * |y_new|
+            np.abs(y_new, out=self._etol_buf)
+            self._etol_buf *= self.rtol
+            self._etol_buf += self.atol
+
+            # scaled error
+            np.divide(err_vec, self._etol_buf, out=self._err_buf)
+            accum = float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
+            count = self._err_buf.size
+        else:
+            for i, sl in enumerate(self.component_slices):
+                if i in self.skip_error_indices:
+                    continue
+                yn_blk = y_new[sl]
+                er_blk = err_vec[sl]
+
+                if self._err_buf is None or self._err_buf.shape != yn_blk.shape:
+                    self._err_buf = np.empty_like(yn_blk)
+                if self._etol_buf is None or self._etol_buf.shape != yn_blk.shape:
+                    self._etol_buf = np.empty_like(yn_blk)
+
+                np.abs(yn_blk, out=self._etol_buf)
+                self._etol_buf *= self.rtol
+                self._etol_buf += self.atol
+
+                np.divide(er_blk, self._etol_buf, out=self._err_buf)
+                accum += float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
+                count += self._err_buf.size
+
+        return 0.0 if count == 0 else math.sqrt(accum / count)
+
     # ------------------------------------------------------------------
     # Attempt logging helpers (optional)
     # ------------------------------------------------------------------
@@ -453,6 +506,12 @@ class AdaptiveStepping:
         """
         Attempt one adaptive step of size h starting from (t,y).
 
+        If the integrator exposes ``has_embedded_error = True``, a single
+        call to ``integrator.step()`` is made and the element-wise error
+        vector it returns is used directly for step-size control—no
+        Richardson extrapolation (step-doubling) is performed.  This cuts
+        the number of implicit solves from 3× to 1× per attempt.
+
         Returns
         -------
         (y_new, fk_new, h_next, E_curr, success, solver_error, iterations)
@@ -465,6 +524,104 @@ class AdaptiveStepping:
           - E_curr is the normalized local error estimate for this attempt.
           - success is True if we accept and advance, else False.
         """
+
+        # ==============================================================
+        # Fast path: integrator provides an embedded error estimate
+        # (e.g. SDIRK2).  Only ONE call to integrator.step() needed.
+        # ==============================================================
+        if getattr(self.integrator, 'has_embedded_error', False):
+            return self._step_embedded(fun, t, y, h)
+
+        # ==============================================================
+        # Default path: Richardson extrapolation (step-doubling)
+        # ==============================================================
+        return self._step_richardson(fun, t, y, h)
+
+    # ------------------------------------------------------------------
+    # Embedded-error path  (SDIRK2, etc.)
+    # ------------------------------------------------------------------
+    def _step_embedded(self, fun, t, y, h):
+        """Single-step adaptive attempt using the integrator's own error."""
+        try:
+            y_new, fk_new, err_vec, ok, it = self.integrator.step(fun, t, y, h)
+        except RuntimeError as e:
+            if self.verbose:
+                print(f"[adaptive/emb] runtime error @ t={t:.6g}: {e}")
+            h_retry = max(self.h_min, self.h_down * h)
+            return self._finalize_return(
+                t, h, y, None, h_retry, np.inf, False, np.inf, 0,
+                "embedded_step_runtime_error",
+            )
+
+        if not ok:
+            if self.verbose:
+                print(f"[adaptive/emb] nonlinear fail @ t={t:.6g}: shrinking")
+            h_retry = max(self.h_min, self.h_down * h)
+            return self._finalize_return(
+                t, h, y, None, h_retry, np.inf, False, np.inf, it,
+                "embedded_step_nonlinear_fail",
+            )
+
+        # Normalised RMS error from embedded estimate
+        solver_err = 0.0  # no separate "solver residual" to report
+        if isinstance(err_vec, np.ndarray) and err_vec.shape == y_new.shape:
+            E_curr = self._scaled_error_embedded(y_new, err_vec)
+        else:
+            # Fallback: treat scalar err_vec as pre-scaled
+            try:
+                E_curr = float(err_vec)
+            except (TypeError, ValueError):
+                E_curr = 0.0
+
+        # ---- controller logic (identical to Richardson path) ----------
+        if self.mode == "classic":
+            success = (E_curr <= 1.0)
+            if success:
+                h_next = self._propose_h_classic(h, E_curr)
+            else:
+                if self.verbose:
+                    print(f"[adaptive/emb] reject @ t={t:.6g}, E={E_curr:.3e}, "
+                          f"h={h:.3e} -> h_next={h*self.h_down:.3e}")
+                return self._finalize_return(
+                    t, h, y, fk_new, h * self.h_down, E_curr, False,
+                    solver_err, it, "embedded_classic_reject",
+                )
+
+            if self.verbose:
+                print(f"[adaptive/emb] accept @ t={t:.6g} -> t+{h:.3e}, "
+                      f"E={E_curr:.3e}, h_next={h_next:.3e}")
+
+            self._E_prev = E_curr
+            self._rho_prev = (h_next / h) if h > 0.0 else 1.0
+
+            return self._finalize_return(
+                t, h, y_new, fk_new, h_next, E_curr, True,
+                solver_err, it, "embedded_classic_accept",
+            )
+
+        else:
+            # ratio / digital-filter mode
+            h_prop, rho_prop = self._propose_h_ratio(h, E_curr)
+            decision, _, h_next, E_out, success, solver_error_out, it_used = \
+                self._apply_ratio_acceptance(
+                    t, h, h_prop, rho_prop, E_curr, fk_new, it, solver_err,
+                )
+
+            if not success:
+                return self._finalize_return(
+                    t, h, y, fk_new, h_next, E_out, False,
+                    solver_error_out, it_used, "embedded_ratio_reject",
+                )
+
+            return self._finalize_return(
+                t, h, y_new, fk_new, h_next, E_out, True,
+                solver_error_out, it_used, "embedded_ratio_accept",
+            )
+
+    # ------------------------------------------------------------------
+    # Richardson extrapolation path  (BackwardEuler, TR, Composite, …)
+    # ------------------------------------------------------------------
+    def _step_richardson(self, fun, t, y, h):
 
         # ------------------------------------------------------
         # 1. Take one full step of size h

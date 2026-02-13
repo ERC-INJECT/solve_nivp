@@ -35,7 +35,7 @@ Options
 -------
 - Projections: ``'identity'``, ``'sign'``, ``'coulomb'`` (see API docs for arguments like ``y_indices``, ``w_indices``, ``con_force_func``, ``conf_jacobian_mode``)
 - Solvers: ``'VI'`` and ``'semismooth_newton'`` (globalization ``'none'`` or ``'linesearch'``)
-- Integrators: BackwardEuler, Trapezoidal, ThetaMethod, CompositeMethod, EmbeddedBETR
+- Integrators: BackwardEuler, Trapezoidal, ThetaMethod, CompositeMethod, EmbeddedBETR, SDIRK2
 
 Numba acceleration
 ------------------

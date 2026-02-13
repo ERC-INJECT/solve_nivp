@@ -23,7 +23,7 @@ Low-level workflow
 1. Instantiate a projection (e.g. :class:`CoulombProjection`).
 2. Create an :class:`ImplicitEquationSolver` with that projection.
 3. Pick an integration method (``BackwardEuler``, ``Trapezoidal``, ``ThetaMethod``,
-   ``CompositeMethod``, ``EmbeddedBETR``) and pass the solver instance.
+   ``CompositeMethod``, ``EmbeddedBETR``, ``SDIRK2``) and pass the solver instance.
 4. Build an :class:`ODESystem` specifying your RHS ``fun(t, y)`` and options.
 5. Drive the time loop with :class:`ODESolver` or let ``solve_ivp_ns`` do it.
 
@@ -57,7 +57,7 @@ from .projections import (
   MuScaledSOCProjection
 )
 from .nonlinear_solvers import ImplicitEquationSolver
-from .integrations import BackwardEuler, Trapezoidal, ThetaMethod, CompositeMethod, EmbeddedBETR  # , BDFMethod
+from .integrations import BackwardEuler, Trapezoidal, ThetaMethod, CompositeMethod, EmbeddedBETR, SDIRK2  # , BDFMethod
 from .ODESystem import ODESystem
 from .ODESolver import ODESolver
 
@@ -69,7 +69,7 @@ __all__ = [
   # Nonlinear solver
   'ImplicitEquationSolver',
   # Integrators
-  'BackwardEuler', 'Trapezoidal', 'ThetaMethod', 'CompositeMethod', 'EmbeddedBETR',
+  'BackwardEuler', 'Trapezoidal', 'ThetaMethod', 'CompositeMethod', 'EmbeddedBETR', 'SDIRK2',
   # Projections
   'CoulombProjection', 'SignProjection', 'IdentityProjection','GeneralMoreauVIProjection'
 ]
@@ -109,7 +109,7 @@ def solve_ivp_ns(
     Initial state.
   method : str, default 'composite'
     Time stepping scheme: ``'backward_euler'``, ``'trapezoidal'``, ``'theta'``,
-    ``'composite'`` (TR-BE like second order), ``'embedded_betr'``.
+    ``'composite'`` (TR-BE like second order), ``'embedded_betr'``, ``'sdirk2'``.
   projection : str or None, default None
     Name of projection to build: ``'coulomb'``, ``'sign'``, ``'identity'`` or
     ``None`` for no projection (only meaningful if solver supports that path).
@@ -239,6 +239,8 @@ def solve_ivp_ns(
     integrator = CompositeMethod(solver=solver_instance, A=A, **_integrator_opts)
   elif m == 'embedded_betr':
     integrator = EmbeddedBETR(solver=solver_instance, A=A)
+  elif m == 'sdirk2':
+    integrator = SDIRK2(solver=solver_instance, A=A, **_integrator_opts)
   # elif m == 'bdf':
   #     integrator = BDFMethod(solver=solver_instance, atol=atol, rtol=rtol)
   else:

@@ -258,37 +258,111 @@ class CoulombProjection(Projection):
             else:
                 self.constraint_indices = np.array([])
         self.use_numba = use_numba if use_numba in ('auto', True, False) else 'auto'
+        # Cache the call signature of con_force_func to avoid try/except on every call
+        self._con_force_nargs = None  # will be set on first call
 
     def _call_con_force(self, y, t=None, Fk_val=None):
-        # Flexible call to support signatures: (y), (y,t), (y,t,Fk_val)
-        try:
+        # On first call, determine the number of args accepted and cache it
+        nargs = self._con_force_nargs
+        if nargs == 3:
             return self.con_force_func(y, t, Fk_val)
+        elif nargs == 2:
+            return self.con_force_func(y, t)
+        elif nargs == 1:
+            return self.con_force_func(y)
+        # First call: probe signature
+        try:
+            result = self.con_force_func(y, t, Fk_val)
+            self._con_force_nargs = 3
+            return result
         except TypeError:
             try:
-                return self.con_force_func(y, t)
+                result = self.con_force_func(y, t)
+                self._con_force_nargs = 2
+                return result
             except TypeError:
-                return self.con_force_func(y)
+                result = self.con_force_func(y)
+                self._con_force_nargs = 1
+                return result
 
-    def _compute_jacobian(self, y, t=None, Fk_val=None):
+    def _compute_jacobian(self, y, t=None, Fk_val=None, rows=None):
+        """Compute the constraint force Jacobian.
+        
+        Parameters
+        ----------
+        rows : array-like of int, optional
+            If provided, only compute these rows of the Jacobian. Returns an
+            (len(rows), n) array instead of the full (n, n) Jacobian.
+        """
         if self.jac_func is not None:
             try:
                 J = self.jac_func(y, t, Fk_val)
             except TypeError:
                 J = self.jac_func(y)
-            return _to_numpy_if_needed(J)
-        return self._numerical_jacobian(y, t=t, Fk_val=Fk_val)
+            J = _to_numpy_if_needed(J)
+            if rows is not None:
+                rows = np.asarray(rows)
+                if sp.issparse(J):
+                    return J[rows].toarray() if hasattr(J[rows], 'toarray') else np.asarray(J[rows])
+                return J[rows]
+            return J
+        return self._numerical_jacobian(y, t=t, Fk_val=Fk_val, rows=rows)
 
-    def _numerical_jacobian(self, y, eps=1e-8, t=None, Fk_val=None):
+    def _numerical_jacobian(self, y, eps=1e-8, t=None, Fk_val=None, rows=None):
+        """Compute the constraint force Jacobian via finite differences.
+        
+        Parameters
+        ----------
+        rows : array-like of int, optional
+            If provided, only store these rows. Returns (len(rows), n) array.
+            When the constraint force Jacobian is diagonal (local constraint
+            force), only ``len(rows)`` perturbations are needed instead of n.
+        """
         y_np = _to_numpy_if_needed(y)
         n = len(y_np)
-        J = np.zeros((n,n), dtype=y_np.dtype)
         f0 = _to_numpy_if_needed(self._call_con_force(y, t=t, Fk_val=Fk_val))
-        for j in range(n):
-            y_pert = y_np.copy()
-            y_pert[j] += eps
-            f_eps = _to_numpy_if_needed(self._call_con_force(y_pert, t=t, Fk_val=Fk_val))
-            J[:, j] = (f_eps - f0)/eps
-        return J
+
+        if rows is not None:
+            rows = np.asarray(rows)
+            nr = rows.size
+
+            # Check cached diagonal flag; None = unknown, True/False = detected
+            _diag = getattr(self, '_jac_is_diagonal', None)
+
+            if _diag is True:
+                # Fast diagonal path: only perturb rows columns
+                J = np.zeros((nr, n), dtype=y_np.dtype)
+                for idx in range(nr):
+                    j = int(rows[idx])
+                    y_pert = y_np.copy()
+                    y_pert[j] += eps
+                    f_eps = _to_numpy_if_needed(self._call_con_force(y_pert, t=t, Fk_val=Fk_val))
+                    J[:, j] = (f_eps[rows] - f0[rows]) / eps
+                return J
+
+            # Full perturbation (unknown or non-diagonal)
+            J = np.zeros((nr, n), dtype=y_np.dtype)
+            for j in range(n):
+                y_pert = y_np.copy()
+                y_pert[j] += eps
+                f_eps = _to_numpy_if_needed(self._call_con_force(y_pert, t=t, Fk_val=Fk_val))
+                J[:, j] = (f_eps[rows] - f0[rows]) / eps
+
+            if _diag is None:
+                # Detect diagonal structure from the computed Jacobian
+                off_diag = J.copy()
+                for idx in range(nr):
+                    off_diag[idx, int(rows[idx])] = 0.0
+                self._jac_is_diagonal = bool(np.max(np.abs(off_diag)) < eps * 10)
+            return J
+        else:
+            J = np.zeros((n, n), dtype=y_np.dtype)
+            for j in range(n):
+                y_pert = y_np.copy()
+                y_pert[j] += eps
+                f_eps = _to_numpy_if_needed(self._call_con_force(y_pert, t=t, Fk_val=Fk_val))
+                J[:, j] = (f_eps - f0) / eps
+            return J
 
     @staticmethod
     def _gather_rhok_ci(rhok, ci, component_slices):
@@ -441,12 +515,11 @@ class CoulombProjection(Projection):
 
         # Evaluate conf and its (optional) Jacobian at the provided current_state
         conf = _to_numpy_if_needed(self._call_con_force(current_state, t=t, Fk_val=Fk_val))
-        if self.conf_jacobian_mode == 'full':
-            J_conf = self._compute_jacobian(current_state, t=t, Fk_val=Fk_val)
-        else:
-            J_conf = None  # skip computing expensive Jacobian in 'none' mode
+        # Defer Jacobian computation until we know which rows actually need it
+        J_conf = None  # will be computed lazily below
+        J_conf_rows = None  # row-indexed version: {idx -> row_vector}
 
-        # Helper 2x2 projector matrices
+        # Helper 2x2 projector matrices (only P00, P01 values matter for top row)
         P_ray_pp = 0.5 * np.array([[1.0,  1.0],
                                    [1.0,  1.0]])  # onto (1,1)
         P_ray_mp = 0.5 * np.array([[1.0, -1.0],
@@ -477,7 +550,7 @@ class CoulombProjection(Projection):
         codes = None
         if use_nb and _NUMBA_OK and len(valid_indices) > 0:
             try:
-                codes = classify_regions_nb(v_arr, zt_arr, tol)
+                codes = np.asarray(classify_regions_nb(v_arr, zt_arr, tol), dtype=int)
             except Exception:
                 codes = None
 
@@ -499,59 +572,75 @@ class CoulombProjection(Projection):
             codes[mask_ray_mp] = 3
             codes[mask_tie] = 4
 
-        # Prepare dense rows for modified indices (store only nonzeros later)
-        modified_rows = {}
-        for k, idx in enumerate(valid_indices):
-            code = int(codes[k])
-            if code == 0:
-                P = P_zero
-            elif code == 1:
-                P = P_I
-            elif code == 2:
-                P = P_ray_pp
-            elif code == 3:
-                P = P_ray_mp
-            elif code == 4:
-                P = P_tie
-            else:
-                P = P_I
-            if self.conf_jacobian_mode == 'full':
-                row_gi = _to_numpy_if_needed(J_conf[idx])
-            else:
-                row_gi = 0.0
-            # dv/dy
-            col_v = np.zeros((n,), dtype=float); col_v[idx] = 1.0
-            # d z_tilde / dy = sign(current_state[idx]) e_idx - rhok[idx]*J_conf[idx,:]
-            col_zt = np.zeros((n,), dtype=float)
-            sign_val = np.sign(current_state[idx])
-            if sign_val == 0:
-                sign_val = 1.0  # convention at the kink
-            col_zt[idx] = sign_val
-            if self.conf_jacobian_mode == 'full':
-                col_zt -= rhok_full[idx] * row_gi
-            # Only the v-row (top) contributes to the non-augmented state
-            row_top = P[0, 0] * col_v + P[0, 1] * col_zt
-            modified_rows[idx] = row_top
+        # ---- Fully-vectorized CSR assembly ----
+        # P[0,0] and P[0,1] coefficients per code, looked up all at once
+        _P00 = np.array([0.0, 1.0, 0.5, 0.5, 0.5, 1.0], dtype=float)  # codes 0-5
+        _P01 = np.array([0.0, 0.0, 0.5, -0.5, 0.0, 0.0], dtype=float)
+        p00_vec = _P00[codes]  # shape (num_valid,)
+        p01_vec = _P01[codes]
 
-        # Assemble CSR directly
-        data = []
-        indices_list = []
-        indptr = [0]
-        nz_tol = 1e-15
-        for r in range(n):
-            row = modified_rows.get(r)
-            if row is None:
-                data.append(1.0)
-                indices_list.append(r)
+        sign_vals = np.sign(current_state[valid_indices]).astype(float)
+        sign_vals[sign_vals == 0.0] = 1.0  # convention at the kink
+
+        # Lazily compute the constraint Jacobian only for rows that need P01 != 0
+        # (codes 2 and 3), and only compute those specific rows
+        _needs_jac_mask = (codes == 2) | (codes == 3)
+        _has_jac_rows = self.conf_jacobian_mode == 'full' and np.any(_needs_jac_mask)
+        if _has_jac_rows:
+            _jac_indices = valid_indices[_needs_jac_mask]
+            _jac_rows = self._compute_jacobian(current_state, t=t, Fk_val=Fk_val, rows=_jac_indices)
+
+        # ---- Build the result as a modified identity ----
+        # Start with an identity matrix, then modify constrained rows.
+        # This avoids a Python for-loop over all n rows.
+
+        # Diagonal values: 1.0 everywhere, then overwritten for constrained rows
+        diag_vals = np.ones(n, dtype=float)
+        # For constrained rows: diagonal = c0 + c1 * sign  (when c1 != 0)
+        #                       diagonal = c0              (when c1 == 0)
+        #                       diagonal = 0               (code 0 = zero row)
+        diag_vals[valid_indices] = p00_vec + p01_vec * sign_vals
+
+        if not _has_jac_rows:
+            # No Jacobian contribution — result is a diagonal matrix
+            D_csr = sp.diags(diag_vals, 0, shape=(n, n), format='csr')
+        else:
+            # Some rows have off-diagonal entries from the Jacobian.
+            n_jac = len(_jac_indices)
+
+            # Position of _jac_indices within valid_indices
+            _jac_pos = np.searchsorted(valid_indices, _jac_indices)
+            c1_jac = p01_vec[_jac_pos]  # c1 values for these rows
+            rhok_jac = rhok_full[_jac_indices]  # rhok for these rows
+            # Scale factors for Jacobian rows: -c1 * rhok, shape (n_jac,)
+            scale = -c1_jac * rhok_jac
+
+            _jac_diag = getattr(self, '_jac_is_diagonal', None)
+            if _jac_diag is True:
+                # Diagonal constraint Jacobian: correction is purely diagonal
+                # jac_rows[k, _jac_indices[k]] is the only nonzero per row
+                jac_diag_vals = np.array([
+                    float(_jac_rows[k, int(_jac_indices[k])])
+                    for k in range(n_jac)])
+                diag_vals[_jac_indices] += scale * jac_diag_vals
+                D_csr = sp.diags(diag_vals, 0, shape=(n, n), format='csr')
             else:
-                nz = np.flatnonzero(np.abs(row) > nz_tol)
-                if nz.size:
-                    data.extend(row[nz])
-                    indices_list.extend(nz.tolist())
-            indptr.append(len(data))
-        data = np.array(data, dtype=float)
-        indices_arr = np.array(indices_list, dtype=int)
-        D_csr = sp.csr_matrix((data, indices_arr, np.array(indptr)), shape=(n, n))
+                # General case: build sparse correction from the dense Jacobian block
+                jac_block = _to_numpy_if_needed(_jac_rows) * scale[:, np.newaxis]
+                D_csr = sp.diags(diag_vals, 0, shape=(n, n), format='csr')
+
+                # Build COO correction in the full (n, n) space directly
+                nz_tol = 1e-15
+                jac_block[np.abs(jac_block) <= nz_tol] = 0.0
+                nz_rows_local, nz_cols = np.nonzero(jac_block)
+                if nz_cols.size > 0:
+                    nz_vals = jac_block[nz_rows_local, nz_cols]
+                    nz_rows_global = _jac_indices[nz_rows_local]
+                    correction = sp.csr_matrix(
+                        (nz_vals, (nz_rows_global, nz_cols)),
+                        shape=(n, n))
+                    D_csr = D_csr + correction
+
         return D_csr
 
 

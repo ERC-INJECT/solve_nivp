@@ -28,6 +28,16 @@ docs = [
   "sphinx>=6",
   "sphinx-rtd-theme>=1.2",
 ]
+petsc = [
+  "petsc4py>=3.20",
+]
+all = [
+  "petsc4py>=3.20",
+  "gymnasium>=0.29",
+  "stable-baselines3>=2.2",
+  "sb3-contrib>=2.2",
+  "matplotlib>=3.5",
+]
 
 [project.scripts]
 solve_nivp-selftest = "solve_nivp._selftest:main"
