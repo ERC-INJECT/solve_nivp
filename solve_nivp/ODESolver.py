@@ -1,11 +1,27 @@
 import numpy as np
-from typing import Any, Tuple, List
+import gc
+from typing import Any, Tuple, List, Optional
 
 class ODESolver:
     """Time integration driver (fixed or adaptive) for an ``ODESystem``.
 
     Stores growing histories of time grid, states, step sizes and solver
     diagnostics. For adaptive runs, rejected steps do not append entries.
+
+    Memory-saving options
+    ---------------------
+    For large systems (100k+ DOFs), storing the full state at every time step
+    can consume significant memory.  Several knobs are provided:
+
+    ``thin_output``
+        Store only every *N*-th accepted step (first and last are always kept).
+    ``store_fk``
+        Set ``False`` to skip storing the residual vectors (which have the same
+        size as the state vector).
+    ``gc_interval``
+        Call ``gc.collect()`` every *N* accepted steps to free unreferenced
+        Python objects (e.g. stale sparse factorisations released by the
+        solver).
 
     Residual semantics
     ------------------
@@ -15,7 +31,15 @@ class ODESolver:
     projected components). Entries may be ``None`` if a method does not return
     a residual (should not occur with current integrators).
     """
-    def __init__(self, system: Any, t_span: Tuple[float, float], h: float = 1e-2):
+    def __init__(
+        self,
+        system: Any,
+        t_span: Tuple[float, float],
+        h: float = 1e-2,
+        thin_output: int = 1,
+        store_fk: bool = True,
+        gc_interval: int = 0,
+    ):
         """
         Initialize the ODESolver.
         
@@ -23,6 +47,13 @@ class ODESolver:
             system: The ODE system to be integrated.
             t_span: A tuple (t0, tf) specifying the start and end times.
             h: The initial time step size.
+            thin_output: Store every *N*-th accepted step (1 = store all).
+                First and last steps are always stored.
+            store_fk: Whether to store per-step residual vectors.
+                Setting to False saves ~1× state-vector memory per step.
+            gc_interval: Call ``gc.collect()`` every *N* accepted steps
+                (0 = disabled). Useful for large problems where stale
+                solver factorisations may linger.
         """
         self.system = system
         self.t0, self.tf = t_span
@@ -32,6 +63,10 @@ class ODESolver:
         self.h_values: List[float] = [h]
         self.error_estimates: List[Tuple[Any, bool, int]] = []
         self.fk: List[Any] = []
+        # Memory-saving options
+        self.thin_output = max(1, int(thin_output))
+        self.store_fk = bool(store_fk)
+        self.gc_interval = max(0, int(gc_interval))
 
     def solve(self, return_attempts: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Tuple[Any, bool, int]]]:
         """Integrate from ``t0`` to ``tf``.
@@ -65,9 +100,18 @@ class ODESolver:
         if stepper is not None and hasattr(stepper, 'reset_attempt_log'):
             stepper.reset_attempt_log()
         
-        # Initialize progress bar for integration.
-        # pbar = tqdm(total=self.tf - self.t0, desc='Integration Progress', unit='time unit')
-        while t < self.tf:
+        _step_count = 0          # accepted-step counter
+        _thin = self.thin_output
+        _gc_iv = self.gc_interval
+
+        # Floating-point tolerance for the "close enough to tf" check.
+        # After many accepted steps the accumulated t may land a rounding
+        # error below tf.  Attempting a micro-step of order eps would make
+        # the implicit Jacobian A/(γh) explode and the nonlinear solver
+        # fail, falsely reporting "reached minimum step size".
+        _tf_eps = 4.0 * np.finfo(float).eps * max(abs(self.t0), abs(self.tf), 1.0)
+
+        while self.tf - t > _tf_eps:
             # Ensure we do not overshoot the final time.
             h_step = min(h, self.tf - t)
             if self.system.adaptive:
@@ -76,13 +120,23 @@ class ODESolver:
                 y_new, fk_new, h_new, E, success, solver_error, iterations = self.system.step(t, h_step)
                 if success:
                     t += h_step
-                    self.t_values.append(t)
-                    self.y_values.append(y_new.copy())
-                    self.fk.append(fk_new.copy() if fk_new is not None else None)
-                    self.h_values.append(h_new)
-                    self.error_estimates.append((solver_error, success, iterations))
+                    _step_count += 1
+                    # Thin output: only store every Nth step (always store last)
+                    _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
+                    if _step_count % _thin == 0 or _is_last:
+                        self.t_values.append(t)
+                        self.y_values.append(y_new.copy())
+                        if self.store_fk:
+                            self.fk.append(fk_new.copy() if fk_new is not None else None)
+                        else:
+                            self.fk.append(None)
+                        self.h_values.append(h_new)
+                        self.error_estimates.append((solver_error, success, iterations))
                     self.system.current_y = y_new
                     h = h_new  # Update step size for next iteration.
+                    # Periodic garbage collection for large problems
+                    if _gc_iv > 0 and _step_count % _gc_iv == 0:
+                        gc.collect()
                 else:
                     h = h_new
                     # If the adaptive step fails, reduce the step size and try again.
@@ -94,12 +148,20 @@ class ODESolver:
                 # Fixed stepping mode.
                 y_new, fk_new, solver_error, success, iterations = self.system.step(t, h_step)
                 t += h_step
-                self.t_values.append(t)
-                self.y_values.append(y_new.copy())
-                self.fk.append(fk_new.copy() if fk_new is not None else None)
-                self.h_values.append(h_step)
-                self.error_estimates.append((solver_error, success, iterations))
+                _step_count += 1
+                _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
+                if _step_count % _thin == 0 or _is_last:
+                    self.t_values.append(t)
+                    self.y_values.append(y_new.copy())
+                    if self.store_fk:
+                        self.fk.append(fk_new.copy() if fk_new is not None else None)
+                    else:
+                        self.fk.append(None)
+                    self.h_values.append(h_step)
+                    self.error_estimates.append((solver_error, success, iterations))
                 self.system.current_y = y_new
+                if _gc_iv > 0 and _step_count % _gc_iv == 0:
+                    gc.collect()
             # pbar.update(h_step)
         # pbar.close()
         t_arr = np.array(self.t_values)

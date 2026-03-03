@@ -89,3 +89,18 @@ def classify_regions_nb(v_arr: "float[:]", zt_arr: "float[:]", tol: float):
             continue
         codes[k] = 1  # identity
     return codes
+
+
+@njit(cache=True)
+def wrms_kernel(F, y, atol_v, rtol_v):
+    """Compute weighted RMS norm in a single pass — no intermediate arrays.
+
+    Equivalent to ``sqrt(mean((F / (atol + rtol*|y|))^2))``.
+    """
+    n = F.shape[0]
+    acc = 0.0
+    for i in range(n):
+        w = atol_v[i] + rtol_v[i] * abs(y[i])
+        s = F[i] / w
+        acc += s * s
+    return (acc / n) ** 0.5

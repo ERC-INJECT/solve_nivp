@@ -260,6 +260,52 @@ class BackwardEuler(IntegrationMethod):
         """
         A_local = self._get_A(len(y))
 
+        # When h changes the iteration matrix A/h − J changes, so the
+        # cached SPLU from a different step size cannot be reused directly.
+        # However, Richardson extrapolation *alternates* between h and h/2
+        # every adaptive step.  Instead of discarding the factorisation we
+        # save it under the old step size and restore a cached one (if any)
+        # for the new step size.  This avoids re-factorising a 33k × 33k
+        # system twice per adaptive step when the Jacobian hasn't changed.
+        _prev_h = getattr(self, '_cached_step_h', None)
+        if _prev_h is not None and _prev_h != h:
+            # ---- save current LU state under the old step size ----
+            _cache = getattr(self, '_lu_h_cache', None)
+            if _cache is None:
+                self._lu_h_cache = _cache = {}
+            _cache[_prev_h] = (
+                self.solver._lu,
+                getattr(self.solver, '_lu_shape', None),
+                getattr(self.solver, '_lu_pattern', None),
+                getattr(self.solver, '_lu_use_count', 0),
+                getattr(self.solver, '_J_cross_call', None),
+            )
+            # keep at most 2 entries (full-step + half-step)
+            if len(_cache) > 2:
+                _oldest = next(iter(_cache))
+                del _cache[_oldest]
+
+            # ---- restore cached state for the new step size ----
+            _cached_state = _cache.get(h)
+            if _cached_state is not None:
+                (self.solver._lu,
+                 self.solver._lu_shape,
+                 self.solver._lu_pattern,
+                 self.solver._lu_use_count,
+                 self.solver._J_cross_call) = _cached_state
+            else:
+                self.solver._lu = None
+                self.solver._lu_shape = None
+                if hasattr(self.solver, '_J_cross_call'):
+                    self.solver._J_cross_call = None
+            # PETSc/MUMPS factorisation cannot be swapped like SPLU;
+            # force a refactorisation on the next linear solve.
+            self.solver._petsc_needs_matrix_update = True
+        if _prev_h is None:
+            # First call ever — no state to save/restore
+            pass
+        self._cached_step_h = h
+
         # Helper to flexibly call fun with optional Fk_val
         prev_state_arg = y if self.pass_prev_state else None
         step_size_arg = h if self.pass_step_size else None
@@ -772,9 +818,42 @@ class SDIRK2(BackwardEuler):
         A_local = self._get_A(n)
         gh = gamma * h  # diagonal sub-step length
 
+        # -- Cache A/(γh) across steps to avoid redundant sparse division --
+        # Both SDIRK2 stages share the same diagonal coefficient γh, so the
+        # matrix  A/(γh)  only changes when h changes.  Caching it avoids a
+        # full sparse-scalar division (O(nnz) allocation + copy) on every
+        # call to step() when h is unchanged — which is the common case for
+        # an adaptive controller on a smooth trajectory.
+        _prev_gh = getattr(self, '_cached_gh', None)
+        if _prev_gh is None or _prev_gh != gh:
+            self._A_over_gh = A_local / gh
+            self._cached_gh = gh
+            # ---- Invalidate solver caches ----
+            # The iteration matrix  M/(γh) − J  depends on h.  When h
+            # changes, a cached SPLU factorisation or Jacobian from the
+            # previous step is stale and MUST be discarded.  Without
+            # this, the modified-Newton loop's first iteration reuses
+            # the stale factor (because errF > 0.5*inf is always False
+            # in IEEE-754), corrupts the iterate, and wastes iterations
+            # recovering — often exceeding max_iter.
+            self.solver._lu = None
+            self.solver._lu_shape = None
+            if hasattr(self.solver, '_J_cross_call'):
+                self.solver._J_cross_call = None
+            # Also invalidate PETSc/MUMPS factorisation — the direct
+            # solver path in _solve_with_petsc will otherwise skip the
+            # matrix update and keep solving with the stale factor.
+            self.solver._petsc_needs_matrix_update = True
+        A_over_gh = self._A_over_gh
+
         # -- helpers for flexible RHS calling ----------------------------
         prev_state_arg = y if self.pass_prev_state else None
-        step_size_arg = h if self.pass_step_size else None
+        # Pass the *stage* sub-step γh (not full h).  The contact RHS
+        # computes  B·r/(θ·h_val);  the stage equation divides by γh,
+        # so net coupling is  B·r·γh / (θ·γh) = B·r/θ — correct for
+        # θ = 1.  Pre-stress callbacks (get_s0) that multiply force×h_val
+        # also get the stage-level impulse, which is physically right.
+        step_size_arg = gh if self.pass_step_size else None
         _rhs = self._get_bound_wrapper(
             fun,
             has_prev=(prev_state_arg is not None),
@@ -785,18 +864,32 @@ class SDIRK2(BackwardEuler):
         def _call_fun(tt, yy, Fk=None):
             return _rhs(tt, yy, Fk, prev_state_arg, step_size_arg)
 
+        # ── Block-diagonal ρ equilibration ──────────────────────────────
+        # The natural-map Jacobian  J_Φ = I − DΠ(I − ρ J_F)  has the
+        # implicit-equation diagonal  A_ii/(γh)  on the physical rows.
+        # When γ < 1 (e.g. SDIRK2, γ ≈ 0.293) this diagonal scales
+        # as 1/γ relative to Backward Euler, pushing the condition
+        # number above the IEEE-754 accuracy floor and stalling Newton.
+        # Setting  ρ_i = γh / A_ii  for M-rows and  ρ_i = 1  for
+        # algebraic (zero-mass) rows equilibrates the system to O(1).
+        _A_diag = (A_local.diagonal() if sp.issparse(A_local)
+                   else np.diag(A_local))
+        _phys_mask = np.abs(_A_diag) > 0.0
+        _rho_vec = np.ones(n)
+        _rho_vec[_phys_mask] = gh / _A_diag[_phys_mask]
+        self.solver.lam = _rho_vec
+
         # ================================================================
         # Stage 1:  solve  A (Y1 − y)/(γh) − f(t + γh, Y1) = 0
         # ================================================================
         def implicit_s1(Y1):
-            return A_local @ ((Y1 - y) / gh) - _call_fun(
+            return A_over_gh @ (Y1 - y) - _call_fun(
                 t + gh, Y1, getattr(self.solver, 'last_Fk_val', None)
             )
 
         # Exact Jacobian for stage 1 (if available)
         rhs_jac = getattr(self.solver, 'rhs_jacobian', None)
         if callable(rhs_jac) and getattr(self.solver, 'method', None) != 'VI':
-            A_over_gh = A_local / gh
 
             def jac_s1(Y1, _Aogh=A_over_gh, _t=t, _gh=gh):
                 fk_val = getattr(self.solver, 'last_Fk_val', None)
@@ -835,13 +928,12 @@ class SDIRK2(BackwardEuler):
         y_shift = y + ((1.0 - gamma) / gamma) * dY1    # mass-matrix agnostic
 
         def implicit_s2(Y2):
-            return A_local @ ((Y2 - y_shift) / gh) - _call_fun(
+            return A_over_gh @ (Y2 - y_shift) - _call_fun(
                 t + h, Y2, getattr(self.solver, 'last_Fk_val', None)
             )
 
         # Exact Jacobian for stage 2 (same structure, different time)
         if callable(rhs_jac) and getattr(self.solver, 'method', None) != 'VI':
-            A_over_gh = A_local / gh
 
             def jac_s2(Y2, _Aogh=A_over_gh, _t=t, _h=h):
                 fk_val = getattr(self.solver, 'last_Fk_val', None)

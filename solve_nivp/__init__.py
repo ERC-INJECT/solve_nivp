@@ -50,16 +50,22 @@ See the Sphinx documentation (``docs/``) for extended examples.
 
 import numpy as np
 from .projections import (
+  Projection,
   CoulombProjection,
   SignProjection,
   IdentityProjection,
-  GeneralMoreauVIProjection,   # ← add this
-  MuScaledSOCProjection
+  GeneralMoreauVIProjection,
+  MuScaledSOCProjection,
+  MoreauSOCProjection,
+  AnisotropicSOCProjection,
+  AlgebraicConstraintProjection,
+  CompositeContactProjection,
 )
-from .nonlinear_solvers import ImplicitEquationSolver
+from .nonlinear_solvers import ImplicitEquationSolver, UMFPACK_AVAILABLE, PETSC_AVAILABLE
 from .integrations import BackwardEuler, Trapezoidal, ThetaMethod, CompositeMethod, EmbeddedBETR, SDIRK2  # , BDFMethod
 from .ODESystem import ODESystem
 from .ODESolver import ODESolver
+from .contact import build_impulse_contact, ContactSystem
 
 # Curated public API
 __all__ = [
@@ -71,7 +77,13 @@ __all__ = [
   # Integrators
   'BackwardEuler', 'Trapezoidal', 'ThetaMethod', 'CompositeMethod', 'EmbeddedBETR', 'SDIRK2',
   # Projections
-  'CoulombProjection', 'SignProjection', 'IdentityProjection','GeneralMoreauVIProjection'
+  'Projection',
+  'CoulombProjection', 'SignProjection', 'IdentityProjection',
+  'GeneralMoreauVIProjection', 'MuScaledSOCProjection', 'MoreauSOCProjection',
+  'AnisotropicSOCProjection', 'AlgebraicConstraintProjection',
+  'CompositeContactProjection',
+  # Contact helpers
+  'build_impulse_contact', 'ContactSystem',
 ]
 
 
@@ -89,12 +101,19 @@ def solve_ivp_ns(
   adaptive=True,
   atol=1e-6,
   rtol=1e-3,
+  nl_atol=None,
+  nl_rtol=None,
   h0=1e-2,
   component_slices=None,
   verbose=False,
   A=None,
   skip_error_indices=None,
   return_attempts=False,
+  dae_var_weight='auto',
+  thin_output=1,
+  store_fk=True,
+  gc_interval=0,
+  jacobian_scaling=None,
 ):
   """Integrate an ODE / simple index–1 DAE with optional nonsmooth projection.
 
@@ -132,10 +151,17 @@ def solve_ivp_ns(
     ``h0`` for the initial step guess. Unrecognized keys are ignored.
   adaptive : bool, default True
     Enable Richardson extrapolation based adaptive step size control.
-  atol, rtol : float
-    Absolute / relative tolerances for the adaptive controller.
-  h0 : float, default 1e-2
-    Initial step size guess.
+  atol, rtol : float or array_like
+    Absolute / relative tolerances for the adaptive controller.  A scalar is
+    broadcast to every DOF; an array of length ``len(component_slices)`` is
+    expanded per block; a full per-DOF array is used directly.
+  nl_atol, nl_rtol : float, array_like, or None
+    Per-DOF absolute / relative tolerances for the nonlinear solver
+    convergence test (weighted RMS norm).  When ``None`` (default) the
+    nonlinear solver falls back to its scalar ``tol`` parameter.
+  h0 : float, str, or None, default 1e-2
+    Initial step size guess.  Set to ``None`` or ``'auto'`` to enable the
+    Hairer-Wanner automatic initial step-size estimator.
   component_slices : list[slice] or None
     Optional partition of the state for block error control and projections.
   verbose : bool, default False
@@ -149,6 +175,32 @@ def solve_ivp_ns(
     When ``True`` (and adaptive stepping is enabled) capture every attempted
     step size along with acceptance, error estimate, and reason. Returning this
     diagnostic data introduces minor overhead and is therefore opt-in.
+  dae_var_weight : str, default 'auto'
+    DAE-aware error weighting.  ``'auto'`` / ``'exclude'`` detects algebraic
+    DOFs from the mass matrix (zero rows) and excludes them from the error
+    norm à la SUNDIALS IDA.  ``'include'`` keeps all DOFs in the norm
+    (traditional behaviour).
+  thin_output : int, default 1
+    Store only every *N*-th accepted step in the returned history arrays.
+    First and last steps are always stored.  Set to a value > 1 for large
+    problems where storing every state vector is prohibitive.
+  store_fk : bool, default True
+    Whether to keep per-step residual vectors in the returned ``fk`` array.
+    Setting ``False`` saves ~1× state-vector memory per stored step.
+  gc_interval : int, default 0
+    Call ``gc.collect()`` every *N* accepted steps to free unreferenced
+    objects (stale sparse factorisations, etc.).  0 disables.
+  jacobian_scaling : str, default 'none'
+    Row / column equilibration of the Newton Jacobian before each linear
+    solve, improving conditioning for saddle-point systems with disparate
+    scales (e.g. mixed physics with large spring constants).
+
+    * ``'none'``  — no scaling (default).
+    * ``'row'``   — row equilibration: normalises each row infinity-norm
+      to 1.  Sufficient for direct solvers (SPLU, MUMPS).
+    * ``'ruiz'``  — Ruiz iterative symmetric scaling (5 iterations):
+      simultaneously normalises row **and** column infinity-norms.
+      Better for iterative solvers (GMRES+ILU).
 
   Returns
   -------
@@ -184,24 +236,38 @@ def solve_ivp_ns(
   # 1) Projection instance
   proj_instance = None
   if projection is not None:
-    p = projection.lower()
-    if p == 'coulomb':
-      proj_instance = CoulombProjection(**projection_opts)
-    elif p == 'sign':
-      proj_instance = SignProjection(**projection_opts)
-    elif p == 'identity':
-      proj_instance = IdentityProjection()
-    elif p == 'unilateral':
-      proj_instance = GeneralMoreauVIProjection(**projection_opts)
-    elif p == 'soccp':
-      proj_instance = MuScaledSOCProjection(**projection_opts)
+    # Accept a pre-built Projection instance directly (bypass string lookup)
+    if isinstance(projection, Projection):
+      proj_instance = projection
+    elif isinstance(projection, str):
+      p = projection.lower()
+      if p == 'coulomb':
+        proj_instance = CoulombProjection(**projection_opts)
+      elif p == 'sign':
+        proj_instance = SignProjection(**projection_opts)
+      elif p == 'identity':
+        proj_instance = IdentityProjection()
+      elif p == 'unilateral':
+        proj_instance = GeneralMoreauVIProjection(**projection_opts)
+      elif p == 'soccp':
+        proj_instance = MuScaledSOCProjection(**projection_opts)
+      elif p == 'algebraic':
+        proj_instance = AlgebraicConstraintProjection(**projection_opts)
+      else:
+        raise ValueError(f"Unknown projection: {projection}")
     else:
-      raise ValueError(f"Unknown projection: {projection}")
+      raise TypeError(
+        f"projection must be a string or Projection instance, got {type(projection).__name__}")
 
   # 2) Nonlinear solver
   # Filter out keys not accepted by ImplicitEquationSolver.__init__
   _solver_opts = dict(solver_opts) if solver_opts is not None else {}
   rhs_jac = _solver_opts.pop('rhs_jac', None) or _solver_opts.pop('fun_jacobian', None)
+
+  # Merge jacobian_scaling: top-level explicit wins over solver_opts value.
+  _js_from_opts = _solver_opts.pop('jacobian_scaling', None)
+  if jacobian_scaling is None:
+    jacobian_scaling = _js_from_opts if _js_from_opts is not None else 'none'
 
   # Provide a sensible default component_slices for VI if not supplied
   if isinstance(solver, str) and solver.lower() == 'vi' and component_slices is None:
@@ -215,6 +281,9 @@ def solve_ivp_ns(
     method=solver,
     proj=proj_instance,
     component_slices=component_slices,
+    nl_atol=nl_atol,
+    nl_rtol=nl_rtol,
+    jacobian_scaling=jacobian_scaling,
     **_solver_opts,
   )
 
@@ -264,6 +333,17 @@ def solve_ivp_ns(
   if adaptive:
     stepper = getattr(system, 'adaptive_stepper', None)
     if stepper is not None:
+      # Forward DAE-aware error weighting setting
+      stepper._dae_var_weight_mode = str(dae_var_weight).lower().strip()
+      stepper._dae_mask = None  # reset so it re-detects
+
+      # Handle auto-h0 from top level
+      if h0 is None or (isinstance(h0, str) and str(h0).lower() == 'auto'):
+        stepper._auto_h0 = True
+        initial_h = stepper.h_min   # placeholder; real h comes from estimator
+      else:
+        stepper._auto_h0 = False
+        initial_h = float(h0)
       # Merge/override supported scalar options
       def _set(name, cast=float):
         if name in adaptive_opts:
@@ -275,8 +355,11 @@ def solve_ivp_ns(
       for key in ('h_min', 'h_max', 'h_up', 'h_down', 'safety'):
         _set(key, float)
       _set('use_PI', bool)
-      _set('atol', float)
-      _set('rtol', float)
+      # atol / rtol may be array_like – pass through without float cast
+      if 'atol' in adaptive_opts:
+        stepper.atol = adaptive_opts['atol']
+      if 'rtol' in adaptive_opts:
+        stepper.rtol = adaptive_opts['rtol']
       _set('verbose', bool)
 
       # Ratio / digital-filter controller knobs
@@ -321,11 +404,25 @@ def solve_ivp_ns(
 
       # Optional 'h0' override inside adaptive_opts
       if 'h0' in adaptive_opts:
-        try:
-          initial_h = float(adaptive_opts['h0'])
-        except Exception:
-          pass
+        ao_h0 = adaptive_opts['h0']
+        if ao_h0 is None or (isinstance(ao_h0, str) and str(ao_h0).lower() == 'auto'):
+          stepper._auto_h0 = True
+          initial_h = stepper.h_min
+        else:
+          try:
+            initial_h = float(ao_h0)
+          except Exception:
+            pass
+
+  # Ensure initial_h is numeric before passing to ODESolver
+  if initial_h is None or isinstance(initial_h, str):
+    initial_h = 1e-2   # safe fallback
 
   # 5) Integrate
-  solver_obj = ODESolver(system, t_span, h=initial_h)
+  solver_obj = ODESolver(
+    system, t_span, h=initial_h,
+    thin_output=thin_output,
+    store_fk=store_fk,
+    gc_interval=gc_interval,
+  )
   return solver_obj.solve(return_attempts=return_attempts)

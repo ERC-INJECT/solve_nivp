@@ -498,6 +498,7 @@ class TestSPLUReuse:
             proj=IdentityProjection(),
             tol=1e-12,
             sparse=True,          # force sparse path to exercise SPLU caching
+            linear_solver='splu', # explicitly select SPLU path
         )
         solver.rhs_jacobian = rhs_jac
         integ = SDIRK2(solver=solver)
@@ -537,3 +538,190 @@ class TestSPLUReuse:
             f"Second step (same h, constant J) should reuse prior factorisation, "
             f"got {second_step_calls} new factorisations"
         )
+
+
+class TestSDIRK2StaleLUInvalidation:
+    """When h changes between steps, the cached SPLU must be invalidated.
+
+    The iteration matrix  M/(γh)−J  depends on h; if a stale factorisation
+    from a previous step is reused, Newton's first iterate is corrupted and
+    may cause convergence failure (the classic symptom: every step shows a
+    'nonlinear fail → shrink → accept' pattern).
+    """
+
+    def test_different_h_invalidates_lu(self):
+        """After a step with h₁, a step with h₂≠h₁ must NOT reuse the old LU."""
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla_mod
+        from unittest.mock import patch
+
+        n = 20
+        A_mat = sp.diags([-2 * np.ones(n), np.ones(n - 1), np.ones(n - 1)],
+                         [0, 1, -1], format='csr') * 50.0
+        M_mat = sp.eye(n, format='csr')
+
+        def rhs(t, y):
+            return A_mat @ y
+
+        solver = ImplicitEquationSolver(
+            method='semismooth_newton',
+            proj=IdentityProjection(),
+            tol=1e-12,
+            max_iter=5,
+            linear_solver='splu',
+            sparse=True,        # force sparse path for small n
+        )
+        solver.rhs_jacobian = lambda t, y, *a, **kw: A_mat
+        integ = SDIRK2(solver=solver, A=M_mat)
+
+        y0 = np.random.RandomState(42).randn(n)
+
+        # Step 1 with h₁ — builds and caches LU
+        h1 = 0.01
+        y1, _, _, ok1, it1 = integ.step(rhs, 0.0, y0, h1)
+        assert ok1, "Step 1 should converge"
+        assert solver._lu is not None, "LU should be cached after step 1"
+
+        # Step 2 with h₂ ≠ h₁ — LU must be invalidated, new factorisation
+        h2 = 0.02
+        real_splu = spla_mod.splu
+        splu_calls = [0]
+
+        def counting_splu(*args, **kwargs):
+            splu_calls[0] += 1
+            return real_splu(*args, **kwargs)
+
+        with patch.object(spla_mod, 'splu', side_effect=counting_splu):
+            y2, _, _, ok2, it2 = integ.step(rhs, h1, y1, h2)
+
+        assert ok2, "Step with different h should still converge"
+        assert splu_calls[0] >= 1, (
+            "A step with a different h must trigger at least one new SPLU factorisation"
+        )
+        # With the fix, Newton should converge in ≤ 3 iterations (linear system)
+        assert it2 <= 4, (
+            f"Linear system should converge quickly with fresh LU, got {it2} iterations"
+        )
+
+    def test_same_h_still_reuses_lu(self):
+        """Consecutive steps with the same h should still reuse the cached LU."""
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla_mod
+        from unittest.mock import patch
+
+        n = 20
+        A_mat = sp.diags([-2 * np.ones(n), np.ones(n - 1), np.ones(n - 1)],
+                         [0, 1, -1], format='csr') * 50.0
+        M_mat = sp.eye(n, format='csr')
+
+        def rhs(t, y):
+            return A_mat @ y
+
+        solver = ImplicitEquationSolver(
+            method='semismooth_newton',
+            proj=IdentityProjection(),
+            tol=1e-12,
+            max_iter=5,
+            linear_solver='splu',
+            sparse=True,        # force sparse path for small n
+        )
+        solver.rhs_jacobian = lambda t, y, *a, **kw: A_mat
+        integ = SDIRK2(solver=solver, A=M_mat)
+
+        y0 = np.random.RandomState(42).randn(n)
+        h = 0.01
+
+        # Step 1 — caches LU
+        y1, _, _, ok1, _ = integ.step(rhs, 0.0, y0, h)
+        assert ok1
+
+        # Step 2 (same h) — count SPLU calls, should be 0
+        real_splu = spla_mod.splu
+        splu_calls = [0]
+
+        def counting_splu(*args, **kwargs):
+            splu_calls[0] += 1
+            return real_splu(*args, **kwargs)
+
+        with patch.object(spla_mod, 'splu', side_effect=counting_splu):
+            y2, _, _, ok2, _ = integ.step(rhs, h, y1, h)
+
+        assert ok2
+        assert splu_calls[0] == 0, (
+            f"Same h should fully reuse the cached LU, got {splu_calls[0]} new factorisations"
+        )
+
+    def test_backward_euler_invalidates_lu_on_h_change(self):
+        """BackwardEuler should also invalidate the cached LU when h changes."""
+        import scipy.sparse as sp
+
+        n = 20
+        A_mat = sp.diags([-2 * np.ones(n), np.ones(n - 1), np.ones(n - 1)],
+                         [0, 1, -1], format='csr') * 50.0
+        M_mat = sp.eye(n, format='csr')
+
+        def rhs(t, y):
+            return A_mat @ y
+
+        solver = ImplicitEquationSolver(
+            method='semismooth_newton',
+            proj=IdentityProjection(),
+            tol=1e-12,
+            max_iter=3,
+            linear_solver='splu',
+            sparse=True,        # force sparse path for small n
+        )
+        solver.rhs_jacobian = lambda t, y, *a, **kw: A_mat
+        integ = BackwardEuler(solver=solver, A=M_mat)
+
+        y0 = np.random.RandomState(42).randn(n)
+
+        # Step 1 with h₁
+        y1, _, _, ok1, it1 = integ.step(rhs, 0.0, y0, 0.01)
+        assert ok1, "BE step 1 should converge"
+
+        # Step 2 with h₂ ≠ h₁ — must converge quickly (max_iter=3 is enough for linear)
+        y2, _, _, ok2, it2 = integ.step(rhs, 0.01, y1, 0.02)
+        assert ok2, (
+            "BE step with different h should converge (LU invalidated, fresh factorisation)"
+        )
+
+    def test_sdirk2_adaptive_no_repeated_nonlinear_failures(self):
+        """An adaptive SDIRK2 run on a linear ODE should NOT show nonlinear
+        failures when h changes, because the LU is invalidated."""
+        import scipy.sparse as sp
+
+        n = 10
+        A_mat = sp.diags([-2 * np.ones(n), np.ones(n - 1), np.ones(n - 1)],
+                         [0, 1, -1], format='csr') * 20.0
+        M_mat = sp.eye(n, format='csr')
+
+        def rhs(t, y):
+            return A_mat @ y
+
+        solver = ImplicitEquationSolver(
+            method='semismooth_newton',
+            proj=IdentityProjection(),
+            tol=1e-10,
+            max_iter=5,
+            linear_solver='splu',
+            sparse=True,        # force sparse path for small n
+        )
+        solver.rhs_jacobian = lambda t, y, *a, **kw: A_mat
+        integ = SDIRK2(solver=solver, A=M_mat)
+
+        y0 = np.ones(n)
+        h = 0.01
+
+        # Run several steps with varying h — none should fail
+        t = 0.0
+        y = y0.copy()
+        h_values = [0.01, 0.02, 0.005, 0.03, 0.01, 0.04]
+        for h_step in h_values:
+            y_new, _, _, ok, it = integ.step(rhs, t, y, h_step)
+            assert ok, (
+                f"Linear system with h={h_step} should converge, "
+                f"but failed after {it} iterations"
+            )
+            t += h_step
+            y = y_new

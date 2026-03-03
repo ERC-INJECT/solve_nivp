@@ -10,6 +10,13 @@ import scipy.sparse.linalg as spla
 import warnings
 import math
 
+# Optional numba acceleration for hot kernels
+try:
+    from ._numba_accel import NUMBA_AVAILABLE as _NUMBA_OK, wrms_kernel as _wrms_numba
+except Exception:
+    _NUMBA_OK = False
+    _wrms_numba = None
+
 # Configure logger for PETSc timing (works in VS Code Jupyter)
 _petsc_logger = logging.getLogger('solve_nivp.petsc')
 _petsc_logger.setLevel(logging.DEBUG)
@@ -17,6 +24,15 @@ if not _petsc_logger.handlers:
     _handler = logging.StreamHandler()  # stderr by default
     _handler.setFormatter(logging.Formatter('%(message)s'))
     _petsc_logger.addHandler(_handler)
+
+# Optional UMFPACK support (much faster than SuperLU for n > ~20k)
+try:
+    from scikits.umfpack import UmfpackContext, UMFPACK_A as _UMFPACK_A
+    UMFPACK_AVAILABLE = True
+except Exception:          # ImportError, OSError, or missing shared lib
+    UMFPACK_AVAILABLE = False
+    UmfpackContext = None
+    _UMFPACK_A = None
 
 # Optional PETSc support
 try:
@@ -73,6 +89,11 @@ class ImplicitEquationSolver:
         # PETSc options
         petsc_options: dict | None = None,
         petsc_reuse_steps: int = 10,
+        # Per-DOF tolerance vectors (SUNDIALS convention) — opt-in
+        nl_atol=None,
+        nl_rtol=None,
+        # Jacobian equilibration for improved conditioning
+        jacobian_scaling: str = 'none',
     ) -> None:
         if method not in ['VI', 'semismooth_newton']:
             raise ValueError("Unsupported solver method. Use 'VI' or 'semismooth_newton'.")
@@ -133,10 +154,17 @@ class ImplicitEquationSolver:
         self.vi_max_block_adjust_iters = int(vi_max_block_adjust_iters)
 
         # PETSc configuration
+        # Default: direct LU via MUMPS — robust for all matrix types
+        # including indefinite / saddle-point systems.  MUMPS uses METIS
+        # nested-dissection ordering (much better fill-reducing than COLAMD
+        # for mixed FE systems) and is multithreaded via OpenMP.
+        # For iterative solving, pass e.g.:
+        #   petsc_options={'ksp_type': 'gmres', 'pc_type': 'hypre',
+        #                  'pc_hypre_type': 'boomeramg'}
         self.petsc_options = petsc_options if petsc_options is not None else {
-            'ksp_type': 'gmres',
-            'pc_type': 'hypre',
-            'pc_hypre_type': 'boomeramg',
+            'ksp_type': 'preonly',
+            'pc_type': 'lu',
+            'pc_factor_mat_solver_type': 'mumps',
         }
         self.petsc_reuse_steps = int(petsc_reuse_steps)
         self._petsc_ksp = None
@@ -144,6 +172,7 @@ class ImplicitEquationSolver:
         self._petsc_build_count = 0
         self._petsc_shape = None
         self._petsc_field_is = None  # Index sets for field-split
+        self._petsc_needs_matrix_update = False  # set True when Newton recomputes J
 
         # Rho adaptation safeguards (bounds and "stuck" thresholds)
         # These are conservative defaults; they can be adjusted by users after construction if needed.
@@ -160,11 +189,35 @@ class ImplicitEquationSolver:
         self._last_shape = None
         self._last_pattern = None
 
-        # SPLU cache
+        # SPLU / UMFPACK cache
         self._lu = None
         self._lu_use_count = 0
         self._lu_pattern = None
         self._lu_shape = None
+        self._lu_matrix = None          # UMFPACK needs original CSC for solve
+        self._umf_ctx = None            # persists across h-change invalidations
+        self._umf_symbolic_key = None   # (shape, nnz) — reuse symbolic analysis
+
+        # Pre-allocated workspace for _wrms to avoid repeated temporaries
+        self._wrms_buf = None
+
+        # ---- Jacobian equilibration ----
+        _js = (jacobian_scaling or 'none').lower()
+        if _js not in ('none', 'row', 'ruiz'):
+            raise ValueError(
+                f"jacobian_scaling must be 'none', 'row', or 'ruiz', got '{jacobian_scaling}'"
+            )
+        self.jacobian_scaling = _js
+        self._eq_Dr = None   # row scaling vector (cached)
+        self._eq_Dc = None   # column scaling vector (cached)
+
+        # Cross-call Jacobian cache for non-SPLU iterative solvers.
+        # When linear_solver is 'gmres' or 'petsc', the identity Newton
+        # path cannot rely on a cached SPLU factor for cross-call modified
+        # Newton.  Instead it caches the last Jacobian CSR here so that
+        # back-to-back solve() calls (e.g. SDIRK stages) can skip the
+        # (potentially expensive) Jacobian evaluation.
+        self._J_cross_call = None
 
         # Identity caches
         self._I_cache = {}
@@ -179,6 +232,17 @@ class ImplicitEquationSolver:
 
         # Initialize rho state (scalar default + structured cache)
         self._set_initial_rho(rho0)
+
+        # ---- Per-DOF weighted-norm convergence (SUNDIALS convention) ----
+        # When nl_atol / nl_rtol are provided, convergence is tested via a
+        # weighted RMS norm  ``wrms(F, y) = sqrt(mean((F_i / w_i)^2)) <= 1``
+        # with ``w_i = nl_atol_i + nl_rtol_i * |y_i|``.
+        # When *not* provided (default), the legacy ``||F|| < tol`` test is used.
+        self._nl_atol_raw = nl_atol      # None, scalar, or array_like
+        self._nl_rtol_raw = nl_rtol
+        self._use_weighted_norm: bool = (nl_atol is not None or nl_rtol is not None)
+        self._nl_atol_vec: np.ndarray | None = None
+        self._nl_rtol_vec: np.ndarray | None = None
 
         # Basic checks
         if self.method == 'VI':
@@ -330,6 +394,204 @@ class ImplicitEquationSolver:
             or getattr(self.proj, 'is_identity', False)
         )
 
+        # Rho-independent projections (e.g. AlgebraicConstraintProjection)
+        # enforce constraints regardless of the rhok / lam parameter, so
+        # Lipschitz-based lam adaptation wastes func evals without benefit.
+        self._is_rho_independent = getattr(self.proj, 'rho_independent', False)
+
+    # ---------- Per-DOF weighted-norm helpers ----------
+
+    def _ensure_nl_tol_vectors(self, n: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(nl_atol_vec, nl_rtol_vec)`` of length *n*.
+
+        Lazily expands the raw tolerances provided at construction:
+
+        * **scalar** → broadcast to length *n*.
+        * **per-slice sequence** (length == ``len(component_slices)``) →
+          expanded to per-DOF via the slice mapping.
+        * **per-DOF array** (length == *n*) → used directly.
+        """
+        if self._nl_atol_vec is not None and self._nl_atol_vec.shape == (n,):
+            return self._nl_atol_vec, self._nl_rtol_vec
+
+        # Defaults when only one of atol/rtol was supplied
+        raw_a = self._nl_atol_raw if self._nl_atol_raw is not None else self.tol
+        raw_r = self._nl_rtol_raw if self._nl_rtol_raw is not None else 0.0
+
+        self._nl_atol_vec = self._expand_nl_tol(raw_a, n, 'nl_atol')
+        self._nl_rtol_vec = self._expand_nl_tol(raw_r, n, 'nl_rtol')
+        return self._nl_atol_vec, self._nl_rtol_vec
+
+    def _expand_nl_tol(self, raw, n: int, name: str) -> np.ndarray:
+        arr = np.asarray(raw, dtype=float)
+        if arr.ndim == 0:
+            return np.full(n, float(arr))
+        if arr.shape == (n,):
+            return arr.copy()
+        if self.component_slices is not None and arr.size == len(self.component_slices):
+            out = np.empty(n, dtype=float)
+            for val, sl in zip(arr.ravel(), self.component_slices):
+                out[sl] = float(val)
+            return out
+        raise ValueError(
+            f"{name} has length {arr.size}, expected scalar, "
+            f"len(component_slices)={len(self.component_slices) if self.component_slices else 'N/A'}, "
+            f"or n={n}"
+        )
+
+    def _wrms(self, F: np.ndarray, y: np.ndarray) -> float:
+        """Weighted RMS norm: ``sqrt(mean((F_i / w_i)^2))`` with ``w_i = atol_i + rtol_i*|y_i|``.
+
+        Returns a value comparable to the ``E <= 1`` convention used by
+        SUNDIALS CVODE for Newton convergence.
+        """
+        n = F.size
+        atol_v, rtol_v = self._ensure_nl_tol_vectors(n)
+        # Fast path: single-pass numba kernel (no intermediate arrays)
+        if _NUMBA_OK and _wrms_numba is not None:
+            return float(_wrms_numba(F, y, atol_v, rtol_v))
+        # Reuse pre-allocated buffer to avoid 3 temporary arrays per call
+        buf = self._wrms_buf
+        if buf is None or buf.size != n:
+            buf = self._wrms_buf = np.empty(n, dtype=float)
+        np.abs(y, out=buf)       # buf = |y|
+        buf *= rtol_v             # buf = rtol * |y|
+        buf += atol_v             # buf = atol + rtol * |y|  (= weights)
+        np.divide(F, buf, out=buf)  # buf = F / weights
+        return float(math.sqrt(np.dot(buf, buf) / n))
+
+    def _converged(self, F: np.ndarray, y: np.ndarray) -> bool:
+        """Check nonlinear convergence using either legacy or weighted-norm test.
+
+        * Legacy (default): ``||F|| < self.tol``
+        * Weighted-norm (when ``nl_atol`` or ``nl_rtol`` was provided):
+          ``wrms(F, y) <= 1``
+        """
+        if self._use_weighted_norm:
+            return self._wrms(F, y) <= 1.0
+        return float(np.linalg.norm(F)) < self.tol
+
+    def _errf_metric(self, F: np.ndarray, y: np.ndarray) -> float:
+        """Return the convergence metric value (for reporting / modified Newton logic)."""
+        if self._use_weighted_norm:
+            return self._wrms(F, y)
+        return float(np.linalg.norm(F))
+
+    def _converged_with_metric(self, F: np.ndarray, y: np.ndarray) -> tuple[bool, float]:
+        """Compute convergence metric and test in a single call.
+
+        Returns ``(is_converged, errF)`` without evaluating the norm twice.
+        This replaces the common pattern::
+
+            errF = self._errf_metric(F, y)
+            if self._converged(F, y):  # re-computes the same norm
+        """
+        if self._use_weighted_norm:
+            val = self._wrms(F, y)
+            return (val <= 1.0, val)
+        val = float(np.linalg.norm(F))
+        return (val < self.tol, val)
+
+
+    # ---------- Jacobian equilibration ----------
+
+    def _equilibrate(self, J_csr):
+        r"""Row (and optionally column) equilibrate a CSR Jacobian.
+
+        Parameters
+        ----------
+        J_csr : scipy.sparse.csr_matrix
+            Jacobian in CSR format.
+
+        Returns
+        -------
+        J_eq : scipy.sparse.csr_matrix
+            Equilibrated Jacobian.
+        Dr : ndarray
+            Row scaling vector such that ``J_eq = diag(Dr) @ J @ diag(Dc)``.
+        Dc : ndarray
+            Column scaling vector (ones for ``'row'`` mode).
+        """
+        n = J_csr.shape[0]
+        mode = self.jacobian_scaling
+
+        def _dense_ravel(sparse_or_matrix):
+            """Convert sparse/matrix .max() result to a 1-D dense array."""
+            if sp.issparse(sparse_or_matrix):
+                return np.asarray(sparse_or_matrix.toarray()).ravel()
+            return np.asarray(sparse_or_matrix).ravel()
+
+        if mode == 'row':
+            # Row equilibration: normalise each row's infinity-norm to 1.
+            abs_J = J_csr.copy()
+            abs_J.data = np.abs(abs_J.data)
+            row_max = _dense_ravel(abs_J.max(axis=1))
+            row_max = np.where(row_max > 0, row_max, 1.0)
+            Dr = 1.0 / row_max
+
+            J_eq = J_csr.copy()
+            if J_eq.nnz > 0:
+                row_idx = np.repeat(np.arange(n), np.diff(J_eq.indptr))
+                J_eq.data = J_eq.data * Dr[row_idx]
+            return J_eq, Dr, np.ones(n)
+
+        elif mode == 'ruiz':
+            # Ruiz iterative symmetric scaling (5 iterations).
+            # After convergence both row and column infinity-norms ≈ 1.
+            J_eq = J_csr.copy()
+            Dr_total = np.ones(n)
+            Dc_total = np.ones(n)
+
+            for _ in range(5):
+                abs_J = J_eq.copy()
+                abs_J.data = np.abs(abs_J.data)
+
+                row_max = _dense_ravel(abs_J.max(axis=1))
+                row_max = np.where(row_max > 0, row_max, 1.0)
+                Dr = 1.0 / np.sqrt(row_max)
+
+                col_max = _dense_ravel(abs_J.max(axis=0))
+                col_max = np.where(col_max > 0, col_max, 1.0)
+                Dc = 1.0 / np.sqrt(col_max)
+
+                if J_eq.nnz > 0:
+                    row_idx = np.repeat(np.arange(n), np.diff(J_eq.indptr))
+                    J_eq.data = J_eq.data * Dr[row_idx] * Dc[J_eq.indices]
+
+                Dr_total *= Dr
+                Dc_total *= Dc
+
+            return J_eq, Dr_total, Dc_total
+
+        # 'none' — identity (should not normally be called)
+        return J_csr, np.ones(n), np.ones(n)
+
+    def _apply_jacobian_scaling(self, J_csr):
+        """Equilibrate *J_csr* and cache the scaling vectors on *self*.
+
+        Returns the equilibrated matrix.  Subsequent calls to
+        :meth:`_scale_rhs` and :meth:`_unscale_solution` use the cached
+        vectors until this method is called again.
+        """
+        J_eq, self._eq_Dr, self._eq_Dc = self._equilibrate(J_csr)
+        return J_eq
+
+    def _scale_rhs(self, rhs):
+        """Scale a right-hand side vector with the cached row scaling."""
+        if self.jacobian_scaling == 'none' or self._eq_Dr is None:
+            return rhs
+        return self._eq_Dr * rhs
+
+    def _unscale_solution(self, x):
+        """Undo column scaling on the linear-solve result.
+
+        For ``'row'`` mode the column scaling is the identity, so this
+        is a no-op.  For ``'ruiz'`` mode the solution is multiplied by
+        the column scaling vector.
+        """
+        if self.jacobian_scaling in ('none', 'row') or self._eq_Dc is None:
+            return x
+        return self._eq_Dc * x
 
     # ---------- Rho helpers ----------
     def _rho_scalar_value(self, rho):
@@ -365,6 +627,52 @@ class ImplicitEquationSolver:
         self.proj = proj
         self._bind_projector_fastpaths()
 
+    def invalidate_all_caches(self):
+        """Force-discard every cached factorisation, Jacobian, and PETSc KSP.
+
+        This is called by the adaptive stepper when many consecutive NL
+        failures indicate that stale solver state is contributing to
+        divergence.  The next ``solve()`` call will compute a fresh Jacobian,
+        fresh factorisation (SPLU/UMFPACK/MUMPS), and fresh preconditioner.
+        """
+        # SPLU / UMFPACK cache
+        self._lu = None
+        self._lu_shape = None
+        self._lu_pattern = None
+        self._lu_use_count = 0
+        self._lu_matrix = None
+
+        # Cross-call Jacobian cache (for non-SPLU paths)
+        self._J_cross_call = None
+
+        # GMRES/ILU preconditioner cache
+        self._ilu = None
+        self._ilu_steps_since_build = 0
+        self._last_shape = None
+        self._last_pattern = None
+
+        # PETSc KSP / Mat / factorisation — must be destroyed to release
+        # MUMPS memory and force a full refactorisation.
+        self._petsc_needs_matrix_update = False
+        if self._petsc_ksp is not None:
+            try:
+                self._petsc_ksp.destroy()
+            except Exception:
+                pass
+            self._petsc_ksp = None
+        if self._petsc_mat is not None:
+            try:
+                self._petsc_mat.destroy()
+            except Exception:
+                pass
+            self._petsc_mat = None
+        self._petsc_build_count = 0
+        self._petsc_shape = None
+
+        # Jacobian equilibration cache
+        self._eq_Dr = None
+        self._eq_Dc = None
+
     def solve(self, func, y0):
         self.set_func(func)
         if self.method == 'VI':
@@ -374,7 +682,230 @@ class ImplicitEquationSolver:
         else:
             if self._is_identity_proj:
                 return self._solve_newton_identity(func, y0)
+            if self._is_rho_independent:
+                return self._solve_newton_algebraic(func, y0)
             return self._solve_with_semismooth_newton(func, y0)
+
+    # ================================================================
+    # Algebraic-constraint fast path (direct Newton with row patching)
+    # ================================================================
+
+    def _solve_newton_algebraic(self, func, y0):
+        r"""Newton solver for algebraic-constraint projections.
+
+        Bypasses the general semismooth Newton assembly
+        ``J = I - D + lam·D·J_func`` (which requires an expensive sparse
+        matrix–matrix product ``D @ J_func`` plus three additional sparse
+        additions) and instead directly patches the zero constraint rows
+        of the iteration-matrix Jacobian with the algebraic constraint
+        equations.
+
+        The augmented system solved at each Newton step is::
+
+            F_field(y) = 0          (implicit equation — field rows)
+            q - g(y_field) = 0      (algebraic constraint — constraint rows)
+
+        whose Jacobian is::
+
+            J_mod[field, :]      = J_func[field, :]        (unchanged)
+            J_mod[q_i, q_i]      = +1                      (identity diagonal)
+            J_mod[q_i, y_field]  = -∂g/∂y                  (constraint Jacobian)
+
+        Since ``J_func`` already has zero rows on the constraint DOFs
+        (mass and stiffness stripped), the patch is an additive sparse
+        correction — O(nnz_patch) rather than O(nnz(D) × nnz_row(J)).
+
+        SPLU caching is delegated to ``_solve_linear_sparse`` so the
+        factorisation reuse policy (``precond_reuse_steps``) is identical
+        to the general semismooth Newton path.  When the SPLU will be
+        reused, Jacobian computation and row-patching are skipped
+        entirely.
+        """
+        y = y0.copy()
+        n = len(y)
+        sparse_active = self._sparse_active(n)
+        P = self.proj
+        _has_patch = hasattr(P, 'build_constraint_patch') and callable(P.build_constraint_patch)
+        _has_resid = hasattr(P, 'constraint_residual') and callable(P.constraint_residual)
+
+        if not (_has_patch and _has_resid):
+            return self._solve_with_semismooth_newton(func, y0)
+
+        # Pre-fetch constraint q_slices for row replacement
+        _q_slices = P.constraint_q_slices if hasattr(P, 'constraint_q_slices') else []
+
+        # Cross-call Jacobian cache (patched J persists across solve() calls)
+        J_local = None
+        if self._J_cross_call is not None and self._J_cross_call.shape == (n, n):
+            J_local = self._J_cross_call
+
+        prev_errF = np.inf
+
+        # Force row equilibration for the algebraic saddle-point system
+        # when using SPLU or UMFPACK.  The patched Jacobian has constraint
+        # rows with O(1) entries and field rows with O(||stiffness||/h_time)
+        # entries.  Without equilibration the direct solver receives a
+        # heavily unbalanced matrix, producing an inaccurate LU factor that
+        # stalls Newton.  This worsens with mesh refinement (stiffness ∝
+        # h_mesh⁻²) and with larger time steps (A/(γh) → 0).
+        #
+        # When linear_solver='petsc' with MUMPS (the default PETSc config),
+        # MUMPS ICNTL(8)=77 automatically selects the best scaling strategy
+        # *inside* the factorisation — tightly coupled with pivot selection
+        # and generally superior to a separate row-equilibration pass.
+        # We therefore skip the manual scaling for the PETSc path.
+        _force_scaling = False
+        _is_petsc = (self.linear_solver == 'petsc')
+        if sparse_active and self.jacobian_scaling == 'none' and not _is_petsc:
+            _force_scaling = True
+            self.jacobian_scaling = 'row'
+
+        # Verbose Newton diagnostics — enable via solver._nl_debug = True
+        _nl_debug = getattr(self, '_nl_debug', False)
+
+        def _build_patched_J(y_cur, t_cur, Fk_cur):
+            """Compute base Jacobian and patch constraint rows."""
+            J_base = self._compute_jacobian_csr(func, y_cur, sparse_active)
+            patch = P.build_constraint_patch(
+                y_cur, n, t=t_cur, Fk_val=Fk_cur,
+                step_size=getattr(self, 'prev_step', None),
+                prev_state=getattr(self, 'prev_state', None),
+            )
+            if sparse_active:
+                J_mod = J_base.copy()
+                # Vectorised row zeroing via CSR indptr slicing
+                for qs in _q_slices:
+                    s = J_mod.indptr[qs.start]
+                    e = J_mod.indptr[qs.stop]
+                    if e > s:
+                        J_mod.data[s:e] = 0.0
+                J_mod.eliminate_zeros()
+                return J_mod + patch
+            else:
+                J_arr = J_base.toarray() if sp.issparse(J_base) else np.array(J_base, copy=True)
+                patch_d = patch.toarray() if sp.issparse(patch) else np.asarray(patch)
+                for qs in _q_slices:
+                    J_arr[qs, :] = 0.0
+                return J_arr + patch_d
+
+        for iteration in range(1, self.max_iter + 1):
+            tcur = getattr(self, 'current_time', None)
+
+            # ---- Combined residual: field eqs + constraint violation ----
+            F_field = func(y)
+            self.last_Fk_val = F_field
+            c_resid = P.constraint_residual(
+                y, t=tcur, Fk_val=F_field,
+                step_size=getattr(self, 'prev_step', None),
+                prev_state=getattr(self, 'prev_state', None),
+            )
+            # REPLACE constraint rows (don't add — func may already carry
+            # algebraic residual on those DOFs, e.g. dq = q - C y).
+            F_combined = F_field.copy()
+            for qs in _q_slices:
+                F_combined[qs] = c_resid[qs]
+
+            converged, errF = self._converged_with_metric(F_combined, y)
+            if _nl_debug:
+                print(f'  [alg-newton] it={iteration} errF={errF:.4e}'
+                      f' ||F_field||={float(np.linalg.norm(F_field)):.4e}'
+                      f' ||c_resid||={float(np.linalg.norm(c_resid)):.4e}'
+                      f' converged={converged}')
+            if converged:
+                # Enforce constraints to machine precision before returning
+                proj_val = self._project(y, y, 1.0, tcur, F_field,
+                                         getattr(self, 'prev_state', None))
+                y[:] = proj_val
+                F_final = func(y)
+                if _force_scaling:
+                    self.jacobian_scaling = 'none'
+                return (y.copy(), F_final, errF, True, iteration)
+
+            # ---- Recompute J only when stale or first time ----
+            need_J = (J_local is None or errF > 0.5 * prev_errF)
+            prev_errF = errF
+
+            if need_J:
+                J_local = _build_patched_J(y, tcur, F_field)
+                # ---- Jacobian equilibration (row / Ruiz) ----
+                if sparse_active and self.jacobian_scaling != 'none':
+                    J_local = self._apply_jacobian_scaling(
+                        self._to_csr(J_local) if not sp.issparse(J_local) else J_local.tocsr())
+                self._J_cross_call = J_local
+                # Invalidate cached factorisations so the fresh J is used
+                self._lu = None
+                self._lu_pattern = None
+                self._lu_shape = None
+                self._petsc_needs_matrix_update = True
+
+            # ---- Linear solve (SPLU caching delegated to _solve_linear_sparse) ----
+            rhs = -F_combined
+
+            if sparse_active:
+                J_csr = self._to_csr(J_local) if not sp.issparse(J_local) else J_local
+
+                rtol_dyn = self.gmres_tol
+                if self.linear_solver not in ('splu', 'umfpack') and self.linear_tol_strategy != 'fixed':
+                    eta = min(0.5, self.eisenstat_c * (errF ** self.eisenstat_exp))
+                    rtol_dyn = max(self.gmres_tol, eta)
+
+                delta, ok = self._solve_linear_sparse(
+                    J_csr, self._scale_rhs(rhs), rtol=rtol_dyn)
+                if ok:
+                    delta = self._unscale_solution(delta)
+                if not ok:
+                    if not need_J:
+                        # Force fresh Jacobian and SPLU rebuild
+                        J_local = _build_patched_J(y, tcur, F_field)
+                        if self.jacobian_scaling != 'none':
+                            J_local = self._apply_jacobian_scaling(
+                                self._to_csr(J_local) if not sp.issparse(J_local)
+                                else J_local.tocsr())
+                        self._J_cross_call = J_local
+                        J_csr = self._to_csr(J_local) if not sp.issparse(J_local) else J_local
+                        self._lu = None
+                        self._lu_pattern = None
+                        self._lu_shape = None
+                        self._petsc_needs_matrix_update = True
+                        delta, ok = self._solve_linear_sparse(
+                            J_csr, self._scale_rhs(rhs), rtol=rtol_dyn)
+                        if ok:
+                            delta = self._unscale_solution(delta)
+                    if not ok:
+                        if _force_scaling:
+                            self.jacobian_scaling = 'none'
+                        return (y, F_field, errF, False, iteration)
+            else:
+                J_dense = J_local.toarray() if sp.issparse(J_local) else J_local
+                try:
+                    delta = np.linalg.solve(J_dense, rhs)
+                except np.linalg.LinAlgError:
+                    if _force_scaling:
+                        self.jacobian_scaling = 'none'
+                    return (y, F_field, errF, False, iteration)
+
+            if _nl_debug:
+                delta_norm = float(np.linalg.norm(delta))
+                y_norm = max(1.0, float(np.linalg.norm(y)))
+                print(f'  [alg-newton] it={iteration} ||delta||={delta_norm:.4e}'
+                      f' ||y||={y_norm:.4e} need_J={need_J}')
+
+            # ---- Update ----
+            np.add(y, delta, out=y)
+
+        # Max iterations exhausted
+        F_in = func(y)
+        self.last_Fk_val = F_in
+        c_resid = P.constraint_residual(y, t=getattr(self, 'current_time', None))
+        F_combined = F_in.copy()
+        for qs in _q_slices:
+            F_combined[qs] = c_resid[qs]
+        errF = self._errf_metric(F_combined, y)
+        if _force_scaling:
+            self.jacobian_scaling = 'none'
+        if _nl_debug:
+            print(f'  [alg-newton] FAILED after {self.max_iter} iters, errF={errF:.4e}')
+        return (y, F_in, errF, False, self.max_iter)
 
     # ================================================================
     # Identity-projection fast paths (no projection overhead at all)
@@ -416,14 +947,24 @@ class ImplicitEquationSolver:
         # the same step size and constant Jacobian) reuse the factorisation.
         J_local = None          # current Jacobian (dense or CSR)
         lu_local = self._lu if (self._lu is not None and self._lu_shape == (n, n)) else None
+
+        # For non-SPLU iterative solvers (GMRES, PETSc, …), seed J from
+        # the cross-call cache so that stage 2 of SDIRK and consecutive
+        # same-h steps skip the Jacobian evaluation — analogous to how
+        # the SPLU path seeds lu_local from self._lu.
+        _use_splu_path = (self.linear_solver == 'splu')
+        if not _use_splu_path and self._J_cross_call is not None:
+            if self._J_cross_call.shape == (n, n):
+                J_local = self._J_cross_call
+
         prev_errF = np.inf      # previous *iteration's* errF (always updated)
 
         for iteration in range(1, self.max_iter + 1):
             F_in = func(y)
             self.last_Fk_val = F_in
-            errF = float(np.linalg.norm(F_in))
+            converged, errF = self._converged_with_metric(F_in, y)
 
-            if errF < self.tol:
+            if converged:
                 return (y.copy(), F_in, errF, True, iteration)
 
             # --- Decide whether to recompute J (modified Newton) ---
@@ -443,9 +984,15 @@ class ImplicitEquationSolver:
 
             if need_J:
                 J_local = self._compute_jacobian_csr(func, y, sparse_active)
+                # ---- Jacobian equilibration (row / Ruiz) ----
+                if sparse_active and self.jacobian_scaling != 'none':
+                    J_csr_eq = self._to_csr(J_local) if not sp.issparse(J_local) else J_local.tocsr()
+                    J_local = self._apply_jacobian_scaling(J_csr_eq)
                 lu_local = None               # invalidate cached factorization
                 self._lu = None               # also invalidate persistent cache
                 self._lu_shape = None
+                self._J_cross_call = None     # will be re-set after linear solve
+                self._petsc_needs_matrix_update = True  # force MUMPS re-factorisation
 
             # --- Linear solve: J @ delta = -F_in ---
             rhs = -F_in
@@ -456,46 +1003,114 @@ class ImplicitEquationSolver:
                 if J_local is not None:
                     J_csr = self._to_csr(J_local) if not sp.issparse(J_local) else J_local
 
-                # Prefer direct SPLU with factorization reuse within this solve
-                # (and across consecutive solve() calls via self._lu).
-                # Fall back to the general _solve_linear_sparse (GMRES/ILU/PETSc)
-                # if SPLU fails (e.g. singular or very large system).
-                if lu_local is not None:
-                    try:
-                        delta = lu_local.solve(rhs)
-                    except Exception:
-                        lu_local = None
-                        self._lu = None
-                        self._lu_shape = None
+                if _use_splu_path:
+                    # ---- Inline SPLU path with cross-call LU reuse ----
+                    # Fastest for moderate-size systems where direct
+                    # factorisation is affordable.  LU is reused within a
+                    # solve and across consecutive solve() calls (SDIRK
+                    # stage reuse, consecutive same-h steps).
+                    rhs_solve = self._scale_rhs(rhs)
+                    if lu_local is not None:
+                        try:
+                            delta = lu_local.solve(rhs_solve)
+                            delta = self._unscale_solution(delta)
+                        except Exception:
+                            lu_local = None
+                            self._lu = None
+                            self._lu_shape = None
 
-                if lu_local is None:
-                    # If we still don't have J (cache miss + LU failure), compute now
-                    if J_csr is None:
-                        J_local = self._compute_jacobian_csr(func, y, sparse_active)
-                        J_csr = self._to_csr(J_local) if not sp.issparse(J_local) else J_local
-                    try:
-                        J_csc = J_csr.tocsc() if not sp.isspmatrix_csc(J_csr) else J_csr
-                        lu_local = spla.splu(J_csc, permc_spec=self.splu_permc_spec)
-                        # Persist for cross-call reuse (SDIRK stages, same-h steps)
-                        self._lu = lu_local
-                        self._lu_shape = (n, n)
-                        delta = lu_local.solve(rhs)
-                    except Exception:
-                        # SPLU failed — fall back to configured linear solver
-                        lu_local = None
-                        rtol_dyn = self.gmres_tol
-                        if self.linear_solver == 'gmres' and self.linear_tol_strategy != 'fixed':
-                            eta = min(0.5, self.eisenstat_c * (errF ** self.eisenstat_exp))
-                            rtol_dyn = max(self.gmres_tol, eta)
-                        delta, ok = self._solve_linear_sparse(J_csr, rhs, rtol=rtol_dyn)
-                        if not ok:
-                            # Last resort: recompute J if we hadn't already
-                            if not need_J:
-                                J_local = self._compute_jacobian_csr(func, y, sparse_active)
-                                J_csr = self._to_csr(J_local)
-                                delta, ok = self._solve_linear_sparse(J_csr, rhs, rtol=rtol_dyn)
+                    if lu_local is None:
+                        if J_csr is None:
+                            J_local = self._compute_jacobian_csr(func, y, sparse_active)
+                            if self.jacobian_scaling != 'none':
+                                J_local = self._apply_jacobian_scaling(
+                                    self._to_csr(J_local) if not sp.issparse(J_local)
+                                    else J_local.tocsr())
+                                rhs_solve = self._scale_rhs(rhs)
+                            J_csr = self._to_csr(J_local) if not sp.issparse(J_local) else J_local
+                        try:
+                            J_csc = J_csr.tocsc() if not sp.isspmatrix_csc(J_csr) else J_csr
+                            lu_local = spla.splu(J_csc, permc_spec=self.splu_permc_spec)
+                            self._lu = lu_local
+                            self._lu_shape = (n, n)
+                            delta = lu_local.solve(rhs_solve)
+                            delta = self._unscale_solution(delta)
+                        except Exception:
+                            # SPLU failed — fall back to _solve_linear_sparse
+                            lu_local = None
+                            rtol_dyn = self.gmres_tol
+                            if self.linear_tol_strategy != 'fixed':
+                                eta = min(0.5, self.eisenstat_c * (errF ** self.eisenstat_exp))
+                                rtol_dyn = max(self.gmres_tol, eta)
+                            delta, ok = self._solve_linear_sparse(
+                                J_csr, rhs_solve, rtol=rtol_dyn)
+                            if ok:
+                                delta = self._unscale_solution(delta)
                             if not ok:
-                                return (y, F_in, errF, False, iteration)
+                                if not need_J:
+                                    J_local = self._compute_jacobian_csr(func, y, sparse_active)
+                                    if self.jacobian_scaling != 'none':
+                                        J_local = self._apply_jacobian_scaling(
+                                            self._to_csr(J_local) if not sp.issparse(J_local)
+                                            else J_local.tocsr())
+                                        rhs_solve = self._scale_rhs(rhs)
+                                    J_csr = self._to_csr(J_local)
+                                    self._petsc_needs_matrix_update = True
+                                    delta, ok = self._solve_linear_sparse(
+                                        J_csr, rhs_solve, rtol=rtol_dyn)
+                                    if ok:
+                                        delta = self._unscale_solution(delta)
+                                if not ok:
+                                    return (y, F_in, errF, False, iteration)
+                else:
+                    # ---- General iterative path (GMRES, PETSc, …) ----
+                    # Honours the user's ``linear_solver`` setting and
+                    # enables physics-based preconditioners such as PETSc
+                    # field-split for saddle-point systems (e.g. Biot).
+                    #
+                    # Cross-call modified Newton: when *need_J* was False
+                    # (convergence is healthy), the Jacobian seeded from
+                    # ``_J_cross_call`` is reused — SDIRK stage 2 and
+                    # consecutive same-h steps avoid redundant evaluations.
+                    if J_csr is None:
+                        # Fall back to computing J now
+                        J_local = self._compute_jacobian_csr(func, y, sparse_active)
+                        if self.jacobian_scaling != 'none':
+                            J_local = self._apply_jacobian_scaling(
+                                self._to_csr(J_local) if not sp.issparse(J_local)
+                                else J_local.tocsr())
+                        J_csr = self._to_csr(J_local) if not sp.issparse(J_local) else J_local
+
+                    # Persist for cross-call reuse (analogous to self._lu)
+                    self._J_cross_call = J_csr
+
+                    rtol_dyn = self.gmres_tol
+                    if self.linear_tol_strategy != 'fixed':
+                        eta = min(0.5, self.eisenstat_c * (errF ** self.eisenstat_exp))
+                        rtol_dyn = max(self.gmres_tol, eta)
+
+                    rhs_solve = self._scale_rhs(rhs)
+                    delta, ok = self._solve_linear_sparse(J_csr, rhs_solve, rtol=rtol_dyn)
+                    if ok:
+                        delta = self._unscale_solution(delta)
+                    if not ok:
+                        # Retry with a fresh Jacobian if we hadn't already
+                        if not need_J:
+                            J_local = self._compute_jacobian_csr(func, y, sparse_active)
+                            if self.jacobian_scaling != 'none':
+                                J_local = self._apply_jacobian_scaling(
+                                    self._to_csr(J_local) if not sp.issparse(J_local)
+                                    else J_local.tocsr())
+                                rhs_solve = self._scale_rhs(rhs)
+                            J_csr = self._to_csr(J_local) if not sp.issparse(J_local) else J_local
+                            self._J_cross_call = J_csr
+                            self._petsc_needs_matrix_update = True
+                            delta, ok = self._solve_linear_sparse(
+                                J_csr, rhs_solve, rtol=rtol_dyn)
+                            if ok:
+                                delta = self._unscale_solution(delta)
+                        if not ok:
+                            return (y, F_in, errF, False, iteration)
             else:
                 J_dense = J_local.toarray() if sp.issparse(J_local) else J_local
                 try:
@@ -559,7 +1174,7 @@ class ImplicitEquationSolver:
         # Max iterations exhausted
         F_in = func(y)
         self.last_Fk_val = F_in
-        errF = float(np.linalg.norm(F_in))
+        errF = self._errf_metric(F_in, y)
         return (y, F_in, errF, False, self.max_iter)
 
     def _solve_vi_identity(self, func, y0):
@@ -602,7 +1217,12 @@ class ImplicitEquationSolver:
             rho_blk = rho_scalar  # kept for _set_rho_last
 
         # --- helper: block-relative error (same metric as general VI) ---
+        # When per-DOF weighted norm is active, use it instead.
+        _use_wrms = self._use_weighted_norm
+
         def _err(r_vec, y_vec):
+            if _use_wrms:
+                return self._wrms(r_vec, y_vec)
             if slices is not None and len(slices) > 0:
                 vals = []
                 for s in slices:
@@ -616,6 +1236,9 @@ class ImplicitEquationSolver:
             return (float(np.linalg.norm(r_vec)) / math.sqrt(nn)
                     / (1.0 + float(np.linalg.norm(y_vec)) / math.sqrt(nn)))
 
+        # Convergence threshold: wrms <= 1 or legacy err <= tol
+        _conv_thresh = 1.0 if _use_wrms else self.tol
+
         # --- buffers ---
         _r_buf = np.empty(n_vi, dtype=float)
 
@@ -625,7 +1248,7 @@ class ImplicitEquationSolver:
         err = _err(_r_buf, y)
 
         k = 0
-        while err > self.tol and k < self.max_iter:
+        while err > _conv_thresh and k < self.max_iter:
             # Richardson step: y_new = y - rho * F(y)
             y_new = y - rho_vec * Fk
             Fk_new = func(y_new)
@@ -665,7 +1288,7 @@ class ImplicitEquationSolver:
             err = _err(_r_buf, y)
             k += 1
 
-        success = (err <= self.tol)
+        success = (err <= _conv_thresh)
         self._set_rho_last(rho_blk, update_default=True)
         return (y, Fk, err, success, k)
 
@@ -746,13 +1369,58 @@ class ImplicitEquationSolver:
         # Track whether we have a cached F_in from a previous _update_rho call
         _cached_F_in = None
 
+        # --- Active-set locking for gap-based projections ---
+        # Evaluate gap at the *predicted* candidate (y0 − λ F(y0)) to
+        # decide which contacts are active for the entire solve.  This
+        # prevents active-set chattering that destroys Newton convergence.
+        _has_lock = hasattr(P, 'lock_active_set') and hasattr(P, 'unlock_active_set')
+        _has_relock = _has_lock and hasattr(P, 'reset_branch_cache')
+        if _has_lock:
+            tcur_init = getattr(self, 'current_time', None)
+            _F0 = func(y)
+            # Lock active set at the *initial state* y (previous step's
+            # converged solution).  The old predictor  y − λ F(y)  is a
+            # crude forward-Euler step of the natural map; for stiff or
+            # DAE-like systems the position rows of F carry an O(1/h)
+            # factor, causing the predictor to massively overshoot
+            # position variables and produce spurious contact activation
+            # when gap is position-based (e.g. gap = q_y).
+            # Locking at y is physically meaningful: if the ball is
+            # clearly above the ground (gap > 0) at the start of the
+            # step, contact is inactive.  Should the iterate cross
+            # gap = 0 during the Newton solve, Proposal 3 (monotone
+            # relocking below) will activate the contact.
+            P.lock_active_set(y, t=tcur_init)
+            _cached_F_in = _F0            # reuse for first iteration
+
+        def _unlock():
+            if _has_lock:
+                P.unlock_active_set()
+
+        # Merit tracking for Proposal 3 (complementarity-based relocking).
+        # After each accepted Newton step, if the natural-map merit
+        # Ψ = ½‖r‖² improved, re-evaluate the gap at the new candidate
+        # and re-lock.  Prevents mis-classification at the predictor from
+        # persisting, while still preventing within-iteration chatter.
+        _prev_merit = float('inf')
+
         for iteration in range(1, self.max_iter + 1):
             # cache context once per iteration
             tcur = getattr(self, 'current_time', None)
             prev = getattr(self, 'prev_state', None)
 
-            # Optional adaptive lam — pass cached F_in to avoid redundant func eval
-            if self.adaptive_lam and self.lam_update_strategy == 'vi':
+            # Optional adaptive lam — pass cached F_in to avoid redundant func eval.
+            # Skip when the projection is rho-independent (e.g. algebraic
+            # constraints): lam has no effect on the projection output and
+            # lam=1 gives the optimal standard Newton system.
+            # Also skip after the first iteration: for SSN the Newton
+            # direction already accounts for lam, so re-adapting every
+            # iteration destroys quadratic convergence and wastes evals.
+            if (self.adaptive_lam
+                    and self.lam_update_strategy == 'vi'
+                    and not self._is_rho_independent
+                    and iteration <= 1
+                    and np.ndim(lam) == 0):
                 try:
                     lam = self._update_rho(func, y, lam, Fk_val=_cached_F_in)
                     self.lam = lam
@@ -786,10 +1454,11 @@ class ImplicitEquationSolver:
 
             # F_buf = y - proj_z
             np.subtract(y, proj_z, out=F_buf)
-            errF = np.linalg.norm(F_buf)
-            if errF < self.tol:
+            converged, errF = self._converged_with_metric(F_buf, y)
+            if converged:
                 y[:] = proj_z
                 F_y = func(y)
+                _unlock()
                 return (y.copy(), F_y, errF, True, iteration)
 
             # Inner Jacobian
@@ -827,14 +1496,18 @@ class ImplicitEquationSolver:
             if sparse_active:
                 # Sparse path: either use matrix-free GMRES (default) or explicit matrix + SPLU/PETSc.
                 J_in = self._to_csr(J_in)
-                Dproj = self._compute_tangent_csr(candidate, y, lam, tcur, F_in, prev, n)
+                D_out = self._compute_tangent_csr(candidate, y, lam, tcur, F_in, prev, n)
+                if isinstance(D_out, tuple):
+                    Dproj, Dstate = D_out
+                else:
+                    Dproj, Dstate = D_out, None
                 rhs = -F_buf
 
                 # Detect diagonal D for fast assembly (avoid expensive D @ J matmul).
                 # D is diagonal when it has exactly n nonzeros and they sit on the diagonal.
                 _D_is_diag = False
                 _D_diag_vals = None
-                if sp.issparse(Dproj) and Dproj.nnz <= n:
+                if Dstate is None and sp.issparse(Dproj) and Dproj.nnz <= n:
                     # Quick check: CSR with exactly one entry per row on the diagonal
                     _dptr = Dproj.indptr
                     if np.all(np.diff(_dptr) == 1):
@@ -856,8 +1529,17 @@ class ImplicitEquationSolver:
                         _one_minus_d = 1.0 - d
                         J_mat = J_mat + sp.diags(_one_minus_d, format='csr')
                     else:
-                        # General: J = I - D + lam * D @ J_in
-                        J_mat = I - Dproj + lam * (Dproj @ J_in)
+                        # General: J = I - D + D @ diag(lam) @ J_in
+                        # For scalar lam the commutation is trivial;
+                        # for vector lam we must row-scale J_in first.
+                        if np.ndim(lam) >= 1:
+                            _J_lam = J_in.multiply(lam[:, None]) if hasattr(J_in, 'multiply') else sp.diags(lam) @ J_in
+                        else:
+                            _J_lam = lam * J_in
+                        if Dstate is None:
+                            J_mat = I - Dproj + Dproj @ _J_lam
+                        else:
+                            J_mat = I - Dproj - Dstate + Dproj @ _J_lam
                     if not sp.issparse(J_mat):
                         J_mat = self._to_csr(J_mat, n)
                     delta, ok = self._solve_linear_sparse(J_mat, rhs, rtol=rtol_dyn, pattern_hint=None)
@@ -871,26 +1553,56 @@ class ImplicitEquationSolver:
                         def _rmatvec(w, _s=_scale, _omd=_one_minus_d, _J=J_in):
                             return _omd * w + _J.T @ (_s * w)
                     else:
-                        def _matvec(v, _D=Dproj, _J=J_in, _lam=lam):
-                            return (v - _D @ v) + _lam * (_D @ (_J @ v))
-                        def _rmatvec(w, _D=Dproj, _J=J_in, _lam=lam):
-                            return (w - _D.T @ w) + _lam * (_J.T @ (_D.T @ w))
+                        # D @ diag(lam) @ J — reorder so lam scales
+                        # the Jv product *before* D acts on it.
+                        # Works identically for scalar and vector lam.
+                        if Dstate is None:
+                            def _matvec(v, _D=Dproj, _J=J_in, _lam=lam):
+                                return (v - _D @ v) + _D @ (_lam * (_J @ v))
+                            def _rmatvec(w, _D=Dproj, _J=J_in, _lam=lam):
+                                Dt = _D.T @ w
+                                return (w - Dt) + _J.T @ (_lam * Dt)
+                        else:
+                            def _matvec(v, _D=Dproj, _B=Dstate, _J=J_in, _lam=lam):
+                                return (v - _D @ v - _B @ v) + _D @ (_lam * (_J @ v))
+                            def _rmatvec(w, _D=Dproj, _B=Dstate, _J=J_in, _lam=lam):
+                                Dt = _D.T @ w
+                                return (w - Dt - _B.T @ w) + _J.T @ (_lam * Dt)
 
                     J = spla.LinearOperator((n, n), matvec=_matvec, rmatvec=_rmatvec)
                     delta, ok = self._solve_linear_sparse(J, rhs, rtol=rtol_dyn, pattern_hint=None)
 
                 if not ok:
+                    _unlock()
                     return (y, F_in, errF, False, iteration)
             else:
-                Dproj = self._tangent(candidate, y, lam, tcur, F_in, prev)
+                P = getattr(self, 'proj', None)
+                if (P is not None and hasattr(P, 'tangent_cone_split')
+                        and callable(getattr(P, 'tangent_cone_split'))):
+                    Dproj, Dstate = P.tangent_cone_split(
+                        candidate, y, rhok=lam, t=tcur, Fk_val=F_in, prev_state=prev)
+                else:
+                    Dproj, Dstate = self._tangent(candidate, y, lam, tcur, F_in, prev), None
+
                 if sp.issparse(Dproj):
                     Dproj = Dproj.toarray()
+                if Dstate is not None and sp.issparse(Dstate):
+                    Dstate = Dstate.toarray()
                 if sp.issparse(J_in):
                     J_in = J_in.toarray()
-                J = I - Dproj + lam * (Dproj @ J_in)
+                # Dense: J = I - D + D @ diag(lam) @ J
+                if np.ndim(lam) >= 1:
+                    _J_lam = lam[np.newaxis, :] * J_in   # row-scale J_in
+                else:
+                    _J_lam = lam * J_in
+                if Dstate is None:
+                    J = I - Dproj + Dproj @ _J_lam
+                else:
+                    J = I - Dproj - Dstate + Dproj @ _J_lam
                 try:
                     delta = np.linalg.solve(J, -F_buf)
                 except np.linalg.LinAlgError:
+                    _unlock()
                     return (y, F_in, errF, False, iteration)
 
             # Globalization (optional)
@@ -904,9 +1616,11 @@ class ImplicitEquationSolver:
                     def _apply_JT_local(v):
                         return _omd * v + J_in.T @ (_s_ls * v)
                 else:
-                    def _apply_JT_local(v):
+                    def _apply_JT_local(v, _lam=lam):
                         Dt = Dproj.T @ v
-                        return v - Dt + lam * (J_in.T @ Dt)
+                        if Dstate is None:
+                            return v - Dt + J_in.T @ (_lam * Dt)
+                        return v - Dt - (Dstate.T @ v) + J_in.T @ (_lam * Dt)
 
                 grad_phi = _apply_JT_local(F_buf)
                 grad_dir = float(np.dot(grad_phi, delta))
@@ -944,6 +1658,7 @@ class ImplicitEquationSolver:
                 if not accepted:
                     nrm_g = np.linalg.norm(grad_phi)
                     if nrm_g == 0.0:
+                        _unlock()
                         return (y, F_in, errF, False, iteration)
                     delta_g = -grad_phi
                     grad_dir = -nrm_g * nrm_g
@@ -967,6 +1682,7 @@ class ImplicitEquationSolver:
                             self._F_prev_broyden = F_in.copy()
                         y = y_trial
                     else:
+                        _unlock()
                         return (y, F_in, errF, False, iteration)
             else:
                 if self.use_broyden and not sparse_active:
@@ -974,12 +1690,51 @@ class ImplicitEquationSolver:
                     self._F_prev_broyden = F_in.copy()
                 np.add(y, delta, out=y)
 
+            # --- Proposal 3: monotone active-set relocking ---
+            # After each accepted Newton step, re-evaluate the gap and
+            # take the UNION of the current lock with newly-detected
+            # contacts.  Contacts are never *removed* during a solve —
+            # only added.  This corrects predictor mis-classification
+            # (a contact the predictor missed) without triggering the
+            # false-deactivation problem (a contact that appears
+            # resolved at an intermediate iterate but is still needed).
+            #
+            # Only attempt when:
+            #   (a) merit improved (don't waste evals on diverging iters)
+            #   (b) not all blocks are already active (nothing to add)
+            #   (c) iteration ≥ 2 (first iteration is the big correction)
+            if _has_relock and iteration >= 2:
+                _cur_merit = 0.5 * float(np.dot(F_buf, F_buf))
+                _old_mask = P._locked_active
+                _all_active = (_old_mask is not None
+                               and _old_mask.all())
+                if _cur_merit < _prev_merit and not _all_active:
+                    # Evaluate gap at current iterate directly (cheap).
+                    _gap_nargs = getattr(P, '_gap_nargs', None)
+                    _gap_func = getattr(P, 'gap_func', None)
+                    if _gap_func is not None:
+                        _tcur_rl = getattr(self, 'current_time', None)
+                        if _gap_nargs is not None and _gap_nargs <= 1:
+                            _gaps_rl = np.atleast_1d(_gap_func(y))
+                        else:
+                            _gaps_rl = np.atleast_1d(
+                                _gap_func(y, _tcur_rl))
+                        _new_active = _gaps_rl <= P.gap_tol
+                        if _old_mask is not None:
+                            _union = _old_mask | _new_active
+                            if not np.array_equal(_union, _old_mask):
+                                # Actually gained a new contact
+                                P._locked_active = _union
+                _prev_merit = _cur_merit
+
         # Out of iterations
         F_in = func(y)
         self.last_Fk_val = F_in
         tcur = getattr(self, 'current_time', None)
         prev = getattr(self, 'prev_state', None)
-        errF = np.linalg.norm(y - self._project(y, y - lam * F_in, lam, tcur, F_in, prev))
+        F_resid = y - self._project(y, y - lam * F_in, lam, tcur, F_in, prev)
+        errF = self._errf_metric(F_resid, y)
+        _unlock()
         return (y, F_in, errF, False, self.max_iter)
 
 
@@ -1016,7 +1771,12 @@ class ImplicitEquationSolver:
                 return arr
 
         # Helper: block-wise relative L2 of natural residual r = (y - P(y - rho F(y)))
+        # When per-DOF weighted norm is active, use it instead.
+        _use_wrms = self._use_weighted_norm
+
         def _rel_block_l2(r, y, slices):
+            if _use_wrms:
+                return self._wrms(r, y)
             if slices is not None:
                 vals = []
                 for s in slices:
@@ -1130,7 +1890,10 @@ class ImplicitEquationSolver:
         if debug:
             print(f"[VI] k={k} err={err:.3e}")
 
-        while err > self.tol and k < self.max_iter:
+        # Convergence threshold: wrms <= 1 or legacy err <= tol
+        _conv_thresh = 1.0 if _use_wrms else self.tol
+
+        while err > _conv_thresh and k < self.max_iter:
             # Project with current rho
             tcur = getattr(self, 'current_time', None)
             prev = getattr(self, 'prev_state', None)
@@ -1270,7 +2033,7 @@ class ImplicitEquationSolver:
             Fk_val = Fk_val_1
             k += 1
 
-        success = (err <= self.tol)
+        success = (err <= _conv_thresh)
         # Persist last rho for subsequent solves (both cached and default field)
         rho = _sanitize_rho(rho, context="final")
         self._set_rho_last(rho, update_default=True)
@@ -1500,8 +2263,23 @@ class ImplicitEquationSolver:
         return J_csr
 
     def _compute_tangent_csr(self, candidate, y, lam, tcur, F_in, prev, n):
-        """Compute Tangent and return as CSR, using caching to avoid dense-to-sparse overhead."""
-        # 1. Compute raw Tangent (dense or sparse)
+        """Compute Tangent and return as CSR, using caching to avoid dense-to-sparse overhead.
+
+        Returns either a single CSR matrix ``D`` (legacy) or a tuple
+        ``(D_cand, D_state)`` when the projector exposes
+        ``tangent_cone_split``, signalling that the projection depends on
+        ``current_state`` (e.g. Moreau De Saxcé augmentation).
+        """
+        # 1. Check for split tangent (state-dependent projector)
+        P = getattr(self, 'proj', None)
+        if (P is not None and hasattr(P, 'tangent_cone_split')
+                and callable(getattr(P, 'tangent_cone_split'))):
+            # Split derivative: (dP/dcandidate, dP/dcurrent_state)
+            D_cand_raw, D_state_raw = P.tangent_cone_split(
+                candidate, y, rhok=lam, t=tcur, Fk_val=F_in, prev_state=prev)
+            return (self._to_csr(D_cand_raw, n), self._to_csr(D_state_raw, n))
+
+        # 2. Legacy single-tangent path
         D_raw = self._tangent(candidate, y, lam, tcur, F_in, prev)
 
         # Check if cache needs reset due to shape change
@@ -1601,6 +2379,90 @@ class ImplicitEquationSolver:
                 # Fall through to ILU path below
             else:
                 return self._solve_with_petsc(J, b, rtol=rtol)
+
+        if self.linear_solver == 'umfpack':
+            if not UMFPACK_AVAILABLE:
+                warnings.warn(
+                    "UMFPACK not available. Install with: pip install scikit-umfpack. "
+                    "Falling back to splu.",
+                    UserWarning, stacklevel=2,
+                )
+                self.linear_solver = 'splu'  # fall through below
+            else:
+                nnz = getattr(J, 'nnz', None)
+                pattern_key = (J.shape, nnz, pattern_hint)
+                reuse_budget = int(self.precond_reuse_steps)
+
+                need_rebuild = (
+                    self._lu is None
+                    or self._lu_shape != J.shape
+                    or self._lu_pattern != pattern_key
+                    or reuse_budget <= 0
+                    or self._lu_use_count >= reuse_budget
+                )
+
+                if need_rebuild:
+                    try:
+                        matrix = J
+                        if not sp.issparse(matrix):
+                            matrix = sp.csc_matrix(matrix)
+                        elif not sp.isspmatrix_csc(matrix):
+                            matrix = matrix.tocsc()
+                        # --- UMFPACK symbolic/numeric separation ---
+                        # The UmfpackContext lives in _umf_ctx (NOT _lu)
+                        # so that SDIRK2's h-change invalidation (which
+                        # sets _lu = None) does NOT destroy the cached
+                        # symbolic analysis.  Symbolic depends only on
+                        # the sparsity pattern; numeric depends on values.
+                        sym_key = (J.shape, nnz)
+                        if (self._umf_ctx is not None
+                                and self._umf_symbolic_key == sym_key):
+                            # Same pattern → reuse symbolic, redo numeric only
+                            self._umf_ctx.numeric(matrix)
+                        else:
+                            # New pattern → full symbolic + numeric
+                            umf = UmfpackContext("di")
+                            umf.symbolic(matrix)
+                            umf.numeric(matrix)
+                            self._umf_ctx = umf
+                            self._umf_symbolic_key = sym_key
+                        self._lu = self._umf_ctx   # alias for solve + reuse check
+                        self._lu_matrix = matrix
+                        self._lu_use_count = 0
+                        self._lu_pattern = pattern_key
+                        self._lu_shape = J.shape
+                    except Exception:
+                        self._lu = None
+                        self._lu_matrix = None
+                        self._lu_pattern = None
+                        self._lu_shape = None
+                        self._umf_ctx = None
+                        self._umf_symbolic_key = None
+
+                if self._lu is not None:
+                    try:
+                        x = self._lu.solve(
+                            _UMFPACK_A, self._lu_matrix, b,
+                            autoTranspose=True,
+                        )
+                        self._lu_use_count += 1
+                        return x, True
+                    except Exception:
+                        self._lu = None
+                        self._lu_matrix = None
+                        self._lu_pattern = None
+                        self._lu_shape = None
+                        self._umf_ctx = None
+                        self._umf_symbolic_key = None
+
+                # Fallback to GMRES
+                x, info = self._gmres(
+                    J, b,
+                    rtol=(self.gmres_tol if rtol is None else rtol),
+                    maxiter=self.gmres_maxiter,
+                    restart=self.gmres_restart,
+                )
+                return (x, info == 0)
 
         if self.linear_solver == 'splu':
             nnz = getattr(J, 'nnz', None)
@@ -1763,8 +2625,14 @@ class ImplicitEquationSolver:
         # For direct solvers, we want to reuse the factorization like SPLU does.
         # The key insight: SPLU reuses stale factorizations for precond_reuse_steps solves.
         # This works because Newton iteration is self-correcting.
-        # 
-        # Track a separate counter for direct solver factorization reuse:
+        #
+        # However, when Newton explicitly recomputes the Jacobian (convergence
+        # is slow), the fresh matrix MUST be factorised — otherwise the Newton
+        # step is based on a stale system and convergence stalls or fails.
+        if getattr(self, '_petsc_needs_matrix_update', False):
+            need_rebuild = True
+            self._petsc_needs_matrix_update = False
+
         if is_direct_solver and not need_rebuild:
             # Reuse existing factorization without updating matrix
             # This is the key optimization that makes MUMPS competitive with SPLU

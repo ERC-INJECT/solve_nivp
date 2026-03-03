@@ -59,7 +59,7 @@ class AdaptiveStepping:
         component_slices=None,
         atol: float = 1e-6,
         rtol: float = 1e-3,
-        h0: float = 1e-2,
+        h0: float | str | None = 1e-2,
         h_min: float = 1e-10,
         h_max: float = 1e3,
         h_up: float = 2.0,
@@ -79,19 +79,42 @@ class AdaptiveStepping:
         verbose: bool = False,
         skip_error_indices=None,
         record_attempts: bool = False,
+        # --- DAE-aware error weighting ---
+        dae_var_weight: str = "auto",   # "auto", "exclude", "include"
     ) -> None:
 
         self.integrator = integrator
         self.component_slices = component_slices
-        self.atol = float(atol)
-        self.rtol = float(rtol)
 
-        # current step size h_n
-        self.h = float(h0)
+        # ---- Per-DOF tolerance vectors (SUNDIALS / scipy convention) ----
+        # Accept scalar, per-slice list/tuple, or full per-DOF array.
+        # Internally we store 1-D numpy arrays (or a scalar float when the
+        # system size is not yet known so that the first call lazily expands).
+        self._atol_raw = atol
+        self._rtol_raw = rtol
+        self._atol_vec: np.ndarray | None = None   # lazily built on first use
+        self._rtol_vec: np.ndarray | None = None
+
+        # ---- Automatic h₀ (Hairer-Wanner) ----
+        # When h0 is None or "auto", defer estimation to the first call to
+        # step(), where we have access to fun, t₀, y₀.
+        if h0 is None or (isinstance(h0, str) and h0.lower() == 'auto'):
+            self._auto_h0 = True
+            self.h = float(h_min)     # placeholder until estimated
+        else:
+            self._auto_h0 = False
+            self.h = float(h0)
 
         # global hard clamps on h
         self.h_min = float(h_min)
         self.h_max = float(h_max)
+
+        # ---- DAE-aware error weighting ----
+        # "auto"   : detect algebraic DOFs from mass matrix on first use
+        # "exclude": same as auto (kept for clarity)
+        # "include": traditional behaviour, weight all DOFs equally
+        self._dae_var_weight_mode = dae_var_weight.lower().strip()
+        self._dae_mask: np.ndarray | None = None    # lazily built
 
         # per-step up/down clamp factors (classic mode)
         self.h_up = float(h_up)
@@ -139,11 +162,232 @@ class AdaptiveStepping:
         self._attempt_status = None
         self.reset_attempt_log()
 
+        # --- Nonlinear failure recovery tracking ---
+        # Detects persistent fail→succeed cycles (the "death spiral" where
+        # every proposed h triggers a NL failure, the retry at h*h_down
+        # succeeds with tiny error, the controller grows h, and the next
+        # attempt fails again).
+        self._nl_fail_recovery_count = 0   # consecutive fail→succeed pairs
+        self._nl_success_no_fail = 0       # consecutive clean successes
+        self._in_nl_recovery = False        # previous step() had NL failure
+        self._consecutive_nl_fails = 0     # consecutive NL failures (no success between)
+
+        # How many consecutive NL failures before a full solver reset
+        # (destroy PETSc KSP, SPLU, ILU, all caches — force fresh Jacobian
+        # and fresh factorisation on the next attempt).
+        self._NL_RESCUE_THRESH = 5
+
         # operating mode
         m = mode.lower().strip()
         if m not in ("classic", "ratio"):
             raise ValueError("mode must be 'classic' or 'ratio'")
         self.mode = m
+
+    # ------------------------------------------------------------------
+    # Tolerance helpers  (per-DOF weighted-norm à la SUNDIALS / scipy)
+    # ------------------------------------------------------------------
+
+    @property
+    def atol(self):
+        """Return atol — scalar float or 1-D ndarray."""
+        if self._atol_vec is not None:
+            return self._atol_vec
+        return self._atol_raw
+
+    @atol.setter
+    def atol(self, value):
+        """Allow ``stepper.atol = X`` from outside (e.g. solve_ivp_ns tuning)."""
+        self._atol_raw = value
+        self._atol_vec = None          # invalidate cache so next call re-expands
+
+    @property
+    def rtol(self):
+        if self._rtol_vec is not None:
+            return self._rtol_vec
+        return self._rtol_raw
+
+    @rtol.setter
+    def rtol(self, value):
+        self._rtol_raw = value
+        self._rtol_vec = None
+
+    def _ensure_tol_vectors(self, n: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(atol_vec, rtol_vec)`` of length *n*.
+
+        Lazily expands the raw tolerances provided at construction:
+
+        * **scalar** → broadcast to length *n*.
+        * **per-slice sequence** (length == ``len(component_slices)``) →
+          expanded to per-DOF via the slice mapping.
+        * **per-DOF array** (length == *n*) → used directly.
+        """
+        if self._atol_vec is not None and self._atol_vec.shape == (n,):
+            return self._atol_vec, self._rtol_vec
+
+        self._atol_vec = self._expand_tol(self._atol_raw, n, 'atol')
+        self._rtol_vec = self._expand_tol(self._rtol_raw, n, 'rtol')
+        return self._atol_vec, self._rtol_vec
+
+    def _expand_tol(self, raw, n: int, name: str) -> np.ndarray:
+        """Expand a raw tolerance value to a length-*n* 1-D float array."""
+        arr = np.asarray(raw, dtype=float)
+        if arr.ndim == 0:
+            # scalar → broadcast
+            return np.full(n, float(arr))
+        if arr.shape == (n,):
+            return arr.copy()
+        # per-slice?
+        if self.component_slices is not None and arr.size == len(self.component_slices):
+            out = np.empty(n, dtype=float)
+            for val, sl in zip(arr.ravel(), self.component_slices):
+                out[sl] = float(val)
+            return out
+        raise ValueError(
+            f"{name} has length {arr.size}, expected scalar, "
+            f"len(component_slices)={len(self.component_slices) if self.component_slices else 'N/A'}, "
+            f"or n={n}"
+        )
+
+    # ------------------------------------------------------------------
+    # DAE-aware error weighting
+    # ------------------------------------------------------------------
+
+    def _ensure_dae_mask(self, n: int) -> np.ndarray:
+        """Return a 1-D array of shape *(n,)* with per-DOF error weights.
+
+        * **differential** DOF → weight 1.0
+        * **algebraic** DOF (zero mass-matrix row) → weight 0.0
+
+        The mask is built lazily on the first call by inspecting the mass
+        matrix ``A`` stored on the integrator.  If ``dae_var_weight='include'``
+        or no mass matrix is available, a uniform-ones vector is returned.
+        """
+        if self._dae_mask is not None and self._dae_mask.shape == (n,):
+            return self._dae_mask
+
+        if self._dae_var_weight_mode == 'include':
+            self._dae_mask = np.ones(n, dtype=float)
+            return self._dae_mask
+
+        # Try to get the mass matrix from the integrator
+        A = getattr(self.integrator, 'A', None)
+        if A is None or getattr(self.integrator, 'use_identity', True):
+            # No mass matrix (identity) → all differential
+            self._dae_mask = np.ones(n, dtype=float)
+            return self._dae_mask
+
+        self._dae_mask = self._detect_algebraic_dofs(A, n)
+
+        n_alg = int(np.sum(self._dae_mask == 0.0))
+        if self.verbose and n_alg > 0:
+            print(f"[adaptive/DAE] detected {n_alg} algebraic DOFs "
+                  f"(of {n} total) — excluded from error norm")
+
+        return self._dae_mask
+
+    @staticmethod
+    def _detect_algebraic_dofs(A, n: int) -> np.ndarray:
+        """Build a 0/1 mask from mass matrix *A*.
+
+        A row whose absolute-value norm is below a small tolerance is
+        classified as algebraic (weight = 0).  Works for both dense and
+        sparse matrices.
+
+        Uses fully vectorised operations — no Python row loop.
+        """
+        import scipy.sparse as sp
+        mask = np.ones(n, dtype=float)
+        m = min(n, A.shape[0])
+
+        if sp.issparse(A):
+            A_csr = sp.csr_matrix(A)
+            # Vectorised: compute max |value| per row via abs() then
+            # group-max using np.maximum.reduceat on the CSR data array.
+            if A_csr.nnz == 0:
+                mask[:m] = 0.0
+            else:
+                abs_data = np.abs(A_csr.data)
+                # Rows that have at least one entry
+                row_nnz = np.diff(A_csr.indptr[:m + 1])
+                nonempty = row_nnz > 0
+
+                # reduceat only over non-empty rows (avoids 0-length segments)
+                starts = A_csr.indptr[:m][nonempty]
+                row_max = np.maximum.reduceat(abs_data, starts)
+                # Only keep the first element of each segment
+                # (reduceat already does this for us since segments are contiguous)
+                alg_nonempty = row_max < 1e-14
+
+                # Empty rows are always algebraic
+                alg_mask = np.ones(m, dtype=bool)
+                alg_mask[nonempty] = alg_nonempty
+                # Rows with zero nnz stay True (algebraic)
+
+                mask[:m] = np.where(alg_mask, 0.0, 1.0)
+        else:
+            A_arr = np.asarray(A)
+            row_max = np.max(np.abs(A_arr[:m, :]), axis=1)
+            mask[:m] = np.where(row_max < 1e-14, 0.0, 1.0)
+
+        return mask
+
+    # ------------------------------------------------------------------
+    # Hairer-Wanner automatic h₀ estimation
+    # ------------------------------------------------------------------
+
+    def _estimate_h0_hairer(self, fun, t0: float, y0: np.ndarray) -> float:
+        """Estimate a good initial step size using the Hairer-Wanner algorithm.
+
+        Reference: Hairer, Nørsett & Wanner, *Solving Ordinary Differential
+        Equations I*, § II.4, algorithm on p. 169.
+
+        Steps
+        -----
+        1. Compute weighted norms d₀ = ‖y₀‖ and d₁ = ‖f₀‖.
+        2. First guess  h₀ = 0.01 · d₀ / d₁   (or 10⁻⁶ if too small).
+        3. Euler step   y₁ = y₀ + h₀ · f₀.
+        4. Second derivative estimate  d₂ = ‖f(t₀+h₀, y₁) - f₀‖ / h₀.
+        5. Refine  h₁ = (0.01 / max(d₁,d₂))^{1/(p+1)}.
+        6. Return  min(100·h₀, h₁), clamped to [h_min, h_max].
+        """
+        p = self.p
+        n = y0.size
+        atol_v, rtol_v = self._ensure_tol_vectors(n)
+
+        def _wnorm(v):
+            """Weighted RMS norm with tol = atol + rtol*|y0|."""
+            sc = atol_v + rtol_v * np.abs(y0)
+            return math.sqrt(np.mean((v / sc) ** 2))
+
+        f0 = np.asarray(fun(t0, y0), dtype=float).ravel()
+
+        d0 = _wnorm(y0)
+        d1 = _wnorm(f0)
+
+        if d0 < 1e-5 or d1 < 1e-5:
+            h0 = 1e-6
+        else:
+            h0 = 0.01 * d0 / d1
+
+        # Explicit Euler probe
+        y1 = y0 + h0 * f0
+        f1 = np.asarray(fun(t0 + h0, y1), dtype=float).ravel()
+
+        d2 = _wnorm(f1 - f0) / h0
+
+        if max(d1, d2) <= 1e-15:
+            h1 = max(1e-6, h0 * 1e-3)
+        else:
+            h1 = (0.01 / max(d1, d2)) ** (1.0 / (p + 1))
+
+        h_est = min(100.0 * h0, h1)
+        h_est = min(self.h_max, max(self.h_min, h_est))
+
+        if self.verbose:
+            print(f"[adaptive/auto_h0] d0={d0:.3e}, d1={d1:.3e}, d2={d2:.3e}, "
+                  f"h0_probe={h0:.3e}, h1={h1:.3e} → h_est={h_est:.3e}")
+
+        return h_est
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -198,14 +442,23 @@ class AdaptiveStepping:
         """
         Compute normalized error E via Richardson step-doubling:
             raw_err = (y_lo - y_hi) / (2^p - 1)
-        scale each component by atol + rtol * max(|.|),
+        scale each component by atol_i + rtol_i * max(|.|),
         then RMS over included components.
 
         E <= 1   => "good enough" in classic sense.
+
+        Tolerances may be per-DOF vectors (SUNDIALS convention).
+
+        When DAE-aware weighting is active, algebraic DOFs (zero mass-
+        matrix rows) are excluded from the norm (IDA convention).
         """
         denom = max(1e-14, (2.0 ** self.p) - 1.0)
         accum = 0.0
         count = 0
+
+        n = y_hi.size
+        atol_v, rtol_v = self._ensure_tol_vectors(n)
+        dae_w = self._ensure_dae_mask(n)
 
         if self.component_slices is None:
             if self._err_buf is None or self._err_buf.shape != y_hi.shape:
@@ -217,22 +470,29 @@ class AdaptiveStepping:
             np.subtract(y_lo, y_hi, out=self._err_buf)
             self._err_buf /= denom
 
-            # tol scaling
+            # tol scaling (per-DOF)
             np.maximum(np.abs(y_lo), np.abs(y_hi), out=self._etol_buf)
-            self._etol_buf *= self.rtol
-            self._etol_buf += self.atol
+            self._etol_buf *= rtol_v
+            self._etol_buf += atol_v
 
             # scaled error per component
             np.divide(self._err_buf, self._etol_buf, out=self._err_buf)
 
+            # Apply DAE mask — zero out algebraic DOFs
+            self._err_buf *= dae_w
+
             accum = float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
-            count = self._err_buf.size
+            # Count only differential DOFs in the denominator
+            count = int(np.sum(dae_w > 0.0))
         else:
             for i, sl in enumerate(self.component_slices):
                 if i in self.skip_error_indices:
                     continue
                 lo = y_lo[sl]
                 hi = y_hi[sl]
+                a_blk = atol_v[sl]
+                r_blk = rtol_v[sl]
+                w_blk = dae_w[sl]
 
                 # (re)allocate to match current block
                 if self._err_buf is None or self._err_buf.shape != hi.shape:
@@ -245,14 +505,17 @@ class AdaptiveStepping:
                 self._err_buf /= denom
 
                 np.maximum(np.abs(lo), np.abs(hi), out=self._etol_buf)
-                self._etol_buf *= self.rtol
-                self._etol_buf += self.atol
+                self._etol_buf *= r_blk
+                self._etol_buf += a_blk
 
                 np.divide(self._err_buf, self._etol_buf, out=self._err_buf)
 
+                # Apply DAE mask
+                self._err_buf *= w_blk
+
                 accum += float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
-                count += self._err_buf.size
-        # print(f"error is: {math.sqrt(accum / count) if count>0 else 0.0}")
+                count += int(np.sum(w_blk > 0.0))
+
         return 0.0 if count == 0 else math.sqrt(accum / count)
 
     def _scaled_error_embedded(self, y_new, err_vec) -> float:
@@ -263,13 +526,20 @@ class AdaptiveStepping:
         estimate directly from the integrator (e.g. SDIRK2) and scales it
         by the same tolerance formula::
 
-            tol_i = atol + rtol * |y_new_i|
+            tol_i = atol_i + rtol_i * |y_new_i|
             E     = rms( err_i / tol_i )
+
+        Tolerances may be per-DOF vectors (SUNDIALS convention).
+        When DAE-aware weighting is active, algebraic DOFs are excluded.
 
         Returns ``E`` with the same semantics: ``E <= 1`` means acceptable.
         """
         accum = 0.0
         count = 0
+
+        n = y_new.size
+        atol_v, rtol_v = self._ensure_tol_vectors(n)
+        dae_w = self._ensure_dae_mask(n)
 
         if self.component_slices is None:
             if self._err_buf is None or self._err_buf.shape != y_new.shape:
@@ -277,21 +547,28 @@ class AdaptiveStepping:
             if self._etol_buf is None or self._etol_buf.shape != y_new.shape:
                 self._etol_buf = np.empty_like(y_new)
 
-            # tol scaling: atol + rtol * |y_new|
+            # tol scaling: atol_i + rtol_i * |y_new_i|
             np.abs(y_new, out=self._etol_buf)
-            self._etol_buf *= self.rtol
-            self._etol_buf += self.atol
+            self._etol_buf *= rtol_v
+            self._etol_buf += atol_v
 
             # scaled error
             np.divide(err_vec, self._etol_buf, out=self._err_buf)
+
+            # Apply DAE mask — zero out algebraic DOFs
+            self._err_buf *= dae_w
+
             accum = float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
-            count = self._err_buf.size
+            count = int(np.sum(dae_w > 0.0))
         else:
             for i, sl in enumerate(self.component_slices):
                 if i in self.skip_error_indices:
                     continue
                 yn_blk = y_new[sl]
                 er_blk = err_vec[sl]
+                a_blk = atol_v[sl]
+                r_blk = rtol_v[sl]
+                w_blk = dae_w[sl]
 
                 if self._err_buf is None or self._err_buf.shape != yn_blk.shape:
                     self._err_buf = np.empty_like(yn_blk)
@@ -299,12 +576,16 @@ class AdaptiveStepping:
                     self._etol_buf = np.empty_like(yn_blk)
 
                 np.abs(yn_blk, out=self._etol_buf)
-                self._etol_buf *= self.rtol
-                self._etol_buf += self.atol
+                self._etol_buf *= r_blk
+                self._etol_buf += a_blk
 
                 np.divide(er_blk, self._etol_buf, out=self._err_buf)
+
+                # Apply DAE mask
+                self._err_buf *= w_blk
+
                 accum += float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
-                count += self._err_buf.size
+                count += int(np.sum(w_blk > 0.0))
 
         return 0.0 if count == 0 else math.sqrt(accum / count)
 
@@ -359,6 +640,79 @@ class AdaptiveStepping:
             "status": np.asarray(self._attempt_status, dtype=object),
         }
 
+    # ------------------------------------------------------------------
+    # Nonlinear-failure recovery cap
+    # ------------------------------------------------------------------
+    _NL_PERSIST_THRESH = 3     # fail→succeed pairs before capping kicks in
+    _NL_RECOVERY_GROWTH = 1.05 # max per-step growth factor under the cap
+    _NL_RELAX_SUCCESSES = 3    # clean successes needed to relax one streak level
+
+    def _apply_nl_recovery_cap(self, h_used: float, h_next: float) -> float:
+        """Cap *h_next* when a persistent nonlinear-failure pattern is detected.
+
+        **Problem**: when the nonlinear solver repeatedly fails at "normal"
+        step sizes (due to poor conditioning on coarse meshes, extreme
+        stiffness, etc.), the adaptive loop enters a death spiral:
+
+        1. Controller proposes ``h``.
+        2. NL solver fails → retry at ``h * h_down``.
+        3. Retry succeeds with tiny error → PI proposes ``h_next ≈ h_up * h * h_down``.
+        4. ``h_up * h_down ≈ 1`` so ``h_next ≈ h`` → fails again → repeat.
+
+        Because growth never overcomes the shrink, ``h`` monotonically decays
+        to ``h_min`` and the integration terminates prematurely.
+
+        **Fix**: track consecutive fail→succeed pairs.  After
+        ``_NL_PERSIST_THRESH`` such pairs, limit growth to a conservative
+        factor (``_NL_RECOVERY_GROWTH``, default 5 %) per step.  This
+        stabilises ``h`` near the solver's actual convergence threshold
+        instead of letting it spiral to zero.
+
+        The cap is gradually relaxed after consecutive successes *without*
+        any preceding NL failure  (``_NL_RELAX_SUCCESSES``).
+
+        Called from both the embedded-error and Richardson acceptance paths.
+
+        Parameters
+        ----------
+        h_used : float
+            The step size that was actually *accepted* (after any NL-failure
+            shrink).
+        h_next : float
+            The step size proposed by the PI / digital-filter controller.
+
+        Returns
+        -------
+        h_next : float
+            Possibly capped step size.
+        """
+        if self._in_nl_recovery:
+            # We just successfully recovered from a NL failure.
+            self._nl_fail_recovery_count += 1
+            self._in_nl_recovery = False
+            self._nl_success_no_fail = 0
+        else:
+            # Clean success (no preceding NL failure).
+            self._nl_success_no_fail += 1
+            if self._nl_success_no_fail >= self._NL_RELAX_SUCCESSES:
+                self._nl_fail_recovery_count = max(
+                    0, self._nl_fail_recovery_count - 1
+                )
+                self._nl_success_no_fail = 0  # reset after decrement
+
+        if self._nl_fail_recovery_count >= self._NL_PERSIST_THRESH:
+            h_capped = h_used * self._NL_RECOVERY_GROWTH
+            if h_next > h_capped:
+                if self.verbose:
+                    print(
+                        f"[adaptive] NL-recovery cap: h_next {h_next:.3e} "
+                        f"-> {h_capped:.3e} "
+                        f"(streak={self._nl_fail_recovery_count})"
+                    )
+                h_next = h_capped
+
+        return h_next
+
     # ---------------------------
     # CLASSIC controller proposal
     # ---------------------------
@@ -391,6 +745,34 @@ class AdaptiveStepping:
         # clamp globally
         h_next = min(self.h_max, max(self.h_min, h_next))
         return h_next
+
+    # ---------------------------
+    # Error-predictive rejection shrink
+    # ---------------------------
+    _REJECT_FLOOR = 0.1   # minimum ratio h_new/h on rejection (SUNDIALS ≈ 0.25, scipy ≈ 0.2)
+
+    def _rejection_shrink(self, h: float, E_curr: float) -> float:
+        """Compute a reduced step size after an *error* rejection.
+
+        Instead of the blind ``h * h_down`` fall-back, use the standard
+        optimal-control formula
+
+            h_new = h · clamp(safety · E^{−1/(p+1)},  _REJECT_FLOOR, 1)
+
+        This mirrors SUNDIALS CVODE and scipy.integrate, which apply the
+        elementary controller even on rejection, but with a more aggressive
+        minimum ratio than the acceptance-path ``h_down`` (typically 0.1–0.25
+        instead of 0.6).  For very large errors the step can therefore shrink
+        by up to 10× in a single rejection, avoiding a long cascade of blind
+        0.6× halvings.
+        """
+        if E_curr > 0.0 and np.isfinite(E_curr):
+            g = self.safety * (E_curr ** (-1.0 / (self.p + 1.0)))
+            g = max(self._REJECT_FLOOR, min(g, 1.0))   # clamp to [floor, 1]
+        else:
+            g = self.h_down          # non-finite / zero error → blind fall-back
+        h_new = g * h
+        return max(self.h_min, h_new)
 
     # ---------------------------
     # RATIO / DIGITAL-FILTER proposal
@@ -506,6 +888,10 @@ class AdaptiveStepping:
         """
         Attempt one adaptive step of size h starting from (t,y).
 
+        If ``h0`` was set to ``None`` or ``'auto'`` at construction time
+        the first call triggers the Hairer-Wanner initial step-size
+        estimator and *h* is replaced by the computed value.
+
         If the integrator exposes ``has_embedded_error = True``, a single
         call to ``integrator.step()`` is made and the element-wise error
         vector it returns is used directly for step-size control—no
@@ -524,6 +910,13 @@ class AdaptiveStepping:
           - E_curr is the normalized local error estimate for this attempt.
           - success is True if we accept and advance, else False.
         """
+
+        # ==============================================================
+        # Auto h₀: Hairer-Wanner estimation on the very first call
+        # ==============================================================
+        if self._auto_h0:
+            h = self._estimate_h0_hairer(fun, t, y)
+            self._auto_h0 = False          # only once
 
         # ==============================================================
         # Fast path: integrator provides an embedded error estimate
@@ -554,8 +947,37 @@ class AdaptiveStepping:
             )
 
         if not ok:
+            self._consecutive_nl_fails += 1
             if self.verbose:
                 print(f"[adaptive/emb] nonlinear fail @ t={t:.6g}: shrinking")
+            # Mark that we are in NL-failure recovery (for death-spiral cap)
+            self._in_nl_recovery = True
+            self._nl_success_no_fail = 0
+            # Invalidate the solver's cached LU factorisation so that the
+            # retry with a smaller h (and therefore a different iteration
+            # matrix M/(γh_new) − J) does not blindly reuse a stale
+            # factorisation from the failed attempt.
+            solver = getattr(self.integrator, 'solver', None)
+            if solver is not None:
+                solver._lu = None
+                solver._lu_shape = None
+                solver._J_cross_call = None
+                solver._petsc_needs_matrix_update = True
+                # After several consecutive failures, do a full solver reset:
+                # destroy PETSc KSP (stale MUMPS factorisation), ILU,
+                # equilibration cache — everything.  This forces a completely
+                # fresh Jacobian + factorisation on the next attempt.
+                if self._consecutive_nl_fails >= self._NL_RESCUE_THRESH:
+                    if hasattr(solver, 'invalidate_all_caches'):
+                        solver.invalidate_all_caches()
+                    if self.verbose:
+                        print(
+                            f"[adaptive] full solver reset after "
+                            f"{self._consecutive_nl_fails} consecutive NL failures"
+                        )
+            # Also clear the integrator's step-size LU cache
+            if hasattr(self.integrator, '_lu_h_cache'):
+                self.integrator._lu_h_cache.clear()
             h_retry = max(self.h_min, self.h_down * h)
             return self._finalize_return(
                 t, h, y, None, h_retry, np.inf, False, np.inf, it,
@@ -563,6 +985,8 @@ class AdaptiveStepping:
             )
 
         # Normalised RMS error from embedded estimate
+        # NL solve succeeded — reset consecutive failure counter
+        self._consecutive_nl_fails = 0
         solver_err = 0.0  # no separate "solver residual" to report
         if isinstance(err_vec, np.ndarray) and err_vec.shape == y_new.shape:
             E_curr = self._scaled_error_embedded(y_new, err_vec)
@@ -578,12 +1002,15 @@ class AdaptiveStepping:
             success = (E_curr <= 1.0)
             if success:
                 h_next = self._propose_h_classic(h, E_curr)
+                # Apply NL-recovery cap to prevent death spiral
+                h_next = self._apply_nl_recovery_cap(h, h_next)
             else:
+                h_reject = self._rejection_shrink(h, E_curr)
                 if self.verbose:
                     print(f"[adaptive/emb] reject @ t={t:.6g}, E={E_curr:.3e}, "
-                          f"h={h:.3e} -> h_next={h*self.h_down:.3e}")
+                          f"h={h:.3e} -> h_next={h_reject:.3e}")
                 return self._finalize_return(
-                    t, h, y, fk_new, h * self.h_down, E_curr, False,
+                    t, h, y, fk_new, h_reject, E_curr, False,
                     solver_err, it, "embedded_classic_reject",
                 )
 
@@ -612,6 +1039,9 @@ class AdaptiveStepping:
                     t, h, y, fk_new, h_next, E_out, False,
                     solver_error_out, it_used, "embedded_ratio_reject",
                 )
+
+            # Apply NL-recovery cap to prevent death spiral
+            h_next = self._apply_nl_recovery_cap(h, h_next)
 
             return self._finalize_return(
                 t, h, y_new, fk_new, h_next, E_out, True,
@@ -648,8 +1078,30 @@ class AdaptiveStepping:
             )
 
         if not ok_full:
+            self._consecutive_nl_fails += 1
             if self.verbose:
                 print(f"[adaptive] nonlinear fail @ t={t:.6g}: shrinking")
+            # Mark NL-failure recovery (for death-spiral cap)
+            self._in_nl_recovery = True
+            self._nl_success_no_fail = 0
+            # Invalidate cached LU — h is about to change
+            solver = getattr(self.integrator, 'solver', None)
+            if solver is not None:
+                solver._lu = None
+                solver._lu_shape = None
+                solver._J_cross_call = None
+                solver._petsc_needs_matrix_update = True
+                if self._consecutive_nl_fails >= self._NL_RESCUE_THRESH:
+                    if hasattr(solver, 'invalidate_all_caches'):
+                        solver.invalidate_all_caches()
+                    if self.verbose:
+                        print(
+                            f"[adaptive] full solver reset after "
+                            f"{self._consecutive_nl_fails} consecutive NL failures"
+                        )
+            # Also clear the integrator's step-size LU cache
+            if hasattr(self.integrator, '_lu_h_cache'):
+                self.integrator._lu_h_cache.clear()
             h_retry = max(self.h_min, self.h_down * h)
             return self._finalize_return(
                 t,
@@ -671,8 +1123,11 @@ class AdaptiveStepping:
         try:
             y_half, _, _, ok_h1, _ = self.integrator.step(fun, t, y, h2)
             if not ok_h1:
+                self._consecutive_nl_fails += 1
                 if self.verbose:
                     print(f"[adaptive] half-step fail #1 @ t={t:.6g}")
+                self._in_nl_recovery = True
+                self._nl_success_no_fail = 0
                 h_retry = max(self.h_min, self.h_down * h)
                 return self._finalize_return(
                     t,
@@ -689,8 +1144,11 @@ class AdaptiveStepping:
 
             y_hi, fk_hi, _, ok_h2, _ = self.integrator.step(fun, t + h2, y_half, h2)
             if not ok_h2:
+                self._consecutive_nl_fails += 1
                 if self.verbose:
                     print(f"[adaptive] half-step fail #2 @ t={t:.6g}")
+                self._in_nl_recovery = True
+                self._nl_success_no_fail = 0
                 h_retry = max(self.h_min, self.h_down * h)
                 return self._finalize_return(
                     t,
@@ -725,6 +1183,8 @@ class AdaptiveStepping:
         # ------------------------------------------------------
         # 3. Compute local normalized error E_curr
         # ------------------------------------------------------
+        # All three solves (full + 2 half) succeeded — reset counter
+        self._consecutive_nl_fails = 0
         E_curr = self._scaled_error(y, y_full, y_hi)
 
         # ------------------------------------------------------
@@ -738,19 +1198,22 @@ class AdaptiveStepping:
             if E_curr <= 1:
                 # Suggest next step size via classic P/PI rule
                 h_next = self._propose_h_classic(h, E_curr)
+                # Apply NL-recovery cap to prevent death spiral
+                h_next = self._apply_nl_recovery_cap(h, h_next)
 
             if not success:
                 # reject: do not advance state
+                h_reject = self._rejection_shrink(h, E_curr)
                 if self.verbose:
                     print(f"[adaptive] reject @ t={t:.6g}, E={E_curr:.3e}, "
-                          f"h_curr={h:.3e} -> h_next={h*self.h_down:.3e}")
+                          f"h_curr={h:.3e} -> h_next={h_reject:.3e}")
                 # do NOT update _E_prev on reject (optional; classical codes often don't)
                 return self._finalize_return(
                     t,
                     h,
                     y,
                     fk_full,
-                    h * self.h_down,
+                    h_reject,
                     E_curr,
                     False,
                     solver_err,
@@ -813,6 +1276,9 @@ class AdaptiveStepping:
                 )
 
             # ACCEPT path from ratio mode:
+            # Apply NL-recovery cap to prevent death spiral
+            h_next = self._apply_nl_recovery_cap(h, h_next)
+
             # decision == "ACCEPT" here.
             # we already updated _E_prev, _rho_prev, _reject_streak inside _apply_ratio_acceptance
 

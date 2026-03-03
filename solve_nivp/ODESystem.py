@@ -36,8 +36,10 @@ class ODESystem:
         Auxiliary parameter (currently only placeholder for composite schemes).
     adaptive : bool, default False
         Enable adaptive step controller (two half-step Richardson + PI).
-    atol, rtol : float
-        Absolute / relative tolerances (adaptive only).
+    atol, rtol : float or array_like
+        Absolute / relative tolerances (adaptive only).  Scalar values are
+        broadcast; arrays are interpreted per-DOF or per ``component_slices``
+        block (see :class:`AdaptiveStepping`).
     component_slices : list[slice], optional
         Partition for per-block error norm and projection logic.
     verbose : bool, default False
@@ -56,8 +58,8 @@ class ODESystem:
                  method: Union[str, IntegrationMethod] = 'backward_euler',
                  a: float = 1.0,
                  adaptive: bool = False,
-                 atol: float = 1e-6,
-                 rtol: float = 1e-3,
+                 atol = 1e-6,
+                 rtol = 1e-3,
                  component_slices: Optional[list] = None,
                  verbose: bool = False,
                  A: Optional[np.ndarray] = None,
