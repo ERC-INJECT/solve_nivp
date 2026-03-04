@@ -114,6 +114,7 @@ def solve_ivp_ns(
   store_fk=True,
   gc_interval=0,
   jacobian_scaling=None,
+  active_set_filter=False,
 ):
   """Integrate an ODE / simple index–1 DAE with optional nonsmooth projection.
 
@@ -201,6 +202,18 @@ def solve_ivp_ns(
     * ``'ruiz'``  — Ruiz iterative symmetric scaling (5 iterations):
       simultaneously normalises row **and** column infinity-norms.
       Better for iterative solvers (GMRES+ILU).
+
+  active_set_filter : bool, default False
+    When *True*, DOFs whose contact regime changed during a step
+    (stick↔slip, contact↔separation) are excluded from the adaptive
+    error norm.  This prevents the embedded / Richardson error estimator
+    from overreacting to the discontinuous constraint-force jumps that
+    are intrinsic to nonsmooth event-capturing integrators, allowing the
+    step-size controller to maintain larger steps through transitions.
+    Requires a projection with regime tracking (e.g.
+    :class:`MuScaledSOCProjection` or :class:`CompositeContactProjection`).
+    Has no effect when no projection is present or regime tracking is
+    not available.
 
   Returns
   -------
@@ -336,6 +349,9 @@ def solve_ivp_ns(
       # Forward DAE-aware error weighting setting
       stepper._dae_var_weight_mode = str(dae_var_weight).lower().strip()
       stepper._dae_mask = None  # reset so it re-detects
+
+      # Forward active-set filter setting
+      stepper.active_set_filter = bool(active_set_filter)
 
       # Handle auto-h0 from top level
       if h0 is None or (isinstance(h0, str) and str(h0).lower() == 'auto'):

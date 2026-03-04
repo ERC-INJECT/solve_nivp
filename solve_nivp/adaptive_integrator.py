@@ -81,6 +81,8 @@ class AdaptiveStepping:
         record_attempts: bool = False,
         # --- DAE-aware error weighting ---
         dae_var_weight: str = "auto",   # "auto", "exclude", "include"
+        # --- Active-set filter for nonsmooth contact ---
+        active_set_filter: bool = False,
     ) -> None:
 
         self.integrator = integrator
@@ -115,6 +117,14 @@ class AdaptiveStepping:
         # "include": traditional behaviour, weight all DOFs equally
         self._dae_var_weight_mode = dae_var_weight.lower().strip()
         self._dae_mask: np.ndarray | None = None    # lazily built
+
+        # ---- Active-set filter (nonsmooth contact) ----
+        # When enabled, DOFs whose contact regime changed during a step
+        # (e.g. stick↔slip, contact↔separation) are suppressed in the
+        # error norm.  This prevents the embedded error estimator from
+        # overreacting to discontinuous constraint-force jumps.
+        self.active_set_filter = bool(active_set_filter)
+        self._transition_mask: np.ndarray | None = None  # set per step
 
         # per-step up/down clamp factors (classic mode)
         self.h_up = float(h_up)
@@ -247,6 +257,18 @@ class AdaptiveStepping:
             f"len(component_slices)={len(self.component_slices) if self.component_slices else 'N/A'}, "
             f"or n={n}"
         )
+
+    # ------------------------------------------------------------------
+    # Active-set filter helpers
+    # ------------------------------------------------------------------
+
+    def _get_projection(self):
+        """Return the projection object from the integrator's solver, or None."""
+        solver = getattr(self.integrator, 'solver', None)
+        if solver is None:
+            return None
+        proj = getattr(solver, 'proj', None)
+        return proj
 
     # ------------------------------------------------------------------
     # DAE-aware error weighting
@@ -481,9 +503,14 @@ class AdaptiveStepping:
             # Apply DAE mask — zero out algebraic DOFs
             self._err_buf *= dae_w
 
+            # Apply active-set transition mask (suppress regime-changing DOFs)
+            if self._transition_mask is not None:
+                self._err_buf *= self._transition_mask
+
             accum = float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
             # Count only differential DOFs in the denominator
-            count = int(np.sum(dae_w > 0.0))
+            w_eff = dae_w if self._transition_mask is None else dae_w * self._transition_mask
+            count = int(np.sum(w_eff > 0.0))
         else:
             for i, sl in enumerate(self.component_slices):
                 if i in self.skip_error_indices:
@@ -513,8 +540,13 @@ class AdaptiveStepping:
                 # Apply DAE mask
                 self._err_buf *= w_blk
 
+                # Apply active-set transition mask (suppress regime-changing DOFs)
+                if self._transition_mask is not None:
+                    self._err_buf *= self._transition_mask[sl]
+
+                w_eff_blk = w_blk if self._transition_mask is None else w_blk * self._transition_mask[sl]
                 accum += float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
-                count += int(np.sum(w_blk > 0.0))
+                count += int(np.sum(w_eff_blk > 0.0))
 
         return 0.0 if count == 0 else math.sqrt(accum / count)
 
@@ -558,8 +590,13 @@ class AdaptiveStepping:
             # Apply DAE mask — zero out algebraic DOFs
             self._err_buf *= dae_w
 
+            # Apply active-set transition mask (suppress regime-changing DOFs)
+            if self._transition_mask is not None:
+                self._err_buf *= self._transition_mask
+
             accum = float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
-            count = int(np.sum(dae_w > 0.0))
+            w_eff = dae_w if self._transition_mask is None else dae_w * self._transition_mask
+            count = int(np.sum(w_eff > 0.0))
         else:
             for i, sl in enumerate(self.component_slices):
                 if i in self.skip_error_indices:
@@ -584,8 +621,13 @@ class AdaptiveStepping:
                 # Apply DAE mask
                 self._err_buf *= w_blk
 
+                # Apply active-set transition mask (suppress regime-changing DOFs)
+                if self._transition_mask is not None:
+                    self._err_buf *= self._transition_mask[sl]
+
+                w_eff_blk = w_blk if self._transition_mask is None else w_blk * self._transition_mask[sl]
                 accum += float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
-                count += int(np.sum(w_blk > 0.0))
+                count += int(np.sum(w_eff_blk > 0.0))
 
         return 0.0 if count == 0 else math.sqrt(accum / count)
 
@@ -935,16 +977,38 @@ class AdaptiveStepping:
     # ------------------------------------------------------------------
     def _step_embedded(self, fun, t, y, h):
         """Single-step adaptive attempt using the integrator's own error."""
+        # ── Active-set filter: snapshot regime before step ──
+        regime_before = None
+        if self.active_set_filter:
+            proj = self._get_projection()
+            if proj is not None:
+                regime_before = proj.regime_snapshot()
+
         try:
             y_new, fk_new, err_vec, ok, it = self.integrator.step(fun, t, y, h)
         except RuntimeError as e:
             if self.verbose:
                 print(f"[adaptive/emb] runtime error @ t={t:.6g}: {e}")
+            self._transition_mask = None
             h_retry = max(self.h_min, self.h_down * h)
             return self._finalize_return(
                 t, h, y, None, h_retry, np.inf, False, np.inf, 0,
                 "embedded_step_runtime_error",
             )
+
+        # ── Active-set filter: build transition mask ──
+        self._transition_mask = None
+        if self.active_set_filter and regime_before is not None:
+            proj = self._get_projection()
+            if proj is not None:
+                mask = proj.regime_changed_mask(regime_before, y.shape[0])
+                if mask is not None:
+                    self._transition_mask = mask
+                    if self.verbose:
+                        n_supp = int(np.sum(mask == 0.0))
+                        if n_supp > 0:
+                            print(f"[adaptive/asf] suppressing {n_supp} DOFs "
+                                  f"at t={t:.6g} due to regime transition")
 
         if not ok:
             self._consecutive_nl_fails += 1
@@ -1052,6 +1116,13 @@ class AdaptiveStepping:
     # Richardson extrapolation path  (BackwardEuler, TR, Composite, …)
     # ------------------------------------------------------------------
     def _step_richardson(self, fun, t, y, h):
+
+        # ── Active-set filter: snapshot regime before step ──
+        regime_before = None
+        if self.active_set_filter:
+            proj = self._get_projection()
+            if proj is not None:
+                regime_before = proj.regime_snapshot()
 
         # ------------------------------------------------------
         # 1. Take one full step of size h
@@ -1185,6 +1256,21 @@ class AdaptiveStepping:
         # ------------------------------------------------------
         # All three solves (full + 2 half) succeeded — reset counter
         self._consecutive_nl_fails = 0
+
+        # ── Active-set filter: build transition mask ──
+        self._transition_mask = None
+        if self.active_set_filter and regime_before is not None:
+            proj = self._get_projection()
+            if proj is not None:
+                mask = proj.regime_changed_mask(regime_before, y.shape[0])
+                if mask is not None:
+                    self._transition_mask = mask
+                    if self.verbose:
+                        n_supp = int(np.sum(mask == 0.0))
+                        if n_supp > 0:
+                            print(f"[adaptive/asf] suppressing {n_supp} DOFs "
+                                  f"at t={t:.6g} due to regime transition")
+
         E_curr = self._scaled_error(y, y_full, y_hi)
 
         # ------------------------------------------------------

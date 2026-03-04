@@ -99,7 +99,11 @@ class TestContactSystemStructure:
     def test_component_slices_default(self):
         A, rhs, y0, contacts, gap = _bouncing_ball_setup()
         cs = build_impulse_contact(A, rhs, y0, contacts, gap)
-        assert cs.component_slices == [slice(0, 4), slice(4, 6)]
+        # Auto-generated: [vel_dofs, pos_dofs, react_dofs]
+        assert len(cs.component_slices) == 3
+        np.testing.assert_array_equal(cs.component_slices[0], [0, 1])   # velocities
+        np.testing.assert_array_equal(cs.component_slices[1], [2, 3])   # positions
+        np.testing.assert_array_equal(cs.component_slices[2], [4, 5])   # reactions
 
     def test_integrator_opts(self):
         A, rhs, y0, contacts, gap = _bouncing_ball_setup()

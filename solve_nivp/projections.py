@@ -70,6 +70,37 @@ class Projection(ABC):
     def tangent_cone(self, candidate, current_state, rhok=None, t=None, Fk_val=None):
         pass
 
+    # ------------------------------------------------------------------
+    # Active-set filter helpers (overridden in SOC-based projections)
+    # ------------------------------------------------------------------
+    def regime_snapshot(self):
+        """Return an opaque snapshot of the per-block contact regime.
+
+        Returns *None* when the projection does not track regimes.
+        Subclasses (e.g. :class:`MuScaledSOCProjection`) override this.
+        """
+        return None
+
+    def regime_changed_mask(self, prev_snapshot, n_dof):
+        """Return a 1-D float mask of shape ``(n_dof,)`` for error weighting.
+
+        Entries are ``1.0`` (keep) for DOFs unaffected by a regime
+        transition, and ``0.0`` (suppress) for DOFs whose associated
+        contact block changed regime between *prev_snapshot* and the
+        current state.
+
+        Parameters
+        ----------
+        prev_snapshot : object
+            Opaque value returned by a previous :meth:`regime_snapshot`.
+        n_dof : int
+            Total dimension of the state vector.
+
+        Returns *None* when the projection does not track regimes or
+        *prev_snapshot* is *None*.
+        """
+        return None
+
     # Optional batched APIs (default fallbacks preserve behavior)
     def project_batch(self, current_state, candidates, rhok=None, t=None, Fk_val=None):
         candidates = np.asarray(candidates)
@@ -1869,6 +1900,115 @@ class MuScaledSOCProjection(Projection):
             if m > 0:
                 self._batch_branch_w_hat[:, 0] = 1.0
 
+    def _sync_branch_dict_to_batch(self):
+        """Copy per-block regime codes from ``_branch_region`` (dict)
+        into ``_batch_branch_region`` (ndarray).
+
+        The dense / sparse ``tangent_cone`` paths update the dict via
+        ``_proj_persistent``.  The batch fast-path updates the array
+        directly.  This helper keeps them in sync so that
+        ``regime_snapshot()`` always reads the latest data.
+        """
+        if self._uniform_m is None:
+            return
+        for k, region in self._branch_region.items():
+            if isinstance(k, int) and 0 <= k < len(self._batch_branch_region):
+                self._batch_branch_region[k] = region
+
+    # ------------------------------------------------------------------
+    # Active-set filter helpers (regime snapshot / change detection)
+    # ------------------------------------------------------------------
+    def regime_snapshot(self):
+        """Return a copy of the per-block contact regime codes.
+
+        Regime codes: ``-1`` = unset, ``0`` = interior (stick),
+        ``1`` = polar (separation), ``2`` = boundary (sliding).
+
+        Returns a 1-D ``ndarray`` (batch path) or ``dict`` (non-batch).
+        """
+        if self._uniform_m is not None:
+            return self._batch_branch_region.copy()
+        if self._branch_region:
+            return dict(self._branch_region)
+        return None
+
+    def regime_changed_mask(self, prev_snapshot, n_dof):
+        """Return a suppression mask for DOFs coupled to transitioning blocks.
+
+        Parameters
+        ----------
+        prev_snapshot : ndarray or dict
+            Value returned by a prior call to :meth:`regime_snapshot`.
+        n_dof : int
+            Total state vector dimension.
+
+        Returns
+        -------
+        mask : ndarray of float, shape ``(n_dof,)``
+            ``1.0`` for DOFs to keep, ``0.0`` for DOFs to suppress.
+            *None* if regime tracking is unavailable.
+
+        Notes
+        -----
+        Suppressed DOFs are determined by the ``_velocity_dof_map``
+        attribute (set externally, e.g. by :func:`build_impulse_contact`).
+        This maps each contact block index to the velocity DOF indices
+        in the full state that are dynamically coupled to that contact.
+        If ``_velocity_dof_map`` is not set, the projection's own
+        ``blocks`` indices (reaction DOFs) are used as fallback.
+        """
+        if prev_snapshot is None:
+            return None
+
+        changed_blocks = self._changed_block_indices(prev_snapshot)
+        if changed_blocks is None or len(changed_blocks) == 0:
+            return None  # no transitions → no suppression needed
+
+        mask = np.ones(n_dof, dtype=float)
+        vel_map = getattr(self, '_velocity_dof_map', None)
+
+        for k in changed_blocks:
+            if vel_map is not None and k < len(vel_map):
+                # Suppress velocity DOFs coupled to this contact
+                for idx in vel_map[k]:
+                    if 0 <= idx < n_dof:
+                        mask[idx] = 0.0
+            else:
+                # Fallback: suppress the projection's own block indices
+                if k < len(self.blocks):
+                    s_idx, w_idx = self.blocks[k]
+                    if 0 <= s_idx < n_dof:
+                        mask[s_idx] = 0.0
+                    for wi in w_idx:
+                        if 0 <= wi < n_dof:
+                            mask[wi] = 0.0
+        return mask
+
+    def _changed_block_indices(self, prev_snapshot):
+        """Return array of block indices whose regime differs from *prev_snapshot*."""
+        if self._uniform_m is not None:
+            # Batch path: both prev and current are ndarray
+            if not isinstance(prev_snapshot, np.ndarray):
+                return None
+            curr = self._batch_branch_region
+            # Only compare where both are valid (>= 0)
+            valid = (prev_snapshot >= 0) & (curr >= 0)
+            changed = valid & (prev_snapshot != curr)
+            return np.flatnonzero(changed)
+        else:
+            # Dict path
+            if not isinstance(prev_snapshot, dict):
+                return None
+            curr = self._branch_region
+            changed = []
+            all_keys = set(prev_snapshot.keys()) | set(curr.keys())
+            for k in all_keys:
+                pv = prev_snapshot.get(k, -1)
+                cv = curr.get(k, -1)
+                if pv >= 0 and cv >= 0 and pv != cv:
+                    changed.append(k)
+            return np.array(changed, dtype=int) if changed else np.array([], dtype=int)
+
     # ------------------------------------------------------------------
     # Gap-based activation
     # ------------------------------------------------------------------
@@ -1918,9 +2058,15 @@ class MuScaledSOCProjection(Projection):
         self._locked_active = (gaps <= self.gap_tol)
 
     def unlock_active_set(self):
-        """Release the frozen active-set mask and clear branch caches."""
+        """Release the frozen active-set mask.
+
+        Branch caches (spectral region / direction) are intentionally
+        *preserved* so that the active-set filter can snapshot the
+        converged regime after a step.  The caches are reset at the
+        start of the *next* Newton solve via ``lock_active_set``
+        (``reset_branch=True``).
+        """
         self._locked_active = None
-        self.reset_branch_cache()
 
     # ------------------------------------------------------------------
     # Projection API
@@ -2342,6 +2488,9 @@ class MuScaledSOCProjection(Projection):
                     if dz0_k is not None:
                         d_k = J_blk.shape[0]
                         D[idx, :] += (J_blk - np.eye(d_k)) @ dz0_k
+            # Sync per-block dict regions into the batch array so that
+            # regime_snapshot() sees the updated values.
+            self._sync_branch_dict_to_batch()
             return D
 
         # --- Sparse path for larger systems ---
@@ -2416,6 +2565,9 @@ class MuScaledSOCProjection(Projection):
                     data.extend(row_vals[nz].tolist())
                     col_indices.extend(idx[nz].tolist())
             indptr.append(len(data))
+
+        # Sync per-block dict regions into the batch array.
+        self._sync_branch_dict_to_batch()
 
         return sp.csr_matrix(
             (np.array(data, dtype=float),
@@ -2689,6 +2841,17 @@ class CompositeContactProjection(Projection):
     @property
     def _gap_nargs(self):
         return self._soc._gap_nargs
+
+    # ------------------------------------------------------------------
+    # Active-set filter (delegated to SOC sub-projection)
+    # ------------------------------------------------------------------
+    def regime_snapshot(self):
+        """Delegate regime snapshot to the SOC sub-projection."""
+        return self._soc.regime_snapshot()
+
+    def regime_changed_mask(self, prev_snapshot, n_dof):
+        """Delegate regime-change mask to the SOC sub-projection."""
+        return self._soc.regime_changed_mask(prev_snapshot, n_dof)
 
 
 ##############################################################################

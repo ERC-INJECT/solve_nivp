@@ -223,9 +223,10 @@ def build_impulse_contact(
         For :math:`\theta = 1` (Backward Euler) the scheme
         reduces to the standard fully-implicit Moreau
         time-stepping (eq. 68–69 of the reference).
-    component_slices : list of slice, optional
-        Physical-level component partition.  A reaction-DOF slice
-        ``slice(n_phys, n_aug)`` is appended automatically.
+    component_slices : list of slice or list of array-like, optional
+        Physical-level component partition.  Each element may be a
+        ``slice`` object **or** a list / numpy array of integer DOF
+        indices.  A reaction-DOF block is appended automatically.
     C_extract : ndarray or sparse, shape ``(n_contact, n_phys)``, optional
         Extraction operator mapping the full physical state to the
         contact-velocity (or contact-displacement) space.  When
@@ -577,6 +578,18 @@ def build_impulse_contact(
     else:
         proj = soc_proj
 
+    # ── Velocity DOF map for active-set filtering ────────────────────
+    # Maps each SOC block index to the velocity DOF indices in the
+    # augmented state that are dynamically coupled to that contact.
+    # Used by AdaptiveStepping to suppress error-norm contributions
+    # from DOFs undergoing a stick↔slip or contact↔separation transition.
+    _vel_dof_map = []
+    for ci in _contacts:
+        dofs = [ci['vN']] + list(ci['vT'])
+        _vel_dof_map.append(np.array(dofs, dtype=int))
+    # Attach to the SOC projection (CompositeContactProjection delegates)
+    soc_proj._velocity_dof_map = _vel_dof_map
+
     # ── Augmented RHS ────────────────────────────────────────────────
     _B = B_mat
     _rhs = rhs_smooth
@@ -768,10 +781,43 @@ def build_impulse_contact(
         return out
 
     # ── Component slices ─────────────────────────────────────────────
+    # Accept slice objects, index arrays (list/ndarray of int), or None.
+    # When None, auto-generate from the contact specification:
+    #   block 0: velocity DOFs (from vel_normal_idx / vel_tangential_idx)
+    #   block 1: remaining physical DOFs (positions / other)
+    #   block 2: reaction DOFs
+    # This works even when normal and tangential DOFs are non-contiguous.
     if component_slices is not None:
-        cs_aug = list(component_slices) + [slice(n_phys, n_aug)]
+        _cs_norm = []
+        for cs_item in component_slices:
+            if isinstance(cs_item, slice):
+                _cs_norm.append(cs_item)
+            else:
+                _cs_norm.append(np.asarray(cs_item, dtype=int))
+        # Append reaction DOFs in the same style as the user's entries:
+        # use an index array when any entry is an array, else a slice.
+        _any_array = any(isinstance(c, np.ndarray) for c in _cs_norm)
+        if _any_array:
+            _cs_norm.append(np.arange(n_phys, n_aug, dtype=int))
+        else:
+            _cs_norm.append(slice(n_phys, n_aug))
+        cs_aug = _cs_norm
     else:
-        cs_aug = [slice(0, n_phys), slice(n_phys, n_aug)]
+        # Auto-generate: gather velocity DOFs from contacts, rest are
+        # positions / other.  Handles non-contiguous DOF layouts.
+        _vel_set = set()
+        for ci in _contacts:
+            _vel_set.add(ci['vN'])
+            _vel_set.update(ci['vT'])
+        _vel_idx = np.array(sorted(_vel_set), dtype=int)
+        _pos_idx = np.array(sorted(set(range(n_phys)) - _vel_set), dtype=int)
+        _react_idx = np.arange(n_phys, n_aug, dtype=int)
+        cs_aug = []
+        if _vel_idx.size > 0:
+            cs_aug.append(_vel_idx)
+        if _pos_idx.size > 0:
+            cs_aug.append(_pos_idx)
+        cs_aug.append(_react_idx)
 
     integrator_opts = {
         'pass_prev_state': True,
