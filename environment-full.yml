@@ -1,0 +1,41 @@
+# Full environment for the broader repo workflow:
+# core package, tests, docs, Jupyter notebooks, RL helpers, PETSc/UMFPACK
+# linear-solver backends, and the plotting/analysis stack used by examples.
+#
+# The sliding-block and prestressed-fault examples also require a separate
+# checkout of the external "poroelasticity" package/repo.
+name: solve_nivp-full
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - setuptools
+  - wheel
+  - numpy>=1.20
+  - scipy>=1.8
+  - matplotlib>=3.5
+  - numba
+  - pytest>=7
+  - sphinx>=6
+  - sphinx-rtd-theme>=1.2
+  - jupyterlab
+  - ipykernel
+  - ipywidgets
+  - pandas
+  - seaborn
+  - plotly
+  - tqdm
+  - autograd
+  - cmocean
+  - scikit-fem
+  - pytorch
+  - gymnasium>=0.29
+  - mpi4py
+  - petsc
+  - petsc4py>=3.20
+  - mumps
+  - scikit-umfpack
+  - pip:
+      - stable-baselines3>=2.2
+      - sb3-contrib>=2.2

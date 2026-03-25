@@ -40,6 +40,43 @@ Optional extras:
 pip install -e .[rl]
 ```
 
+Conda environments are also provided for HPC or other user-space installs:
+
+```bash
+# lean environment for core development, tests, docs, and notebooks
+conda env create -f environment.yml
+
+# broader environment for PETSc, RL, and the heavier notebook stack
+conda env create -f environment-full.yml
+```
+
+### HPC / user-space install
+
+If you are working on an HPC system and want the environment to live in your
+project or scratch space rather than a shared default location, create it with
+an explicit prefix:
+
+```bash
+export ENV_ROOT=/path/to/your/project-or-scratch-space/.conda
+export CONDA_PKGS_DIRS="$ENV_ROOT/pkgs"
+
+conda env create -p "$ENV_ROOT/envs/solve_nivp" -f environment.yml
+# or, for the broader stack:
+# conda env create -p "$ENV_ROOT/envs/solve_nivp-full" -f environment-full.yml
+
+conda activate "$ENV_ROOT/envs/solve_nivp"
+pip install -e .
+```
+
+The sliding-block and prestressed-fault examples also depend on a separate
+`poroelasticity` repository that is not bundled as a package dependency here.
+If you need those examples, install that repo into the same environment as
+well, for example:
+
+```bash
+pip install -e /path/to/Poroelasticity
+```
+
 ## Quickstart
 
 ```python

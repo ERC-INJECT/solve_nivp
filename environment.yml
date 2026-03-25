@@ -1,0 +1,18 @@
+name: solve_nivp
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - setuptools
+  - wheel
+  - numpy>=1.20
+  - scipy>=1.8
+  - matplotlib>=3.5
+  - numba
+  - pytest>=7
+  - sphinx>=6
+  - sphinx-rtd-theme>=1.2
+  - jupyterlab
+  - ipykernel
+  - ipywidgets
