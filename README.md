@@ -1,5 +1,7 @@
 # solve_nivp
 
+[![DOI](https://joss.theoj.org/papers/10.21105/joss.09775/status.svg)](https://doi.org/10.21105/joss.09775)
+
 A Python library for time integration of **nonsmooth** ODE/DAE systems—models
 with abrupt changes such as impacts, switching, or inequality constraints.
 Such models arise in frictional contact mechanics, piecewise and switching
@@ -107,7 +109,24 @@ The `RL_Adaption/` folder contains optional experiments (TD3/TQC) for learned ad
 
 ## Citation
 
-See `CITATION.cff`. If you use this software, please cite the JOSS paper once available.
+If you use this software, please cite the JOSS paper:
+
+> Riley, D. M. & Stefanou, I. (2025). solve_nivp: A Python toolkit for integrating
+> nonsmooth dynamical systems. *Journal of Open Source Software*.
+> [doi:10.21105/joss.09775](https://doi.org/10.21105/joss.09775)
+
+BibTeX:
+
+```bibtex
+@article{Riley2025solve_nivp,
+  author  = {Riley, David Michael and Stefanou, Ioannis},
+  title   = {solve\_nivp: A Python toolkit for integrating nonsmooth dynamical systems},
+  journal = {Journal of Open Source Software},
+  year    = {2025},
+  doi     = {10.21105/joss.09775},
+  url     = {https://doi.org/10.21105/joss.09775}
+}
+```
 
 ## License
 
