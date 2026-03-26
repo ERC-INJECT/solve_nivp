@@ -50,7 +50,7 @@ class BuildSphinx(Command):
 
 setup(
     name="solve_nivp",
-    version="0.1.1",
+    version="0.1.2",
     packages=find_packages(),  # automatically discovers packages
     description="A solver package for implicit ODEs and projection-based solvers",
     cmdclass={'build_sphinx': BuildSphinx},
