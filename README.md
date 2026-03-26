@@ -37,19 +37,27 @@ sparse arrays in the SciPy ecosystem.
 
 ## Installation
 
-Recommended developer install:
+From PyPI:
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -U pip
-pip install -e .[test]
+pip install solve_nivp
 ```
 
 Optional extras:
 
 ```bash
-# RL experiments
-pip install -e .[rl]
+pip install solve_nivp[test]   # includes pytest
+pip install solve_nivp[rl]     # RL experiments (gymnasium, stable-baselines3)
+pip install solve_nivp[docs]   # Sphinx documentation build
+```
+
+### Developer install (from source)
+
+```bash
+git clone https://github.com/ERC-INJECT/solve_nivp.git
+cd solve_nivp
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .[test]
 ```
 
 ## Quickstart
