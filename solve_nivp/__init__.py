@@ -14,7 +14,7 @@ available each implicit step:
 
 High-level entry point
 ----------------------
-``solve_ivp_ns`` wraps construction of a projection, nonlinear solver and
+``solve_nivp`` wraps construction of a projection, nonlinear solver and
 integration method and returns the integrated time grid, states and diagnostic
 information.
 
@@ -25,7 +25,7 @@ Low-level workflow
 3. Pick an integration method (``BackwardEuler``, ``Trapezoidal``, ``ThetaMethod``,
    ``CompositeMethod``, ``EmbeddedBETR``, ``SDIRK2``) and pass the solver instance.
 4. Build an :class:`ODESystem` specifying your RHS ``fun(t, y)`` and options.
-5. Drive the time loop with :class:`ODESolver` or let ``solve_ivp_ns`` do it.
+5. Drive the time loop with :class:`ODESolver` or let ``solve_nivp`` do it.
 
 Returned residual / fk semantics
 --------------------------------
@@ -38,10 +38,10 @@ implicit equation residual (e.g. Backward Euler) not the projected gap.
 Quick start
 -----------
 >>> import numpy as np
->>> from solve_nivp import solve_ivp_ns, CoulombProjection
+>>> from solve_nivp import solve_nivp, CoulombProjection
 >>> def rhs(t, y):
 ...     return -y  # simple stable linear test
->>> t, y, h, fk, info = solve_ivp_ns(rhs, (0.0, 1.0), y0=np.array([1.0]), method='backward_euler')
+>>> t, y, h, fk, info = solve_nivp(rhs, (0.0, 1.0), y0=np.array([1.0]), method='backward_euler')
 >>> y[-1]
 array([0.3679])  # ~ exp(-1)
 
@@ -66,10 +66,18 @@ from .integrations import BackwardEuler, Trapezoidal, ThetaMethod, CompositeMeth
 from .ODESystem import ODESystem
 from .ODESolver import ODESolver
 from .contact import build_impulse_contact, ContactSystem
+from .alart_curnier_contact import (
+  build_alart_curnier_contact,
+  build_dynamic_alart_curnier_contact,
+)
+from .ncp_contact import (
+  build_ncp_contact,
+  build_dynamic_ncp_contact,
+)
 
 # Curated public API
 __all__ = [
-  'solve_ivp_ns',
+  'solve_nivp',
   # Core system / driver
   'ODESystem', 'ODESolver',
   # Nonlinear solver
@@ -83,16 +91,18 @@ __all__ = [
   'AnisotropicSOCProjection', 'AlgebraicConstraintProjection',
   'CompositeContactProjection',
   # Contact helpers
-  'build_impulse_contact', 'ContactSystem',
+  'build_impulse_contact', 'build_alart_curnier_contact',
+  'build_dynamic_alart_curnier_contact', 'build_ncp_contact',
+  'build_dynamic_ncp_contact', 'ContactSystem',
 ]
 
 
-def solve_ivp_ns(
+def solve_nivp(
   fun,
   t_span,
   y0,
   method='composite',
-  projection=None,
+  projection='identity',
   solver='VI',
   projection_opts=None,
   solver_opts=None,
@@ -113,6 +123,7 @@ def solve_ivp_ns(
   thin_output=1,
   store_fk=True,
   gc_interval=0,
+  abort_on_fixed_failure=True,
   jacobian_scaling=None,
   active_set_filter=False,
 ):
@@ -130,9 +141,10 @@ def solve_ivp_ns(
   method : str, default 'composite'
     Time stepping scheme: ``'backward_euler'``, ``'trapezoidal'``, ``'theta'``,
     ``'composite'`` (TR-BE like second order), ``'embedded_betr'``, ``'sdirk2'``.
-  projection : str or None, default None
+  projection : str or Projection or None, default 'identity'
     Name of projection to build: ``'coulomb'``, ``'sign'``, ``'identity'`` or
-    ``None`` for no projection (only meaningful if solver supports that path).
+    ``None``. At the high-level API, ``None`` is promoted to the identity
+    projection so the smooth unconstrained path works out of the box.
   solver : str, default 'VI'
     Nonlinear solve strategy per implicit step: ``'VI'`` or ``'semismooth_newton'``.
   projection_opts : dict or None
@@ -141,6 +153,9 @@ def solve_ivp_ns(
     Keyword arguments forwarded to :class:`ImplicitEquationSolver` (e.g.
     ``tol``, ``gmres_tol``, ``eisenstat_c``...). If ``rhs_jac`` or
     ``fun_jacobian`` is present it is used as an analytical Jacobian.
+    For large sparse problems, ``jacobian_sparsity`` can be supplied to
+    enable colored finite-difference Jacobian approximation when an
+    analytical Jacobian is not available.
   integrator_opts : dict or None
     Optional keyword arguments forwarded to the integration method
     constructor (e.g. ``pass_prev_state=True``, ``pass_step_size=True``).
@@ -191,6 +206,9 @@ def solve_ivp_ns(
   gc_interval : int, default 0
     Call ``gc.collect()`` every *N* accepted steps to free unreferenced
     objects (stale sparse factorisations, etc.).  0 disables.
+  abort_on_fixed_failure : bool, default True
+    In fixed-step mode, stop at the first nonlinear failure instead of
+    continuing with the failed state. Adaptive stepping is unchanged.
   jacobian_scaling : str, default 'none'
     Row / column equilibration of the Newton Jacobian before each linear
     solve, improving conditioning for saddle-point systems with disparate
@@ -222,11 +240,14 @@ def solve_ivp_ns(
   y : ndarray, shape (m, n)
     State history; ``y[i]`` corresponds to time ``t[i]``.
   h : ndarray, shape (m,)
-    Step sizes actually used (first entry is the initial guess).
-  fk : object ndarray, shape (m,)
-    Residual / implicit function evaluations associated with accepted steps.
+    Stored step-size history. ``h[0]`` is the initial guess; later entries are
+    the accepted step sizes for the stored states.
+  fk : object ndarray, shape (m-1,)
+    Residual / implicit function evaluations for the stored accepted steps.
   info : list of tuple
-    Per-step diagnostics: ``(solver_error, success, iterations)``.
+    Nonlinear-solver diagnostics for the stored accepted steps. In fixed-step
+    mode a terminal failure tuple is appended even if the failed state is not
+    stored.
   attempts : dict or None, optional
     Only returned when ``return_attempts`` is True. Contains arrays describing
     each attempted adaptive step (time, proposed ``h``, accepted flag, etc.).
@@ -248,7 +269,11 @@ def solve_ivp_ns(
 
   # 1) Projection instance
   proj_instance = None
-  if projection is not None:
+  if projection is None:
+    # The public API treats "no projection specified" as the smooth identity
+    # map so the default solver configuration is immediately usable.
+    proj_instance = IdentityProjection()
+  else:
     # Accept a pre-built Projection instance directly (bypass string lookup)
     if isinstance(projection, Projection):
       proj_instance = projection
@@ -440,5 +465,10 @@ def solve_ivp_ns(
     thin_output=thin_output,
     store_fk=store_fk,
     gc_interval=gc_interval,
+    abort_on_fixed_failure=abort_on_fixed_failure,
   )
   return solver_obj.solve(return_attempts=return_attempts)
+
+
+# Backward-compatible alias for older user code and examples.
+solve_ivp_ns = solve_nivp

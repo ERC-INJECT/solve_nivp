@@ -10,6 +10,7 @@ from .integrations import (
     ThetaMethod,
     CompositeMethod,
     EmbeddedBETR,
+    SDIRK2,
     # BDFMethod,
     # AdaptiveSteppingBDF
 )
@@ -123,16 +124,26 @@ class ODESystem:
         Returns:
             An instance of the selected integration method.
         """
+        from .nonlinear_solvers import ImplicitEquationSolver
+        from .projections import IdentityProjection
+
+        default_solver = ImplicitEquationSolver(
+            method='semismooth_newton',
+            proj=IdentityProjection(),
+        )
+
         if method_name == 'backward_euler':
-            return BackwardEuler(A=A)
+            return BackwardEuler(solver=default_solver, A=A)
         elif method_name == 'trapezoidal':
-            return Trapezoidal(A=A)
+            return Trapezoidal(solver=default_solver, A=A)
         elif method_name == 'theta':
-            return ThetaMethod(theta=0.5, A=A)
+            return ThetaMethod(theta=0.5, solver=default_solver, A=A)
         elif method_name == 'composite':
-            return CompositeMethod(a=a, A=A)
+            return CompositeMethod(a=a, solver=default_solver, A=A)
         elif method_name == 'embedded_betr':
-            return EmbeddedBETR(A=A)
+            return EmbeddedBETR(solver=default_solver, A=A)
+        elif method_name == 'sdirk2':
+            return SDIRK2(solver=default_solver, A=A)
         else:
             raise ValueError(f"Unknown integration method: {method_name}")
     

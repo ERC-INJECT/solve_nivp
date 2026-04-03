@@ -288,7 +288,7 @@ class TestContact3DIntegration:
             A, rhs, y0, contacts, gap,
             component_slices=[slice(0, 3), slice(3, 6)],
         )
-        t, y, *_ = solve_nivp.solve_ivp_ns(
+        t, y, *_ = solve_nivp.solve_nivp(
             fun=cs.rhs,
             t_span=(0.0, 1.0),
             y0=cs.y0,
@@ -336,7 +336,7 @@ class TestContact3DIntegration:
             A, rhs, y0, contacts, gap,
             component_slices=[slice(0, 3), slice(3, 6)],
         )
-        t, y, *_ = solve_nivp.solve_ivp_ns(
+        t, y, *_ = solve_nivp.solve_nivp(
             fun=cs.rhs, t_span=(0.0, 2.0), y0=cs.y0, A=cs.A,
             method='backward_euler',
             projection=cs.projection,
@@ -490,14 +490,14 @@ class TestAnisotropicIsotropicEquivalence:
             h0=0.005,
         )
 
-        t_iso, y_iso, *_ = solve_nivp.solve_ivp_ns(
+        t_iso, y_iso, *_ = solve_nivp.solve_nivp(
             fun=cs_iso.rhs, y0=cs_iso.y0, A=cs_iso.A,
             projection=cs_iso.projection,
             component_slices=cs_iso.component_slices,
             integrator_opts=cs_iso.integrator_opts,
             **solve_kw,
         )
-        t_ani, y_ani, *_ = solve_nivp.solve_ivp_ns(
+        t_ani, y_ani, *_ = solve_nivp.solve_nivp(
             fun=cs_ani.rhs, y0=cs_ani.y0, A=cs_ani.A,
             projection=cs_ani.projection,
             component_slices=cs_ani.component_slices,
@@ -595,7 +595,7 @@ class TestAnisotropicDirectional:
             step_size_ref=_h,
         )
 
-        t, y, *_ = solve_nivp.solve_ivp_ns(
+        t, y, *_ = solve_nivp.solve_nivp(
             fun=cs.rhs, t_span=(0.0, 1.0), y0=cs.y0, A=cs.A,
             method='backward_euler',
             projection=cs.projection,
@@ -637,7 +637,7 @@ class TestAnisotropicIntegration:
             component_slices=[slice(0, 3), slice(3, 6)],
             get_B=lambda y, k: B,
         )
-        t, y, *_ = solve_nivp.solve_ivp_ns(
+        t, y, *_ = solve_nivp.solve_nivp(
             fun=cs.rhs, t_span=(0.0, 1.0), y0=cs.y0, A=cs.A,
             method='backward_euler',
             projection=cs.projection,
@@ -688,14 +688,14 @@ class TestAnisotropicIntegration:
             adaptive=False, h0=0.002,
         )
 
-        _, y_iso, *_ = solve_nivp.solve_ivp_ns(
+        _, y_iso, *_ = solve_nivp.solve_nivp(
             fun=cs_iso.rhs, y0=cs_iso.y0, A=cs_iso.A,
             projection=cs_iso.projection,
             component_slices=cs_iso.component_slices,
             integrator_opts=cs_iso.integrator_opts,
             **solve_kw,
         )
-        _, y_ani, *_ = solve_nivp.solve_ivp_ns(
+        _, y_ani, *_ = solve_nivp.solve_nivp(
             fun=cs_ani.rhs, y0=cs_ani.y0, A=cs_ani.A,
             projection=cs_ani.projection,
             component_slices=cs_ani.component_slices,
@@ -732,7 +732,7 @@ class TestAnisotropicIntegration:
             step_size_ref=_h,
         )
 
-        t, y, *_ = solve_nivp.solve_ivp_ns(
+        t, y, *_ = solve_nivp.solve_nivp(
             fun=cs.rhs, t_span=(0.0, 3.0), y0=cs.y0, A=cs.A,
             method='backward_euler',
             projection=cs.projection,
@@ -770,7 +770,7 @@ class TestAnisotropicIntegration:
             get_B=lambda y, k: B,
         )
 
-        t, y, *_ = solve_nivp.solve_ivp_ns(
+        t, y, *_ = solve_nivp.solve_nivp(
             fun=cs.rhs, t_span=(0.0, 0.5), y0=cs.y0, A=cs.A,
             method='backward_euler',
             projection=cs.projection,

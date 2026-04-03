@@ -196,16 +196,16 @@ class TestSDIRK2Attributes:
 
 
 # ---------------------------------------------------------------------------
-# 6. Integration via solve_ivp_ns
+# 6. Integration via solve_nivp
 # ---------------------------------------------------------------------------
 
 class TestSDIRK2HighLevel:
-    """Test SDIRK2 via the high-level solve_ivp_ns entry point."""
+    """Test SDIRK2 via the high-level solve_nivp entry point."""
 
-    def test_solve_ivp_ns_sdirk2(self):
-        from solve_nivp import solve_ivp_ns
+    def test_solve_nivp_sdirk2(self):
+        from solve_nivp import solve_nivp
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_decay,
             t_span=(0.0, 1.0),
             y0=np.array([1.0]),
@@ -222,11 +222,11 @@ class TestSDIRK2HighLevel:
             f"Final value {y[-1, 0]:.6f} not close to exp(-1)={y_exact:.6f}"
         )
 
-    def test_solve_ivp_ns_sdirk2_ssn(self):
+    def test_solve_nivp_sdirk2_ssn(self):
         """Also works with semismooth_newton solver."""
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_decay,
             t_span=(0.0, 0.5),
             y0=np.array([1.0, 2.0]),
@@ -424,9 +424,9 @@ class TestSDIRK2EmbeddedAdaptive:
 
     def test_sdirk2_adaptive_produces_correct_result(self):
         """Full adaptive integration with SDIRK2 should still converge."""
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_decay,
             t_span=(0.0, 1.0),
             y0=np.array([1.0]),
@@ -445,9 +445,9 @@ class TestSDIRK2EmbeddedAdaptive:
 
     def test_sdirk2_adaptive_ratio_mode(self):
         """Embedded path also works with ratio/digital-filter controller."""
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_decay,
             t_span=(0.0, 1.0),
             y0=np.array([1.0]),

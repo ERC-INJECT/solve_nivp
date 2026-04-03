@@ -12,7 +12,7 @@ def test_package_import_and_basic_api():
     t_span = (0.0, 0.1)
 
     # Use identity projection and semismooth newton with fixed step
-    result = sivp.solve_ivp_ns(
+    result = sivp.solve_nivp(
         fun=fun,
         t_span=t_span,
         y0=y0,
@@ -35,3 +35,20 @@ def test_package_import_and_basic_api():
     # Backward Euler should be close to exact solution over small horizon
     y_exact = y0 * np.exp(-(t_span[1] - t_span[0]))
     np.testing.assert_allclose(y_values[-1], y_exact, rtol=5e-2, atol=1e-6)
+
+
+def test_package_import_and_default_solve_api_runs():
+    import solve_nivp as sivp
+
+    t_values, y_values, h_values, fk_values, errors = sivp.solve_nivp(
+        fun=lambda t, y: -y,
+        t_span=(0.0, 0.1),
+        y0=np.array([1.0]),
+        adaptive=False,
+        h0=0.05,
+    )
+
+    assert t_values[-1] == 0.1
+    assert y_values.shape == (3, 1)
+    assert h_values.shape == t_values.shape
+    assert len(fk_values) == len(errors) == len(t_values) - 1

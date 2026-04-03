@@ -7,7 +7,7 @@ monotonically to h_min.
 """
 import numpy as np
 import pytest
-from solve_nivp import solve_ivp_ns
+from solve_nivp import solve_nivp
 from solve_nivp.adaptive_integrator import AdaptiveStepping
 from solve_nivp.integrations import SDIRK2
 
@@ -143,12 +143,12 @@ class TestNLRecoveryCapUnit:
 
 
 class TestNLRecoveryIntegration:
-    """Integration tests using solve_ivp_ns."""
+    """Integration tests using solve_nivp."""
 
     def test_stiff_scalar_completes(self):
         """A simple stiff ODE should integrate to completion."""
         lam = -100.0
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             lambda t, y: lam * y,
             (0.0, 1.0),
             y0=np.array([1.0]),
@@ -219,9 +219,9 @@ class TestThinOutputAndMemory:
         t, y, *_ = solver.solve()
         assert t[-1] == pytest.approx(1.0, abs=1e-6)
 
-    def test_thin_output_via_solve_ivp_ns(self):
+    def test_thin_output_via_solve_nivp(self):
         """thin_output parameter works through the high-level API."""
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             lambda t, y: -y,
             (0.0, 1.0),
             y0=np.array([1.0]),
@@ -233,6 +233,36 @@ class TestThinOutputAndMemory:
         assert t[-1] == pytest.approx(1.0, abs=1e-6)
         # Should have far fewer than 100 stored steps
         assert len(t) < 20
+
+    def test_history_diagnostics_stay_aligned(self):
+        """Stored adaptive/fixed histories should use consistent indexing."""
+        t_a, y_a, h_a, fk_a, info_a = solve_nivp(
+            lambda t, y: -y,
+            (0.0, 0.3),
+            y0=np.array([1.0]),
+            method='backward_euler',
+            projection='identity',
+            solver='VI',
+            adaptive=True,
+            h0=0.1,
+            thin_output=1,
+        )
+        np.testing.assert_allclose(np.diff(t_a), h_a[1:], atol=1.0e-12, rtol=0.0)
+        assert len(fk_a) == len(info_a) == len(t_a) - 1
+
+        t_f, y_f, h_f, fk_f, info_f = solve_nivp(
+            lambda t, y: -y,
+            (0.0, 0.3),
+            y0=np.array([1.0]),
+            method='backward_euler',
+            projection='identity',
+            solver='VI',
+            adaptive=False,
+            h0=0.05,
+            thin_output=2,
+        )
+        assert h_f.shape == t_f.shape
+        assert len(fk_f) == len(info_f) == len(t_f) - 1
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +314,7 @@ class TestJacobianScalingPassthrough:
 
     def test_scaling_from_solver_opts(self):
         """jacobian_scaling in solver_opts is forwarded when top-level is None."""
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             lambda t, y: -y,
             (0.0, 0.5),
             y0=np.array([1.0]),
@@ -298,7 +328,7 @@ class TestJacobianScalingPassthrough:
 
     def test_explicit_scaling_wins(self):
         """Explicit jacobian_scaling kwarg wins over solver_opts value."""
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             lambda t, y: -y,
             (0.0, 0.5),
             y0=np.array([1.0]),

@@ -6,7 +6,7 @@ import scipy.sparse as sp
 
 from solve_nivp.nonlinear_solvers import ImplicitEquationSolver
 from solve_nivp.projections import IdentityProjection, AlgebraicConstraintProjection
-from solve_nivp import solve_ivp_ns
+from solve_nivp import solve_nivp
 
 
 # ---------------------------------------------------------------------------
@@ -182,16 +182,16 @@ class TestNewtonWithScaling:
 
 
 # ---------------------------------------------------------------------------
-# solve_ivp_ns integration
+# solve_nivp integration
 # ---------------------------------------------------------------------------
 
 class TestSolveIvpNsScaling:
-    """jacobian_scaling parameter flows through solve_ivp_ns."""
+    """jacobian_scaling parameter flows through solve_nivp."""
 
     @pytest.mark.parametrize('mode', ['none', 'row', 'ruiz'])
     def test_simple_ode_with_scaling(self, mode):
         """dy/dt = -y solves correctly with each scaling mode."""
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=lambda t, y: -y,
             t_span=(0, 1),
             y0=[1.0],

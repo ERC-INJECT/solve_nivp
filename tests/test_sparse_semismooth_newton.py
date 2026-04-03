@@ -13,7 +13,7 @@ def test_semismooth_sparse_path_runs():
     y0 = np.linspace(-1, 1, n)
 
     # Force sparse path with threshold below n and use gmres
-    result = sivp.solve_ivp_ns(
+    result = sivp.solve_nivp(
         fun=fun,
         t_span=(0.0, 0.01),
         y0=y0,

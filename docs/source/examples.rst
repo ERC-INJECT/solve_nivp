@@ -7,7 +7,7 @@ Sign projection (scalar)
 .. code-block:: python
 
     import numpy as np
-    from solve_nivp import solve_ivp_ns, SignProjection
+    from solve_nivp import solve_nivp, SignProjection
 
     # trivial rhs, demonstrate projection behavior
     rhs = lambda t, y: -y
@@ -16,7 +16,7 @@ Sign projection (scalar)
 
     proj = SignProjection(y_indices=0, w_indices=1)
 
-    t, y, h, fk, info = solve_ivp_ns(
+    t, y, h, fk, info = solve_nivp(
         fun=lambda t, s: np.array([-s[0], 0.0]),
         t_span=t_span,
         y0=y0,
@@ -35,7 +35,7 @@ Coulomb projection (toy)
 .. code-block:: python
 
     import numpy as np
-    from solve_nivp import solve_ivp_ns, CoulombProjection
+    from solve_nivp import solve_nivp, CoulombProjection
 
     # toy constraint force: f_conf(y) = K y (diagonal)
     K = np.array([2.0, 3.0, 0.0])
@@ -45,7 +45,7 @@ Coulomb projection (toy)
     y0 = np.zeros(6)  # pairs (v_i, z_i)
     t_span = (0.0, 0.1)
 
-    t, y, h, fk, info = solve_ivp_ns(
+    t, y, h, fk, info = solve_nivp(
         fun=lambda t, s: -s,
         t_span=t_span,
         y0=y0,

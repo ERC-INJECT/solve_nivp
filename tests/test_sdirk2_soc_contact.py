@@ -84,7 +84,7 @@ class TestSDIRK2BouncingBall:
             theta=1.0,
             component_slices=[slice(0, 2), slice(2, 4)],
         )
-        t, y, h, fk, info = solve_nivp.solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp.solve_nivp(
             fun=cs.rhs,
             t_span=(0.0, 1.0),
             y0=cs.y0,
@@ -165,7 +165,7 @@ class TestSDIRK2BouncingBall:
                 theta=1.0,
                 component_slices=[slice(0, 2), slice(2, 4)],
             )
-            t, y, *_ = solve_nivp.solve_ivp_ns(
+            t, y, *_ = solve_nivp.solve_nivp(
                 fun=cs.rhs,
                 t_span=(0.0, 0.5),
                 y0=cs.y0,
@@ -246,7 +246,7 @@ class TestSDIRK2PreStress:
             step_size_ref=_h,
         )
 
-        t, y, *_ = solve_nivp.solve_ivp_ns(
+        t, y, *_ = solve_nivp.solve_nivp(
             fun=cs.rhs,
             t_span=(0.0, 0.5),
             y0=cs.y0,
@@ -291,7 +291,7 @@ class TestSDIRK2AdaptiveContact:
             component_slices=[slice(0, 2), slice(2, 4)],
         )
 
-        t, y, h, fk, info = solve_nivp.solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp.solve_nivp(
             fun=cs.rhs,
             t_span=(0.0, 1.0),
             y0=cs.y0,

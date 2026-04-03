@@ -13,14 +13,14 @@ Minimal example
 .. code-block:: python
 
     import numpy as np
-    from solve_nivp import solve_ivp_ns
+    from solve_nivp import solve_nivp
 
     # y' = -y with identity projection
     rhs = lambda t, y: -y
     t_span = (0.0, 1.0)
     y0 = np.array([1.0])
 
-    t, y, h, fk, info = solve_ivp_ns(
+    t, y, h, fk, info = solve_nivp(
         fun=rhs,
         t_span=t_span,
         y0=y0,

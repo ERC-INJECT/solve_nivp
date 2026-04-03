@@ -51,7 +51,7 @@ class TestIdentityCExtract:
             A_phys, rhs_ball, y0_ball, contact_spec, gap_ball,
             theta=1.0, component_slices=slices_ball,
         )
-        t_ref, y_ref, *_ = solve_nivp.solve_ivp_ns(
+        t_ref, y_ref, *_ = solve_nivp.solve_nivp(
             fun=cs_ref.rhs, t_span=(0, 1.0), y0=cs_ref.y0, A=cs_ref.A,
             method='backward_euler', projection=cs_ref.projection,
             solver='semismooth_newton',
@@ -70,7 +70,7 @@ class TestIdentityCExtract:
             theta=1.0, component_slices=slices_ball,
             C_extract=C_id,
         )
-        t_c, y_c, *_ = solve_nivp.solve_ivp_ns(
+        t_c, y_c, *_ = solve_nivp.solve_nivp(
             fun=cs_c.rhs, t_span=(0, 1.0), y0=cs_c.y0, A=cs_c.A,
             method='backward_euler', projection=cs_c.projection,
             solver='semismooth_newton',
@@ -90,7 +90,7 @@ class TestIdentityCExtract:
             A_phys, rhs_ball, y0_ball, contact_spec, gap_ball,
             theta=1.0, component_slices=slices_ball,
         )
-        t_ref, y_ref, *_ = solve_nivp.solve_ivp_ns(
+        t_ref, y_ref, *_ = solve_nivp.solve_nivp(
             fun=cs_ref.rhs, t_span=(0, 0.5), y0=cs_ref.y0, A=cs_ref.A,
             method='backward_euler', projection=cs_ref.projection,
             solver='semismooth_newton',
@@ -107,7 +107,7 @@ class TestIdentityCExtract:
             theta=1.0, component_slices=slices_ball,
             C_extract=C_sp,
         )
-        t_c, y_c, *_ = solve_nivp.solve_ivp_ns(
+        t_c, y_c, *_ = solve_nivp.solve_nivp(
             fun=cs_c.rhs, t_span=(0, 0.5), y0=cs_c.y0, A=cs_c.A,
             method='backward_euler', projection=cs_c.projection,
             solver='semismooth_newton',
@@ -157,7 +157,7 @@ class TestFEMLikeExtraction:
             A_phys, rhs_ball, y0_ball, contact_spec, gap_ball,
             theta=1.0, component_slices=slices_ball,
         )
-        t_ref, y_ref, *_ = solve_nivp.solve_ivp_ns(
+        t_ref, y_ref, *_ = solve_nivp.solve_nivp(
             fun=cs_ref.rhs, t_span=(0, 1.0), y0=cs_ref.y0, A=cs_ref.A,
             method='backward_euler', projection=cs_ref.projection,
             solver='semismooth_newton',
@@ -173,7 +173,7 @@ class TestFEMLikeExtraction:
             theta=1.0, component_slices=slices_ball,
             C_extract=C_perm,
         )
-        t_c, y_c, *_ = solve_nivp.solve_ivp_ns(
+        t_c, y_c, *_ = solve_nivp.solve_nivp(
             fun=cs_c.rhs, t_span=(0, 1.0), y0=cs_c.y0, A=cs_c.A,
             method='backward_euler', projection=cs_c.projection,
             solver='semismooth_newton',
@@ -246,6 +246,41 @@ class TestFEMLikeExtraction:
         )
         # B should be C^T (reordered: rows [0, 1] of C → columns [0, 1] of B)
         np.testing.assert_array_equal(cs.B, C.T)
+
+    def test_frictionless_c_extract_semismooth_newton(self):
+        """Exact μ=0 should converge in the C_extract path and enforce r_T=0."""
+        C_vel = np.array([
+            [0, 1, 0, 0],
+            [1, 0, 0, 0],
+        ], dtype=float)
+        contact_frictionless = [dict(
+            vel_normal_idx=0,
+            vel_tangential_idx=[1],
+            mu=0.0,
+            e=0.0,
+        )]
+        y0_touching = np.array([2.0, 0.0, 0.0, 0.0])
+
+        cs = build_impulse_contact(
+            A_phys, rhs_ball, y0_touching, contact_frictionless, gap_ball,
+            theta=1.0, component_slices=slices_ball,
+            C_extract=C_vel,
+        )
+        t, y, _, _, info = solve_nivp.solve_nivp(
+            fun=cs.rhs, t_span=(0.0, 0.01), y0=cs.y0, A=cs.A,
+            method='backward_euler', projection=cs.projection,
+            solver='semismooth_newton',
+            solver_opts=dict(tol=1e-12, max_iter=200,
+                             lam_update_strategy='none'),
+            component_slices=cs.component_slices,
+            integrator_opts=cs.integrator_opts,
+            adaptive=False, h0=0.01,
+            abort_on_fixed_failure=True,
+        )
+
+        assert len(t) == 2
+        assert bool(info[-1][1])
+        assert y[-1, cs.n_phys + 1] == pytest.approx(0.0, abs=1e-14)
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -179,11 +179,22 @@ class _ConstraintBlock:
     single-argument functions.
     """
     __slots__ = ('g', 'dg_dy', 'y_slice', 'q_slice', 'fd_eps',
-                 '_g_nargs', '_dg_nargs')
+                 '_g_nargs', '_dg_nargs',
+                 '_g_is_operator', '_dg_is_operator')
 
     def __init__(self, g, dg_dy, y_slice, q_slice, fd_eps=1e-8):
-        self.g = g
-        self.dg_dy = dg_dy
+        self._g_is_operator = (g is not None and not callable(g))
+        self._dg_is_operator = (dg_dy is not None and not callable(dg_dy))
+        if self._g_is_operator:
+            self.g = g.tocsr() if sp.issparse(g) else np.atleast_2d(
+                np.asarray(g, dtype=float))
+        else:
+            self.g = g
+        if self._dg_is_operator:
+            self.dg_dy = (dg_dy.tocsr() if sp.issparse(dg_dy)
+                          else np.atleast_2d(np.asarray(dg_dy, dtype=float)))
+        else:
+            self.dg_dy = dg_dy
         self.y_slice = y_slice
         self.q_slice = q_slice
         self.fd_eps = float(fd_eps)
@@ -200,6 +211,9 @@ class _ConstraintBlock:
             step = s.step or 1
             n_q = max(0, (stop - start + step - 1) // step) if stop is not None else y_sub.size
             return np.zeros(n_q, dtype=float)
+        if self._g_is_operator:
+            return np.asarray(self.g @ np.asarray(y_sub, dtype=float),
+                              dtype=float).reshape(-1)
         n = self._g_nargs
         if n is not None:
             if n >= 3:
@@ -224,25 +238,26 @@ class _ConstraintBlock:
         """Evaluate ``dg/dy`` or fall back to finite differences."""
         if self.dg_dy is None:
             return self._fd_jacobian(y_sub, t=t, Fk_val=Fk_val)
+        if self._dg_is_operator:
+            return self.dg_dy
         n = self._dg_nargs
         if n is not None:
             if n >= 3:
-                return np.asarray(self.dg_dy(y_sub, t, Fk_val), dtype=float)
+                r = self.dg_dy(y_sub, t, Fk_val)
             elif n == 2:
-                return np.asarray(self.dg_dy(y_sub, t), dtype=float)
+                r = self.dg_dy(y_sub, t)
             else:
-                return np.asarray(self.dg_dy(y_sub), dtype=float)
+                r = self.dg_dy(y_sub)
+            return r.tocsr() if sp.issparse(r) else np.asarray(r, dtype=float)
         # Fallback: runtime probing (only when inspect.signature failed)
         try:
             r = self.dg_dy(y_sub, t, Fk_val); self._dg_nargs = 3
-            return np.asarray(r, dtype=float)
         except TypeError:
             try:
                 r = self.dg_dy(y_sub, t); self._dg_nargs = 2
-                return np.asarray(r, dtype=float)
             except (TypeError, ValueError):
                 r = self.dg_dy(y_sub); self._dg_nargs = 1
-                return np.asarray(r, dtype=float)
+        return r.tocsr() if sp.issparse(r) else np.asarray(r, dtype=float)
 
     def _fd_jacobian(self, y_sub, t=None, Fk_val=None):
         """Forward-difference Jacobian of g w.r.t. y."""
@@ -456,9 +471,16 @@ class AlgebraicConstraintProjection(Projection):
         Jg_list = []
         for blk in self._blocks:
             Jg = blk.call_dg(z[blk.y_slice], t=t, Fk_val=Fk_val)
-            if sp.issparse(Jg):
-                Jg = Jg.toarray()
-            Jg_list.append(np.atleast_2d(Jg))
+            Jg_list.append(Jg)
+
+        if any(sp.issparse(Jg) for Jg in Jg_list):
+            if (self._tc_cached is not None and self._tc_n == n
+                    and all(blk._dg_is_operator and sp.issparse(blk.dg_dy)
+                            for blk in self._blocks)):
+                return self._tc_cached
+            return self._build_sparse_tangent(n, Jg_list)
+
+        Jg_list = [np.atleast_2d(np.asarray(Jg, dtype=float)) for Jg in Jg_list]
 
         if self._tc_cached is None or self._tc_n != n:
             self._build_tangent_cache(n, Jg_list)
@@ -469,6 +491,57 @@ class AlgebraicConstraintProjection(Projection):
                     self._tc_cached.data[pos] = Jg.ravel()
 
         return self._tc_cached
+
+    def _build_sparse_tangent(self, n, Jg_list):
+        """Assemble the tangent cone while preserving sparse constraint blocks."""
+        keep_identity = np.ones(n, dtype=bool)
+        rows_list, cols_list, vals_list = [], [], []
+
+        for blk, Jg in zip(self._blocks, Jg_list):
+            q_idx = np.arange(*blk.q_slice.indices(n))
+            keep_identity[q_idx] = False
+            y_idx = np.arange(*blk.y_slice.indices(n))
+            n_qk, n_yk = q_idx.size, y_idx.size
+            if n_qk == 0 or n_yk == 0:
+                continue
+
+            if sp.issparse(Jg):
+                Jg_coo = Jg.tocoo()
+                if Jg_coo.nnz == 0:
+                    continue
+                rows_list.append(q_idx[Jg_coo.row])
+                cols_list.append(y_idx[Jg_coo.col])
+                vals_list.append(Jg_coo.data.copy())
+            else:
+                Jg_arr = np.atleast_2d(np.asarray(Jg, dtype=float))
+                nz_r, nz_c = np.nonzero(Jg_arr)
+                if nz_r.size == 0:
+                    continue
+                rows_list.append(q_idx[nz_r])
+                cols_list.append(y_idx[nz_c])
+                vals_list.append(Jg_arr[nz_r, nz_c].copy())
+
+        identity_rows = np.flatnonzero(keep_identity)
+        if identity_rows.size > 0:
+            rows_list.append(identity_rows)
+            cols_list.append(identity_rows)
+            vals_list.append(np.ones(identity_rows.size))
+
+        if rows_list:
+            all_r = np.concatenate(rows_list)
+            all_c = np.concatenate(cols_list)
+            all_v = np.concatenate(vals_list)
+            D = sp.coo_matrix((all_v, (all_r, all_c)), shape=(n, n)).tocsr()
+            D.sort_indices()
+        else:
+            D = sp.csr_matrix((n, n))
+
+        if all(blk._dg_is_operator and sp.issparse(blk.dg_dy)
+               for blk in self._blocks):
+            self._tc_cached = D
+            self._tc_n = n
+            self._tc_jg_positions = None
+        return D
 
     def _build_tangent_cache(self, n, Jg_list):
         """One-time construction of the tangent-cone CSR and index maps.
@@ -571,21 +644,50 @@ class AlgebraicConstraintProjection(Projection):
         -------
         patch : scipy.sparse.csr_matrix, shape (n, n)
         """
+        if (self._patch_cached is not None and self._patch_n == n
+                and all(blk._dg_is_operator and sp.issparse(blk.dg_dy)
+                        for blk in self._blocks)):
+            return self._patch_cached
+
         if self._patch_cached is not None and self._patch_n == n:
             # Hot path: only update the dg/dy values in-place
             for blk, pos in zip(self._blocks, self._patch_dg_positions):
+                if pos is None:
+                    # The cached sparsity pattern did not contain the full
+                    # dg/dy block (for example because it was identically
+                    # zero when the cache was built). Rebuild from scratch so
+                    # we do not accidentally overwrite unrelated entries such
+                    # as the constraint diagonal identity.
+                    self._patch_cached = None
+                    self._patch_n = None
+                    self._patch_dg_positions = None
+                    return self.build_constraint_patch(
+                        y, n, t=t, Fk_val=Fk_val, **kwargs)
                 Jg = blk.call_dg(y[blk.y_slice], t=t, Fk_val=Fk_val)
                 if sp.issparse(Jg):
-                    Jg = Jg.toarray()
-                Jg = np.atleast_2d(Jg)
+                    # Sparse/state-dependent Jacobians keep a different
+                    # structural pattern than the dense hot path caches.
+                    self._patch_cached = None
+                    self._patch_n = None
+                    self._patch_dg_positions = None
+                    return self.build_constraint_patch(
+                        y, n, t=t, Fk_val=Fk_val, **kwargs)
+                Jg = np.atleast_2d(np.asarray(Jg, dtype=float))
                 if pos.size > 0:
                     self._patch_cached.data[pos] = -Jg.ravel()
             return self._patch_cached
 
+        Jg_list = []
+        for blk in self._blocks:
+            Jg_list.append(blk.call_dg(y[blk.y_slice], t=t, Fk_val=Fk_val))
+
+        if any(sp.issparse(Jg) for Jg in Jg_list):
+            return self._build_sparse_constraint_patch(n, Jg_list)
+
         # Cold path: build from scratch
         rows_list, cols_list, vals_list = [], [], []
 
-        for blk in self._blocks:
+        for blk, Jg in zip(self._blocks, Jg_list):
             q_idx = np.arange(*blk.q_slice.indices(n))
             y_idx = np.arange(*blk.y_slice.indices(n))
             n_qk, n_yk = q_idx.size, y_idx.size
@@ -598,10 +700,7 @@ class AlgebraicConstraintProjection(Projection):
 
             # Negative constraint Jacobian: q_i, y_j → -dg/dy
             if n_qk > 0 and n_yk > 0:
-                Jg = blk.call_dg(y[blk.y_slice], t=t, Fk_val=Fk_val)
-                if sp.issparse(Jg):
-                    Jg = Jg.toarray()
-                Jg = np.atleast_2d(Jg)
+                Jg = np.atleast_2d(np.asarray(Jg, dtype=float))
                 rows_list.append(np.repeat(q_idx, n_yk))
                 cols_list.append(np.tile(y_idx, n_qk))
                 vals_list.append(-Jg.ravel().copy())
@@ -621,17 +720,89 @@ class AlgebraicConstraintProjection(Projection):
             y_idx = np.arange(*blk.y_slice.indices(n))
             n_qk, n_yk = q_idx.size, y_idx.size
             if n_qk > 0 and n_yk > 0:
+                # If q and y overlap, the cold-path COO assembly merges the
+                # constraint identity entries with the -dg/dy entries on the
+                # overlapping coordinates. In that case the hot-path updater
+                # cannot safely identify "just the dg/dy" slots inside the
+                # compressed CSR data, so force a rebuild on reuse instead of
+                # accidentally overwriting the identity rows.
+                if np.intersect1d(q_idx, y_idx, assume_unique=True).size > 0:
+                    self._patch_dg_positions.append(None)
+                    continue
                 dg_pos = np.empty(n_qk * n_yk, dtype=np.intp)
+                valid = True
                 for k, qi in enumerate(q_idx):
                     rs = patch.indptr[qi]
                     row_cols = patch.indices[rs:patch.indptr[qi + 1]]
-                    dg_pos[k * n_yk:(k + 1) * n_yk] = rs + np.searchsorted(row_cols, y_idx)
-                self._patch_dg_positions.append(dg_pos)
+                    loc = np.searchsorted(row_cols, y_idx)
+                    if (
+                        row_cols.size == 0
+                        or np.any(loc >= row_cols.size)
+                        or np.any(row_cols[loc] != y_idx)
+                    ):
+                        valid = False
+                        break
+                    dg_pos[k * n_yk:(k + 1) * n_yk] = rs + loc
+                self._patch_dg_positions.append(dg_pos if valid else None)
             else:
                 self._patch_dg_positions.append(np.array([], dtype=np.intp))
 
         self._patch_cached = patch
         self._patch_n = n
+        return patch
+
+    def _build_sparse_constraint_patch(self, n, Jg_list):
+        """Build the constraint patch without densifying sparse Jacobians."""
+        rows_list, cols_list, vals_list = [], [], []
+
+        for blk, Jg in zip(self._blocks, Jg_list):
+            q_idx = np.arange(*blk.q_slice.indices(n))
+            y_idx = np.arange(*blk.y_slice.indices(n))
+            n_qk, n_yk = q_idx.size, y_idx.size
+
+            if n_qk > 0:
+                rows_list.append(q_idx)
+                cols_list.append(q_idx)
+                vals_list.append(np.ones(n_qk))
+
+            if n_qk == 0 or n_yk == 0:
+                continue
+
+            if sp.issparse(Jg):
+                Jg_coo = Jg.tocoo()
+                if Jg_coo.nnz == 0:
+                    continue
+                rows_list.append(q_idx[Jg_coo.row])
+                cols_list.append(y_idx[Jg_coo.col])
+                vals_list.append(-Jg_coo.data.copy())
+            else:
+                Jg_arr = np.atleast_2d(np.asarray(Jg, dtype=float))
+                nz_r, nz_c = np.nonzero(Jg_arr)
+                if nz_r.size == 0:
+                    continue
+                rows_list.append(q_idx[nz_r])
+                cols_list.append(y_idx[nz_c])
+                vals_list.append(-Jg_arr[nz_r, nz_c].copy())
+
+        if rows_list:
+            all_r = np.concatenate(rows_list)
+            all_c = np.concatenate(cols_list)
+            all_v = np.concatenate(vals_list)
+            patch = sp.coo_matrix((all_v, (all_r, all_c)),
+                                  shape=(n, n)).tocsr()
+            patch.sort_indices()
+        else:
+            patch = sp.csr_matrix((n, n))
+
+        if all(blk._dg_is_operator and sp.issparse(blk.dg_dy)
+               for blk in self._blocks):
+            self._patch_cached = patch
+            self._patch_n = n
+            self._patch_dg_positions = None
+        else:
+            self._patch_cached = None
+            self._patch_n = None
+            self._patch_dg_positions = None
         return patch
 
     def constraint_residual(self, y, t=None, Fk_val=None, **kwargs):
@@ -1350,8 +1521,25 @@ class MuScaledSOCProjection(Projection):
             self._batch_branch_w_hat = np.zeros((nb, m))
             if m > 0:
                 self._batch_branch_w_hat[:, 0] = 1.0  # default direction
+            # Fixed-pattern sparse tangent assembly cache:
+            # non-block rows keep a 1-entry identity row; every block row
+            # stores a full dxd structural block whose values are updated in
+            # place each call. This keeps the exact current tangent while
+            # avoiding repeated COO construction and CSR conversion.
+            self._batch_eye_flat = np.eye(d, dtype=float).reshape(-1)
+            self._batch_tangent_n = None
+            self._batch_tangent_csr = None
+            self._batch_tangent_non_block_pos = None
+            self._batch_tangent_block_pos = None
+            self._batch_tangent_block_pos_flat = None
         else:
             self._uniform_m = None
+            self._batch_eye_flat = None
+            self._batch_tangent_n = None
+            self._batch_tangent_csr = None
+            self._batch_tangent_non_block_pos = None
+            self._batch_tangent_block_pos = None
+            self._batch_tangent_block_pos_flat = None
 
     # ------------------------------------------------------------------
     # Block validation
@@ -1911,9 +2099,20 @@ class MuScaledSOCProjection(Projection):
         """
         if self._uniform_m is None:
             return
+
+        def _block_index(key):
+            if isinstance(key, (int, np.integer)):
+                return int(key)
+            if isinstance(key, (tuple, list)) and key:
+                tail = key[-1]
+                if isinstance(tail, (int, np.integer)):
+                    return int(tail)
+            return None
+
         for k, region in self._branch_region.items():
-            if isinstance(k, int) and 0 <= k < len(self._batch_branch_region):
-                self._batch_branch_region[k] = region
+            idx = _block_index(k)
+            if idx is not None and 0 <= idx < len(self._batch_branch_region):
+                self._batch_branch_region[idx] = region
 
     # ------------------------------------------------------------------
     # Active-set filter helpers (regime snapshot / change detection)
@@ -2087,6 +2286,45 @@ class MuScaledSOCProjection(Projection):
                 and self.get_ds0_dz is None
                 and self.get_dw0_dz is None)
 
+    def _ensure_batch_tangent_pattern(self, n):
+        """Build and cache the fixed CSR structure for the batch tangent map."""
+        if self._uniform_m is None:
+            return None
+        if self._batch_tangent_csr is not None and self._batch_tangent_n == n:
+            return self._batch_tangent_csr
+
+        d = 1 + self._uniform_m
+        nb = len(self.blocks)
+
+        counts = np.ones(n, dtype=np.int64)
+        counts[self._batch_all_flat] = d
+        indptr = np.empty(n + 1, dtype=np.int64)
+        indptr[0] = 0
+        np.cumsum(counts, out=indptr[1:])
+
+        indices = np.empty(indptr[-1], dtype=np.int64)
+        data = np.zeros(indptr[-1], dtype=float)
+
+        non_block_mask = np.ones(n, dtype=bool)
+        non_block_mask[self._batch_all_flat] = False
+        self._batch_non_block_rows = np.flatnonzero(non_block_mask)
+        self._batch_tangent_non_block_pos = indptr[self._batch_non_block_rows].copy()
+        indices[self._batch_tangent_non_block_pos] = self._batch_non_block_rows
+
+        block_pos = np.empty((nb, d, d), dtype=np.int64)
+        for k, idx_k in enumerate(self._all_block_indices):
+            for row_loc, row_idx in enumerate(idx_k):
+                start = int(indptr[row_idx])
+                stop = start + d
+                indices[start:stop] = idx_k
+                block_pos[k, row_loc, :] = np.arange(start, stop, dtype=np.int64)
+
+        self._batch_tangent_block_pos = block_pos
+        self._batch_tangent_block_pos_flat = block_pos.reshape(nb, d * d)
+        self._batch_tangent_csr = sp.csr_matrix((data, indices, indptr), shape=(n, n))
+        self._batch_tangent_n = int(n)
+        return self._batch_tangent_csr
+
     def _batch_project_fast(self, z_work, active, mu_arr, s0_arr):
         """Vectorized projection for uniform-dimension blocks (no w0)."""
         nb = len(self.blocks)
@@ -2113,8 +2351,11 @@ class MuScaledSOCProjection(Projection):
         lam_minus = s_shifted - r / mu_safe
 
         # Region masks
+        # Match _proj_mu_scaled_soc: the cone apex (lam_plus = lam_minus = 0)
+        # must be treated as interior, not polar.  The projection value is
+        # the same there, but the Clarke element is identity rather than zero.
         interior = active & (lam_minus >= 0.0) & (s_shifted >= 0.0)
-        polar    = active & (lam_plus  <= 0.0)
+        polar    = active & ~interior & (lam_plus <= 0.0)
         boundary = active & ~interior & ~polar
         inactive = ~active
 
@@ -2151,12 +2392,20 @@ class MuScaledSOCProjection(Projection):
         return z_work
 
     def _batch_tangent_cone_fast(self, z, y, active, mu_arr, s0_arr, n):
-        """Vectorized tangent-cone CSR assembly for uniform-dim blocks."""
+        """Vectorized tangent-cone CSR assembly for uniform-dim blocks.
+
+        Reuses a fixed CSR structure and updates only the data values.
+        """
         nb = len(self.blocks)
         m = self._uniform_m
         d = 1 + m
         s_idx = self._batch_s_idx
         w_idx = self._batch_w_idx          # (nb, m)
+        D = self._ensure_batch_tangent_pattern(n)
+        data = D.data
+        data.fill(0.0)
+        if self._batch_tangent_non_block_pos.size > 0:
+            data[self._batch_tangent_non_block_pos] = 1.0
 
         # Gather block data with pre-stress shift
         s = z[s_idx] + s0_arr
@@ -2175,8 +2424,11 @@ class MuScaledSOCProjection(Projection):
 
         # Region classification (0=interior, 1=polar, 2=boundary)
         region = np.full(nb, 2, dtype=int)
-        region[(lam_minus >= 0.0) & (s >= 0.0)] = 0
-        region[lam_plus <= 0.0] = 1
+        interior = (lam_minus >= 0.0) & (s >= 0.0)
+        region[interior] = 0
+        # Match _proj_mu_scaled_soc / _proj_persistent: keep the apex in the
+        # interior region so active zero reactions retain the identity tangent.
+        region[~interior & (lam_plus <= 0.0)] = 1
 
         # Scale-aware hysteresis (vectorized)
         scale = np.maximum.reduce([np.ones(nb), np.abs(s),
@@ -2206,57 +2458,11 @@ class MuScaledSOCProjection(Projection):
             reliable = r_bnd > tau[bnd]
             if np.any(reliable):
                 self._batch_branch_w_hat[bnd[reliable]] = w_hat_bnd[reliable]
-
-        # ── Build CSR via COO arrays ─────────────────────────────────
-        # Non-block rows: identity (computed once, cached)
-        if self._batch_non_block_rows is None:
-            all_block_set = set(self._batch_all_flat.tolist())
-            self._batch_non_block_rows = np.array(
-                [i for i in range(n) if i not in all_block_set], dtype=int)
-
-        nbr = self._batch_non_block_rows
-        # Preallocate COO lists — estimate max size
-        max_nnz = len(nbr) + nb * d * d
-        rows = np.empty(max_nnz, dtype=int)
-        cols = np.empty(max_nnz, dtype=int)
-        data = np.empty(max_nnz)
-        ptr = 0
-
-        # 1) Non-block identity rows
-        nn = len(nbr)
-        if nn:
-            rows[ptr:ptr+nn] = nbr
-            cols[ptr:ptr+nn] = nbr
-            data[ptr:ptr+nn] = 1.0
-            ptr += nn
-
-        # 2) Interior blocks → identity on block indices
+        # 1) Interior blocks → identity on block indices
         interior = (region == 0) & active
-        int_idx = np.flatnonzero(interior)
-        if int_idx.size:
-            si = s_idx[int_idx]
-            wi = w_idx[int_idx].ravel()
-            all_int = np.concatenate([si, wi])
-            ni = all_int.size
-            rows[ptr:ptr+ni] = all_int
-            cols[ptr:ptr+ni] = all_int
-            data[ptr:ptr+ni] = 1.0
-            ptr += ni
-
-        # 3) Polar blocks → zero rows (skip — no entries)
-
-        # 4) Inactive blocks: identity if not zero_inactive, else zero
-        inactive = ~active
-        if not self.zero_inactive and np.any(inactive):
-            inact_idx = np.flatnonzero(inactive)
-            si = s_idx[inact_idx]
-            wi = w_idx[inact_idx].ravel()
-            all_inact = np.concatenate([si, wi])
-            ni = all_inact.size
-            rows[ptr:ptr+ni] = all_inact
-            cols[ptr:ptr+ni] = all_inact
-            data[ptr:ptr+ni] = 1.0
-            ptr += ni
+        id_idx = np.flatnonzero(interior | ((~active) & (not self.zero_inactive)))
+        if id_idx.size:
+            data[self._batch_tangent_block_pos_flat[id_idx]] = self._batch_eye_flat
 
         # 5) Boundary blocks → d×d block Jacobians
         if bnd.size > 0:
@@ -2264,6 +2470,7 @@ class MuScaledSOCProjection(Projection):
             mu_bnd = mu_arr[bnd]
             lp = lam_plus[bnd]
             r_jac = np.maximum(r[bnd], self._spectral_atol)
+            pos_flat = self._batch_tangent_block_pos_flat[bnd]
 
             if m == 1:
                 # Optimised m=1 path: 2×2 blocks, 4 entries each
@@ -2275,31 +2482,12 @@ class MuScaledSOCProjection(Projection):
                 J10 = J01
                 J11 = alpha * mu_bnd ** 2
 
-                n_bnd = bnd.size
-                sb = s_idx[bnd]
-                wb = w_idx[bnd, 0]
-
-                # Row indices: [s, s, w, w] per block
-                rows[ptr:ptr+4*n_bnd:4] = sb
-                rows[ptr+1:ptr+4*n_bnd:4] = sb
-                rows[ptr+2:ptr+4*n_bnd:4] = wb
-                rows[ptr+3:ptr+4*n_bnd:4] = wb
-                # Col indices: [s, w, s, w] per block
-                cols[ptr:ptr+4*n_bnd:4] = sb
-                cols[ptr+1:ptr+4*n_bnd:4] = wb
-                cols[ptr+2:ptr+4*n_bnd:4] = sb
-                cols[ptr+3:ptr+4*n_bnd:4] = wb
-                # Values
-                data[ptr:ptr+4*n_bnd:4] = J00
-                data[ptr+1:ptr+4*n_bnd:4] = J01
-                data[ptr+2:ptr+4*n_bnd:4] = J10
-                data[ptr+3:ptr+4*n_bnd:4] = J11
-                ptr += 4 * n_bnd
+                vals = np.column_stack([J00, J01, J10, J11])
+                data[pos_flat] = vals
 
             elif m == 2:
                 # 3×3 blocks, 9 entries each
                 wh = w_hat_bnd                 # (n_bnd, 2)
-                n_bnd = bnd.size
 
                 # Block Jacobians (vectorized)
                 # J[0,0] = α
@@ -2317,32 +2505,22 @@ class MuScaledSOCProjection(Projection):
                 T10 = T01
                 T11 = aMM * ww11 + aR * (1.0 - ww11)
 
-                sb = s_idx[bnd]
-                w0b = w_idx[bnd, 0]
-                w1b = w_idx[bnd, 1]
-
-                # 9 entries per block → stride-9
-                base = ptr
-                for j, (r_arr, c_arr, d_arr) in enumerate([
-                    (sb, sb, alpha),
-                    (sb, w0b, aM * wh[:, 0]),
-                    (sb, w1b, aM * wh[:, 1]),
-                    (w0b, sb, aM * wh[:, 0]),
-                    (w0b, w0b, T00),
-                    (w0b, w1b, T01),
-                    (w1b, sb, aM * wh[:, 1]),
-                    (w1b, w0b, T10),
-                    (w1b, w1b, T11),
-                ]):
-                    rows[base+j::9][:n_bnd] = r_arr
-                    cols[base+j::9][:n_bnd] = c_arr
-                    data[base+j::9][:n_bnd] = d_arr
-                ptr += 9 * n_bnd
+                vals = np.column_stack([
+                    alpha,
+                    aM * wh[:, 0],
+                    aM * wh[:, 1],
+                    aM * wh[:, 0],
+                    T00,
+                    T01,
+                    aM * wh[:, 1],
+                    T10,
+                    T11,
+                ])
+                data[pos_flat] = vals
 
             else:
                 # General m: fall back to per-block assembly
                 for k_loc, k in enumerate(bnd):
-                    idx_k = self._all_block_indices[k]
                     wh_k = w_hat_bnd[k_loc]
                     mu_k = mu_bnd[k_loc]
                     a = alpha[k_loc]
@@ -2356,17 +2534,22 @@ class MuScaledSOCProjection(Projection):
                     J_blk[1:, 1:] = a * (
                         mu_k ** 2 * wwT
                         + mu_k * (lp_k / r_k) * (np.eye(m) - wwT))
-                    rr = np.repeat(idx_k, d)
-                    cc = np.tile(idx_k, d)
-                    ne = d * d
-                    rows[ptr:ptr+ne] = rr
-                    cols[ptr:ptr+ne] = cc
-                    data[ptr:ptr+ne] = J_blk.ravel()
-                    ptr += ne
+                    data[pos_flat[k_loc]] = J_blk.ravel()
 
-        return sp.csr_matrix(
-            (data[:ptr].copy(), (rows[:ptr].copy(), cols[:ptr].copy())),
-            shape=(n, n))
+        # Degenerate frictionless cone K_0 = {(s, 0) : s >= 0}:
+        # the tangential tangent must be zero, not identity, even when the
+        # apex (s = 0, w = 0) is classified as "interior" for the normal
+        # component.  Override any previous block assignment for mu = 0.
+        zero_mu = active & (mu_arr <= 0.0)
+        zmu = np.flatnonzero(zero_mu)
+        if zmu.size > 0:
+            data[self._batch_tangent_block_pos_flat[zmu]] = 0.0
+            zmu_normal_on = zmu[s[zmu] >= 0.0]
+            if zmu_normal_on.size > 0:
+                data[self._batch_tangent_block_pos[zmu_normal_on, 0, 0]] = 1.0
+            self._batch_branch_region[zmu] = np.where(s[zmu] >= 0.0, 0, 1)
+
+        return D
 
     # ------------------------------------------------------------------
     def project(self, current_state, candidate, rhok=None, t=None,
@@ -3025,11 +3208,13 @@ class MoreauSOCProjection(MuScaledSOCProjection):
         s0_arr = self._eval_s0(y, t=t, Fk_val=Fk_val) if _has_ps else None
 
         for k, (s_idx, w_idx) in enumerate(self.blocks):
+            idx = self._all_block_indices[k]
             if not active[k]:
+                if self.zero_inactive:
+                    z[idx] = 0.0
                 continue
             mu_k = float(mu_phys[k])
             alpha_k = float(alpha_arr[k])   # mu - beta (De Saxcé coeff)
-            idx = self._all_block_indices[k]
 
             # Current tangential velocity from iterate (constant in Jacobian)
             v_T = y[w_idx]
@@ -3116,13 +3301,16 @@ class MoreauSOCProjection(MuScaledSOCProjection):
                       if _has_ps_jac and self.get_ds0_dz is not None
                       else None)
 
+        zero_block_indices = set()
         block_data = {}  # k -> (J_composed, ps_corr or None)
         for k, (s_idx, w_idx) in enumerate(self.blocks):
+            idx = self._all_block_indices[k]
             if not active[k]:
+                if self.zero_inactive:
+                    zero_block_indices.update(int(i) for i in idx)
                 continue
             mu_k = float(mu_phys[k])
             alpha_k = float(alpha_arr[k])   # mu - beta
-            idx = self._all_block_indices[k]
             m = idx.size - 1  # tangential dimension
             z_blk = z[idx]
 
@@ -3178,13 +3366,18 @@ class MoreauSOCProjection(MuScaledSOCProjection):
         if n <= 64:
             D = np.eye(n)
             for k, (s_idx, w_idx) in enumerate(self.blocks):
+                idx = self._all_block_indices[k]
+                if not active[k]:
+                    if self.zero_inactive:
+                        D[np.ix_(idx, idx)] = 0.0
+                    continue
                 if k not in block_data:
                     continue
-                idx = self._all_block_indices[k]
                 J_composed, ps_corr = block_data[k]
                 D[np.ix_(idx, idx)] = J_composed
                 if ps_corr is not None:
                     D[idx, :] += ps_corr
+            self._sync_branch_dict_to_batch()
             return D
 
         # --- Sparse path for larger systems ---
@@ -3201,6 +3394,9 @@ class MoreauSOCProjection(MuScaledSOCProjection):
         indptr = [0]
 
         for r in range(n):
+            if r in zero_block_indices:
+                indptr.append(len(data))
+                continue
             entry = block_row_map.get(r)
             if entry is None:
                 data.append(1.0)
@@ -3226,6 +3422,7 @@ class MoreauSOCProjection(MuScaledSOCProjection):
                     col_indices.extend(idx[nz].tolist())
             indptr.append(len(data))
 
+        self._sync_branch_dict_to_batch()
         return sp.csr_matrix(
             (np.array(data, dtype=float),
              np.array(col_indices, dtype=int),
@@ -3286,13 +3483,16 @@ class MoreauSOCProjection(MuScaledSOCProjection):
         #   A_blk: dxd   (wrt candidate)
         #   B_blk: dxd   (state dependence local to block, De Saxcé term)
         #   B_ps : dxn   (state-dependent pre-stress correction, possibly global)
+        zero_block_indices = set()
         block_data = {}  # k -> (A_blk, B_blk, B_ps or None)
         for k, (s_idx, w_idx) in enumerate(self.blocks):
+            idx = self._all_block_indices[k]
             if not active[k]:
+                if self.zero_inactive:
+                    zero_block_indices.update(int(i) for i in idx)
                 continue
             mu_k = float(mu_phys[k])
             alpha_k = float(alpha_arr[k])   # mu - beta
-            idx = self._all_block_indices[k]
             m = idx.size - 1
             z_blk = z[idx]
 
@@ -3364,13 +3564,19 @@ class MoreauSOCProjection(MuScaledSOCProjection):
         if n <= 64:
             D_cand = np.eye(n)
             D_state = np.zeros((n, n))
-            for k in block_data:
-                idx = self._all_block_indices[k]
+            for k, idx in enumerate(self._all_block_indices):
+                if not active[k]:
+                    if self.zero_inactive:
+                        D_cand[np.ix_(idx, idx)] = 0.0
+                    continue
+                if k not in block_data:
+                    continue
                 A_blk, B_blk, B_ps = block_data[k]
                 D_cand[np.ix_(idx, idx)] = A_blk
                 D_state[np.ix_(idx, idx)] += B_blk
                 if B_ps is not None:
                     D_state[idx, :] += B_ps
+            self._sync_branch_dict_to_batch()
             return D_cand, D_state
 
         # --- Sparse assembly ---
@@ -3391,6 +3597,10 @@ class MoreauSOCProjection(MuScaledSOCProjection):
         indptr_B = [0]
 
         for r in range(n):
+            if r in zero_block_indices:
+                indptr_A.append(len(data_A))
+                indptr_B.append(len(data_B))
+                continue
             entry = block_row_map.get(r)
 
             # ---- D_cand row ----
@@ -3447,6 +3657,7 @@ class MoreauSOCProjection(MuScaledSOCProjection):
              np.array(indptr_B, dtype=int)),
             shape=(n, n))
 
+        self._sync_branch_dict_to_batch()
         return D_cand, D_state
 
 ##############################################################################
@@ -3789,6 +4000,7 @@ class AnisotropicSOCProjection(MuScaledSOCProjection):
                     if dz0_k is not None:
                         d_k = J_blk.shape[0]
                         D[idx, :] += (J_blk - np.eye(d_k)) @ dz0_k
+            self._sync_branch_dict_to_batch()
             return D
 
         block_jacs = {}  # k -> (J_blk, dz0_k or None)
@@ -3858,6 +4070,7 @@ class AnisotropicSOCProjection(MuScaledSOCProjection):
                     col_indices.extend(idx[nz].tolist())
             indptr.append(len(data))
 
+        self._sync_branch_dict_to_batch()
         return sp.csr_matrix(
             (np.array(data, dtype=float),
              np.array(col_indices, dtype=int),

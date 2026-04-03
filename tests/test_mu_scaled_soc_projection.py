@@ -223,6 +223,20 @@ class TestProjection:
         result = proj.project(z, z)
         np.testing.assert_allclose(result, [1.0, 1.0])
 
+    def test_mu_zero_batch_tangent_zeroes_tangential_rows(self):
+        """Vectorized tangent path must use diag([1, 0]) on active K_0 blocks."""
+        proj = MuScaledSOCProjection(
+            blocks=[(0, [1]), (2, [3])],
+            get_mu=lambda y: 0.0,
+            gap_func=lambda y, t=None: np.array([0.0, 0.0]),
+            gap_tol=1.0e-12,
+            zero_inactive=True,
+        )
+        z = np.zeros(4)
+        D = proj.tangent_cone(z, z)
+        D = D.toarray() if sp.issparse(D) else np.asarray(D)
+        np.testing.assert_allclose(D, np.diag([1.0, 0.0, 1.0, 0.0]), atol=0.0)
+
     def test_per_block_mu(self):
         """get_mu returns per-block array."""
         proj = MuScaledSOCProjection(
@@ -417,6 +431,46 @@ class TestTangentCone:
         np.testing.assert_allclose(D_dense[:2, 2:], 0.0)
         # Block 1: polar → zero rows
         np.testing.assert_allclose(D_dense[2:, :], 0.0)
+
+    def test_large_batch_tangent_keeps_fixed_pattern_with_exact_values(self):
+        """Large uniform SOC batches reuse one CSR pattern while updating values exactly."""
+        blocks = [(2 * k, [2 * k + 1]) for k in range(40)]  # n = 80 > batch threshold
+        mu = 0.7
+        proj = MuScaledSOCProjection(
+            blocks=blocks,
+            get_mu=lambda y: mu,
+        )
+
+        z_interior = np.zeros(80)
+        z_interior[0::2] = 4.0
+        z_interior[1::2] = 1.0
+        D_interior = proj.tangent_cone(z_interior, z_interior).copy()
+        assert sp.isspmatrix_csr(D_interior)
+        np.testing.assert_array_equal(D_interior[:2, :2].toarray(), np.eye(2))
+
+        z_boundary = np.zeros(80)
+        z_boundary[0] = 1.0
+        z_boundary[1] = 3.0
+        z_boundary[2::2] = 4.0
+        z_boundary[3::2] = 1.0
+        D_boundary = proj.tangent_cone(z_boundary, z_boundary).copy()
+        assert sp.isspmatrix_csr(D_boundary)
+
+        np.testing.assert_array_equal(D_interior.indptr, D_boundary.indptr)
+        np.testing.assert_array_equal(D_interior.indices, D_boundary.indices)
+
+        proj_small = MuScaledSOCProjection(
+            blocks=[(0, [1])],
+            get_mu=lambda y: mu,
+        )
+        D_expected = proj_small.tangent_cone(
+            np.array([1.0, 3.0]),
+            np.array([1.0, 3.0]),
+        )
+        D_expected = D_expected if isinstance(D_expected, np.ndarray) else D_expected.toarray()
+
+        np.testing.assert_allclose(D_boundary[:2, :2].toarray(), D_expected, atol=1e-12)
+        np.testing.assert_allclose(D_boundary[2:4, 2:4].toarray(), np.eye(2), atol=1e-12)
 
 
 # =====================================================================

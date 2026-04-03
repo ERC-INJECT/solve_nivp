@@ -3,7 +3,7 @@
 Feature 2: Automatic h₀
     - Hairer-Wanner algorithm produces a reasonable initial step size
     - h0=None / h0='auto' triggers estimation on first step() call
-    - Works through solve_ivp_ns top-level API
+    - Works through solve_nivp top-level API
     - Backward compat: explicit h0=float still works
 
 Feature 3: DAE-aware error weighting
@@ -111,12 +111,12 @@ class TestHairerWarnerH0:
 
 
 class TestAutoH0HighLevel:
-    """Test auto-h0 through solve_ivp_ns."""
+    """Test auto-h0 through solve_nivp."""
 
-    def test_solve_ivp_ns_auto_h0(self):
-        from solve_nivp import solve_ivp_ns
+    def test_solve_nivp_auto_h0(self):
+        from solve_nivp import solve_nivp
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_decay,
             t_span=(0.0, 1.0),
             y0=np.array([1.0]),
@@ -128,10 +128,10 @@ class TestAutoH0HighLevel:
         y_exact = np.exp(-1.0)
         assert np.abs(y[-1, 0] - y_exact) < 0.05
 
-    def test_solve_ivp_ns_h0_none(self):
-        from solve_nivp import solve_ivp_ns
+    def test_solve_nivp_h0_none(self):
+        from solve_nivp import solve_nivp
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_decay,
             t_span=(0.0, 1.0),
             y0=np.array([1.0]),
@@ -143,11 +143,11 @@ class TestAutoH0HighLevel:
         y_exact = np.exp(-1.0)
         assert np.abs(y[-1, 0] - y_exact) < 0.05
 
-    def test_solve_ivp_ns_sdirk2_auto_h0(self):
+    def test_solve_nivp_sdirk2_auto_h0(self):
         """Auto h0 with SDIRK2 embedded path."""
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_decay,
             t_span=(0.0, 1.0),
             y0=np.array([1.0]),
@@ -319,13 +319,13 @@ class TestDAEErrorWeightingSparse:
 
 
 class TestDAEHighLevel:
-    """Test DAE-aware weighting through solve_ivp_ns."""
+    """Test DAE-aware weighting through solve_nivp."""
 
-    def test_solve_ivp_ns_dae_auto(self):
+    def test_solve_nivp_dae_auto(self):
         """Verify dae_var_weight='auto' doesn't crash and integrates correctly."""
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_decay,
             t_span=(0.0, 1.0),
             y0=np.array([1.0]),
@@ -338,11 +338,11 @@ class TestDAEHighLevel:
         y_exact = np.exp(-1.0)
         assert np.abs(y[-1, 0] - y_exact) < 0.05
 
-    def test_solve_ivp_ns_dae_include(self):
+    def test_solve_nivp_dae_include(self):
         """Verify dae_var_weight='include' (traditional) still works."""
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_decay,
             t_span=(0.0, 1.0),
             y0=np.array([1.0]),
@@ -355,7 +355,7 @@ class TestDAEHighLevel:
         y_exact = np.exp(-1.0)
         assert np.abs(y[-1, 0] - y_exact) < 0.01
 
-    def test_solve_ivp_ns_dae_with_mass_matrix(self):
+    def test_solve_nivp_dae_with_mass_matrix(self):
         """Full test with a mass matrix that has a small (near-zero) diagonal entry.
 
         We use M = diag(1e-15, 1, 1) so that DOF-0 is detected as algebraic
@@ -363,14 +363,14 @@ class TestDAEHighLevel:
         Since f = [-y0, -y1, -y2], the system remains well-posed for the
         implicit solve and DOFs 1-2 should decay as exp(-t).
         """
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
         M = np.diag([1e-15, 1.0, 1.0])
 
         def rhs(t, y):
             return np.array([-y[0], -y[1], -y[2]])
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=rhs,
             t_span=(0.0, 1.0),
             y0=np.array([5.0, 1.0, 2.0]),

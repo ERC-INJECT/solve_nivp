@@ -42,6 +42,18 @@ except ImportError:
     PETSC_AVAILABLE = False
     PETSc = None
 
+_PETSC_GPU_MAT_TYPES = frozenset({'aijcusparse', 'aijkokkos'})
+_PETSC_GPU_VEC_TYPES = frozenset({'cuda', 'kokkos'})
+_PETSC_GPU_PAIR_FOR_MAT = {
+    'aijcusparse': 'cuda',
+    'aijkokkos': 'kokkos',
+}
+_PETSC_GPU_PAIR_FOR_VEC = {
+    'cuda': 'aijcusparse',
+    'kokkos': 'aijkokkos',
+}
+_PETSC_TYPE_SUPPORT_CACHE = {}
+
 class ImplicitEquationSolver:
     """Solve F(y)=0 with projection-aware VI or semismooth Newton (fast path)."""
 
@@ -55,12 +67,11 @@ class ImplicitEquationSolver:
         rho0: float = 0.9,
         delta: float = 0.7,
         component_slices=None,
-        use_autodiff: bool = False,
-        autodiff_mode: str = 'numerical',
         L: float = 0.9,
         Lmin: float = 0.3,
         nu: float = 0.66,
         lam: float = 1.0,
+        lam_min: float = 1e-6,
         sparse: bool | str = 'auto',
         sparse_threshold: int = 200,
         linear_solver: str = 'gmres',
@@ -89,11 +100,13 @@ class ImplicitEquationSolver:
         # PETSc options
         petsc_options: dict | None = None,
         petsc_reuse_steps: int = 10,
+        petsc_comm='self',
         # Per-DOF tolerance vectors (SUNDIALS convention) — opt-in
         nl_atol=None,
         nl_rtol=None,
         # Jacobian equilibration for improved conditioning
         jacobian_scaling: str = 'none',
+        jacobian_sparsity=None,
     ) -> None:
         if method not in ['VI', 'semismooth_newton']:
             raise ValueError("Unsupported solver method. Use 'VI' or 'semismooth_newton'.")
@@ -104,12 +117,11 @@ class ImplicitEquationSolver:
         self.proj = proj
         self.delta = delta
         self.component_slices = component_slices
-        self.use_autodiff = False
-        self.autodiff_mode = 'numerical'
         self.L = L
         self.Lmin = Lmin
         self.nu = nu
         self.lam = lam
+        self._lam_floor = float(lam_min)
 
         # Sparse / linear solver configuration
         self.sparse = sparse
@@ -167,12 +179,18 @@ class ImplicitEquationSolver:
             'pc_factor_mat_solver_type': 'mumps',
         }
         self.petsc_reuse_steps = int(petsc_reuse_steps)
+        self.petsc_comm = petsc_comm
         self._petsc_ksp = None
         self._petsc_mat = None
         self._petsc_build_count = 0
         self._petsc_shape = None
         self._petsc_field_is = None  # Index sets for field-split
         self._petsc_needs_matrix_update = False  # set True when Newton recomputes J
+        self._petsc_use_gpu = False
+        self._petsc_comm_obj = None
+        self._petsc_effective_mat_type = None
+        self._petsc_effective_vec_type = None
+        self._petsc_gpu_warned = set()
 
         # Rho adaptation safeguards (bounds and "stuck" thresholds)
         # These are conservative defaults; they can be adjusted by users after construction if needed.
@@ -225,10 +243,19 @@ class ImplicitEquationSolver:
         # Jacobian structure cache (for dense-to-sparse optimization)
         self._J_cached = None
         self._J_rows = None
+        self.jacobian_sparsity = None
+        self._jacobian_sparsity = None
+        self.set_jacobian_sparsity(jacobian_sparsity)
 
         # Tangent structure cache (for dense-to-sparse optimization)
         self._D_cached = None
         self._D_rows = None
+
+        # Exact sparse assembly cache for diagonal-tangent Newton operators
+        self._diag_newton_key = None
+        self._diag_newton_row_idx = None
+        self._diag_newton_diag_pos = None
+        self._diag_newton_out = None
 
         # Initialize rho state (scalar default + structured cache)
         self._set_initial_rho(rho0)
@@ -398,6 +425,45 @@ class ImplicitEquationSolver:
         # enforce constraints regardless of the rhok / lam parameter, so
         # Lipschitz-based lam adaptation wastes func evals without benefit.
         self._is_rho_independent = getattr(self.proj, 'rho_independent', False)
+
+    def _normalize_jacobian_sparsity(self, sparsity):
+        if sparsity is None:
+            return None
+        if sp.issparse(sparsity):
+            return sparsity.tocsr()
+        arr = np.asarray(sparsity)
+        if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+            raise ValueError("jacobian_sparsity must be a square 2-D array or sparse matrix")
+        return sp.csr_matrix(arr)
+
+    def set_jacobian_sparsity(self, sparsity) -> None:
+        """Register a public Jacobian sparsity pattern for colored FD."""
+        norm = self._normalize_jacobian_sparsity(sparsity)
+        self.jacobian_sparsity = norm
+        # Keep the legacy private alias for backwards compatibility.
+        self._jacobian_sparsity = norm
+
+    def _component_indices(self, field, n: int | None = None, dtype=int) -> np.ndarray:
+        """Normalize a component partition entry to a 1-D index array."""
+        if isinstance(field, slice):
+            start = 0 if field.start is None else int(field.start)
+            if field.stop is None:
+                if n is None:
+                    raise ValueError("Open-ended component slice requires problem size")
+                stop = int(n)
+            else:
+                stop = int(field.stop)
+            step = 1 if field.step is None else int(field.step)
+            return np.arange(start, stop, step, dtype=dtype)
+
+        arr = np.asarray(field)
+        if arr.ndim == 0:
+            return np.array([arr.item()], dtype=dtype)
+        if arr.dtype == bool:
+            if n is None and arr.ndim != 1:
+                raise ValueError("Boolean component mask requires problem size")
+            return np.flatnonzero(arr).astype(dtype, copy=False)
+        return np.asarray(arr, dtype=dtype).ravel()
 
     # ---------- Per-DOF weighted-norm helpers ----------
 
@@ -668,6 +734,11 @@ class ImplicitEquationSolver:
             self._petsc_mat = None
         self._petsc_build_count = 0
         self._petsc_shape = None
+        self._petsc_field_is = None
+        self._petsc_use_gpu = False
+        self._petsc_comm_obj = None
+        self._petsc_effective_mat_type = None
+        self._petsc_effective_vec_type = None
 
         # Jacobian equilibration cache
         self._eq_Dr = None
@@ -721,7 +792,7 @@ class ImplicitEquationSolver:
         reused, Jacobian computation and row-patching are skipped
         entirely.
         """
-        y = y0.copy()
+        y = np.asarray(y0, dtype=float).reshape(-1).copy()
         n = len(y)
         sparse_active = self._sparse_active(n)
         P = self.proj
@@ -960,7 +1031,7 @@ class ImplicitEquationSolver:
         prev_errF = np.inf      # previous *iteration's* errF (always updated)
 
         for iteration in range(1, self.max_iter + 1):
-            F_in = func(y)
+            F_in = np.asarray(func(y), dtype=float).reshape(-1)
             self.last_Fk_val = F_in
             converged, errF = self._converged_with_metric(F_in, y)
 
@@ -1013,7 +1084,9 @@ class ImplicitEquationSolver:
                     if lu_local is not None:
                         try:
                             delta = lu_local.solve(rhs_solve)
-                            delta = self._unscale_solution(delta)
+                            delta = np.asarray(
+                                self._unscale_solution(delta), dtype=float
+                            ).reshape(-1)
                         except Exception:
                             lu_local = None
                             self._lu = None
@@ -1034,7 +1107,9 @@ class ImplicitEquationSolver:
                             self._lu = lu_local
                             self._lu_shape = (n, n)
                             delta = lu_local.solve(rhs_solve)
-                            delta = self._unscale_solution(delta)
+                            delta = np.asarray(
+                                self._unscale_solution(delta), dtype=float
+                            ).reshape(-1)
                         except Exception:
                             # SPLU failed — fall back to _solve_linear_sparse
                             lu_local = None
@@ -1045,7 +1120,9 @@ class ImplicitEquationSolver:
                             delta, ok = self._solve_linear_sparse(
                                 J_csr, rhs_solve, rtol=rtol_dyn)
                             if ok:
-                                delta = self._unscale_solution(delta)
+                                delta = np.asarray(
+                                    self._unscale_solution(delta), dtype=float
+                                ).reshape(-1)
                             if not ok:
                                 if not need_J:
                                     J_local = self._compute_jacobian_csr(func, y, sparse_active)
@@ -1059,7 +1136,9 @@ class ImplicitEquationSolver:
                                     delta, ok = self._solve_linear_sparse(
                                         J_csr, rhs_solve, rtol=rtol_dyn)
                                     if ok:
-                                        delta = self._unscale_solution(delta)
+                                        delta = np.asarray(
+                                            self._unscale_solution(delta), dtype=float
+                                        ).reshape(-1)
                                 if not ok:
                                     return (y, F_in, errF, False, iteration)
                 else:
@@ -1092,7 +1171,9 @@ class ImplicitEquationSolver:
                     rhs_solve = self._scale_rhs(rhs)
                     delta, ok = self._solve_linear_sparse(J_csr, rhs_solve, rtol=rtol_dyn)
                     if ok:
-                        delta = self._unscale_solution(delta)
+                        delta = np.asarray(
+                            self._unscale_solution(delta), dtype=float
+                        ).reshape(-1)
                     if not ok:
                         # Retry with a fresh Jacobian if we hadn't already
                         if not need_J:
@@ -1108,13 +1189,17 @@ class ImplicitEquationSolver:
                             delta, ok = self._solve_linear_sparse(
                                 J_csr, rhs_solve, rtol=rtol_dyn)
                             if ok:
-                                delta = self._unscale_solution(delta)
+                                delta = np.asarray(
+                                    self._unscale_solution(delta), dtype=float
+                                ).reshape(-1)
                         if not ok:
                             return (y, F_in, errF, False, iteration)
             else:
                 J_dense = J_local.toarray() if sp.issparse(J_local) else J_local
                 try:
-                    delta = np.linalg.solve(J_dense, rhs)
+                    delta = np.asarray(
+                        np.linalg.solve(J_dense, rhs), dtype=float
+                    ).reshape(-1)
                 except np.linalg.LinAlgError:
                     return (y, F_in, errF, False, iteration)
 
@@ -1128,9 +1213,9 @@ class ImplicitEquationSolver:
             if self.globalization == 'linesearch' and J_local is not None:
                 phi0 = 0.5 * errF * errF
                 if sp.issparse(J_local):
-                    grad_phi = J_local.T @ F_in
+                    grad_phi = np.asarray(J_local.T @ F_in, dtype=float).reshape(-1)
                 else:
-                    grad_phi = J_local.T @ F_in
+                    grad_phi = np.asarray(J_local.T @ F_in, dtype=float).reshape(-1)
                 grad_dir = float(np.dot(grad_phi, delta))
 
                 alpha = 1.0
@@ -1139,7 +1224,7 @@ class ImplicitEquationSolver:
                 if np.isfinite(grad_dir) and grad_dir < 0.0:
                     for _ in range(self.max_backtracks):
                         y_trial = y + alpha * delta
-                        F_trial = func(y_trial)
+                        F_trial = np.asarray(func(y_trial), dtype=float).reshape(-1)
                         phi_trial = 0.5 * float(np.dot(F_trial, F_trial))
                         if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir:
                             y = y_trial
@@ -1159,7 +1244,7 @@ class ImplicitEquationSolver:
                     alpha = 1.0
                     for _ in range(self.max_backtracks):
                         y_trial = y + alpha * delta_g
-                        F_trial = func(y_trial)
+                        F_trial = np.asarray(func(y_trial), dtype=float).reshape(-1)
                         phi_trial = 0.5 * float(np.dot(F_trial, F_trial))
                         if phi_trial <= phi0 + self.ls_c1 * alpha * grad_dir_g:
                             y = y_trial
@@ -1172,7 +1257,7 @@ class ImplicitEquationSolver:
                 np.add(y, delta, out=y)
 
         # Max iterations exhausted
-        F_in = func(y)
+        F_in = np.asarray(func(y), dtype=float).reshape(-1)
         self.last_Fk_val = F_in
         errF = self._errf_metric(F_in, y)
         return (y, F_in, errF, False, self.max_iter)
@@ -1403,6 +1488,7 @@ class ImplicitEquationSolver:
         # and re-lock.  Prevents mis-classification at the predictor from
         # persisting, while still preventing within-iteration chatter.
         _prev_merit = float('inf')
+        _lam_readapt = False  # set True after Proposal 3b relock
 
         for iteration in range(1, self.max_iter + 1):
             # cache context once per iteration
@@ -1416,16 +1502,19 @@ class ImplicitEquationSolver:
             # Also skip after the first iteration: for SSN the Newton
             # direction already accounts for lam, so re-adapting every
             # iteration destroys quadratic convergence and wastes evals.
+            # Exception: re-adapt once after a Proposal 3b active-set
+            # relock, since the Lipschitz constant changes.
             if (self.adaptive_lam
                     and self.lam_update_strategy == 'vi'
                     and not self._is_rho_independent
-                    and iteration <= 1
+                    and (iteration <= 1 or _lam_readapt)
                     and np.ndim(lam) == 0):
                 try:
                     lam = self._update_rho(func, y, lam, Fk_val=_cached_F_in)
                     self.lam = lam
+                    _lam_readapt = False
                 except Exception:
-                    pass
+                    _lam_readapt = False
 
             F_in = func(y)
             self.last_Fk_val = F_in  # cheap attribute write
@@ -1455,7 +1544,38 @@ class ImplicitEquationSolver:
             # F_buf = y - proj_z
             np.subtract(y, proj_z, out=F_buf)
             converged, errF = self._converged_with_metric(F_buf, y)
+
             if converged:
+                # --- Post-convergence active-set relock (Proposal 3b) ---
+                # Before accepting, check if any previously-inactive
+                # contacts have closed (gap ≤ 0) at the converged state.
+                # If so, add them to the active set (monotone union) and
+                # continue iterating.  This closes the gap in Proposal 3
+                # which sits *after* the convergence check and thus never
+                # fires when convergence is reached with the wrong
+                # (all-inactive) active set.
+                if _has_relock:
+                    _old_mask_cv = P._locked_active
+                    if (_old_mask_cv is not None
+                            and not _old_mask_cv.all()):
+                        _gap_func_cv = getattr(P, 'gap_func', None)
+                        if _gap_func_cv is not None:
+                            _tcur_cv = getattr(self, 'current_time', None)
+                            _gn = getattr(P, '_gap_nargs', None)
+                            if _gn is not None and _gn <= 1:
+                                _gaps_cv = np.atleast_1d(
+                                    _gap_func_cv(y))
+                            else:
+                                _gaps_cv = np.atleast_1d(
+                                    _gap_func_cv(y, _tcur_cv))
+                            _new_cv = _gaps_cv <= P.gap_tol
+                            _union_cv = _old_mask_cv | _new_cv
+                            if not np.array_equal(_union_cv,
+                                                  _old_mask_cv):
+                                P._locked_active = _union_cv
+                                _lam_readapt = True
+                                continue  # re-enter loop with updated set
+
                 y[:] = proj_z
                 F_y = func(y)
                 _unlock()
@@ -1476,8 +1596,7 @@ class ImplicitEquationSolver:
                     if self.jacobian is not None:
                         B0 = self.jacobian(y)
                     else:
-                        mode = 'cs' if getattr(self, 'autodiff_mode', 'numerical') == 'cs' else 'fd'
-                        B0 = self._numerical_jacobian(func, y, sparse=False, mode=mode)
+                        B0 = self._numerical_jacobian(func, y, sparse=False)
                     if sp.issparse(B0):
                         B0 = B0.toarray()
                     self._B = B0
@@ -1507,14 +1626,19 @@ class ImplicitEquationSolver:
                 # D is diagonal when it has exactly n nonzeros and they sit on the diagonal.
                 _D_is_diag = False
                 _D_diag_vals = None
-                if Dstate is None and sp.issparse(Dproj) and Dproj.nnz <= n:
-                    # Quick check: CSR with exactly one entry per row on the diagonal
+                if Dstate is None and sp.issparse(Dproj):
+                    # Fast structural diagonal case first; then fall back to a
+                    # numerical diagonal check that tolerates stored zeros in a
+                    # fixed sparse pattern (e.g. full SOC blocks with zero
+                    # off-diagonal entries in interior / polar regions).
                     _dptr = Dproj.indptr
-                    if np.all(np.diff(_dptr) == 1):
+                    if Dproj.nnz <= n and np.all(np.diff(_dptr) == 1):
                         _didx = Dproj.indices
                         if np.array_equal(_didx, np.arange(n)):
                             _D_is_diag = True
                             _D_diag_vals = Dproj.data  # length-n diagonal
+                    if not _D_is_diag:
+                        _D_is_diag, _D_diag_vals = self._extract_sparse_numeric_diagonal(Dproj, n)
 
                 if self.linear_solver in ('splu', 'petsc'):
                     if _D_is_diag:
@@ -1522,12 +1646,13 @@ class ImplicitEquationSolver:
                         # = diag(1 - d) + lam * diag(d) @ J_in
                         # = diag(1 - d) + J_in scaled row-wise by lam*d
                         d = _D_diag_vals
-                        # Scale J_in rows by lam*d (creates a new CSR)
-                        _scale = lam * d
-                        J_mat = J_in.multiply(_scale[:, None]) if hasattr(J_in, 'multiply') else sp.diags(_scale) @ J_in
-                        # Add diagonal (1 - d)
-                        _one_minus_d = 1.0 - d
-                        J_mat = J_mat + sp.diags(_one_minus_d, format='csr')
+                        J_mat = self._assemble_diag_newton_csr(J_in, d, lam)
+                        if J_mat is None:
+                            # Fallback when J_in lacks a structural diagonal.
+                            _scale = lam * d
+                            J_mat = J_in.multiply(_scale[:, None]) if hasattr(J_in, 'multiply') else sp.diags(_scale) @ J_in
+                            _one_minus_d = 1.0 - d
+                            J_mat = J_mat + sp.diags(_one_minus_d, format='csr')
                     else:
                         # General: J = I - D + D @ diag(lam) @ J_in
                         # For scalar lam the commutation is trivial;
@@ -1542,6 +1667,14 @@ class ImplicitEquationSolver:
                             J_mat = I - Dproj - Dstate + Dproj @ _J_lam
                     if not sp.issparse(J_mat):
                         J_mat = self._to_csr(J_mat, n)
+                    # Ensure every diagonal position is structurally present.
+                    # Sparse arithmetic (e.g. I - D when D=I) can prune
+                    # numerical zeros, leaving MUMPS/SuperLU without a pivot
+                    # entry.  Reading and writing back the diagonal is a
+                    # no-op on values but forces structural allocation.
+                    J_mat = J_mat.tocsr()
+                    _diag = J_mat.diagonal()
+                    J_mat.setdiag(_diag)
                     delta, ok = self._solve_linear_sparse(J_mat, rhs, rtol=rtol_dyn, pattern_hint=None)
                 else:
                     if _D_is_diag:
@@ -1600,7 +1733,7 @@ class ImplicitEquationSolver:
                 else:
                     J = I - Dproj - Dstate + Dproj @ _J_lam
                 try:
-                    delta = np.linalg.solve(J, -F_buf)
+                    delta = np.linalg.solve(np.asarray(J), -F_buf)
                 except np.linalg.LinAlgError:
                     _unlock()
                     return (y, F_in, errF, False, iteration)
@@ -2147,6 +2280,9 @@ class ImplicitEquationSolver:
         rk = self._get_rk(func, yk1, yk, rho)
         while rk > self.L:
             rho = self.nu * rho
+            if rho < self._lam_floor:
+                rho = self._lam_floor
+                break
             yk1 = self._project(yk, yk - rho * Fk_val, rho, tcur, Fk_val, prev)
             rk = self._get_rk(func, yk1, yk, rho)
         if rk <= self.Lmin:
@@ -2178,8 +2314,12 @@ class ImplicitEquationSolver:
                 pass
 
         # --- Coloring-based sparse Jacobian when sparsity pattern is known ---
-        sparsity = getattr(self, '_jacobian_sparsity', None)
+        sparsity = self.jacobian_sparsity
         if sparsity is not None and use_sparse:
+            if sparsity.shape != (n, n):
+                raise ValueError(
+                    f"jacobian_sparsity has shape {sparsity.shape}, expected {(n, n)}"
+                )
             try:
                 from scipy.optimize._numdiff import approx_derivative
                 J_csr = approx_derivative(
@@ -2215,8 +2355,7 @@ class ImplicitEquationSolver:
         if self.jacobian is not None:
             J_raw = self.jacobian(y)
         else:
-            mode = 'cs' if getattr(self, 'autodiff_mode', 'numerical') == 'cs' else 'fd'
-            J_raw = self._numerical_jacobian(func, y, sparse=sparse_active, mode=mode)
+            J_raw = self._numerical_jacobian(func, y, sparse=sparse_active)
 
         if not sparse_active:
             return J_raw
@@ -2353,6 +2492,94 @@ class ImplicitEquationSolver:
             except Exception:
                 pass
         return sp.csr_matrix(A)
+
+    def _extract_sparse_numeric_diagonal(self, D_csr, n):
+        """Detect numerically diagonal sparse matrices even with stored zeros.
+
+        Returns ``(True, diag)`` when every nonzero entry lies on the diagonal
+        and there is at most one diagonal entry per row. This lets the Newton
+        assembly fast path remain active for fixed sparse patterns that keep
+        structural zero off-diagonals (for example full SOC blocks whose
+        interior/polar values are numerically diagonal).
+        """
+        D_csr = self._to_csr(D_csr, n)
+        if D_csr.shape != (n, n):
+            return (False, None)
+
+        data = D_csr.data
+        if data.size == 0:
+            return (True, np.zeros(n, dtype=float))
+
+        nz_mask = data != 0
+        if not np.any(nz_mask):
+            return (True, np.zeros(n, dtype=data.dtype))
+
+        row_idx = np.repeat(np.arange(n), np.diff(D_csr.indptr))
+        nz_rows = row_idx[nz_mask]
+        nz_cols = D_csr.indices[nz_mask]
+        if np.any(nz_cols != nz_rows):
+            return (False, None)
+
+        counts = np.bincount(nz_rows, minlength=n)
+        if np.any(counts > 1):
+            return (False, None)
+
+        diag = np.zeros(n, dtype=data.dtype)
+        diag[nz_rows] = data[nz_mask]
+        return (True, diag)
+
+    def _prepare_diag_newton_template(self, J_csr):
+        """Cache row metadata for exact diagonal-tangent sparse assembly."""
+        key = (J_csr.shape, J_csr.nnz, id(J_csr.indptr), id(J_csr.indices))
+        if self._diag_newton_key == key and self._diag_newton_out is not None:
+            return True
+
+        n = J_csr.shape[0]
+        row_idx = np.repeat(np.arange(n), np.diff(J_csr.indptr))
+        diag_pos = np.full(n, -1, dtype=np.int64)
+        has_full_diag = True
+        for i in range(n):
+            start = J_csr.indptr[i]
+            stop = J_csr.indptr[i + 1]
+            row_cols = J_csr.indices[start:stop]
+            hits = np.flatnonzero(row_cols == i)
+            if hits.size == 0:
+                has_full_diag = False
+                break
+            diag_pos[i] = start + hits[0]
+
+        self._diag_newton_key = key
+        self._diag_newton_row_idx = row_idx
+        self._diag_newton_diag_pos = diag_pos if has_full_diag else None
+        self._diag_newton_out = None
+
+        if not has_full_diag:
+            return False
+
+        self._diag_newton_out = sp.csr_matrix(
+            (np.empty_like(J_csr.data), J_csr.indices.copy(), J_csr.indptr.copy()),
+            shape=J_csr.shape,
+        )
+        return True
+
+    def _assemble_diag_newton_csr(self, J_csr, d_diag, lam):
+        """Assemble ``diag(1-d) + diag(d*lam) @ J`` without sparse temporaries."""
+        if not self._prepare_diag_newton_template(J_csr):
+            return None
+
+        out = self._diag_newton_out
+        row_idx = self._diag_newton_row_idx
+        diag_pos = self._diag_newton_diag_pos
+
+        d_arr = np.asarray(d_diag)
+        if np.ndim(lam) >= 1:
+            scale = d_arr * np.asarray(lam)
+        else:
+            scale = d_arr * float(lam)
+
+        np.multiply(J_csr.data, scale[row_idx], out=out.data)
+        out.data[diag_pos] += (1.0 - d_arr)
+        return out
 
     def _solve_linear_sparse(self, J, rhs, rtol=None, pattern_hint=None):
         n = J.shape[0]
@@ -2571,6 +2798,158 @@ class ImplicitEquationSolver:
             return True
         return bool(self.sparse)
 
+    def _petsc_comm_size(self, comm):
+        if comm is None:
+            return None
+        for name in ('getSize', 'Get_size'):
+            fn = getattr(comm, name, None)
+            if callable(fn):
+                try:
+                    return int(fn())
+                except Exception:
+                    pass
+        size = getattr(comm, 'size', None)
+        if size is not None:
+            try:
+                return int(size)
+            except Exception:
+                pass
+        return None
+
+    def _resolve_petsc_comm(self):
+        """Resolve the communicator used for PETSc objects.
+
+        Only single-rank PETSc solves are currently supported. ``petsc_comm``
+        may still be ``'world'`` provided the effective communicator size is 1.
+        """
+        spec = self.petsc_comm
+        if spec is None or spec == 'self':
+            comm = PETSc.COMM_SELF
+        elif isinstance(spec, str):
+            key = spec.lower()
+            if key == 'self':
+                comm = PETSc.COMM_SELF
+            elif key == 'world':
+                comm = getattr(PETSc, 'COMM_WORLD', PETSc.COMM_SELF)
+            else:
+                raise ValueError("petsc_comm must be 'self', 'world', or a PETSc/mpi4py communicator object.")
+        else:
+            comm = spec
+
+        return comm
+
+    def _petsc_comm_rank(self, comm):
+        if comm is None:
+            return 0
+        for name in ('getRank', 'Get_rank'):
+            fn = getattr(comm, name, None)
+            if callable(fn):
+                try:
+                    return int(fn())
+                except Exception:
+                    pass
+        rank = getattr(comm, 'rank', None)
+        if rank is not None:
+            try:
+                return int(rank)
+            except Exception:
+                pass
+        return 0
+
+    def _petsc_owned_range(self, n: int, comm):
+        """Return the contiguous row ownership range for this rank."""
+        size = self._petsc_comm_size(comm) or 1
+        rank = self._petsc_comm_rank(comm)
+        base, extra = divmod(int(n), int(size))
+        start = rank * base + min(rank, extra)
+        stop = start + base + (1 if rank < extra else 0)
+        return int(start), int(stop)
+
+    def _petsc_type_supported(self, kind, type_name):
+        """Return True when the current PETSc build accepts the requested type."""
+        if not PETSC_AVAILABLE or not type_name:
+            return False
+
+        key = (kind, str(type_name))
+        cached = _PETSC_TYPE_SUPPORT_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        ok = False
+        obj = None
+        try:
+            if kind == 'mat':
+                obj = PETSc.Mat().create(comm=PETSc.COMM_SELF)
+                obj.setSizes((1, 1))
+                obj.setType(type_name)
+            elif kind == 'vec':
+                obj = PETSc.Vec().create(comm=PETSc.COMM_SELF)
+                obj.setSizes(1)
+                obj.setType(type_name)
+            else:
+                raise ValueError(f"Unknown PETSc object kind '{kind}'")
+            ok = True
+        except Exception:
+            ok = False
+        finally:
+            if obj is not None:
+                try:
+                    obj.destroy()
+                except Exception:
+                    pass
+
+        _PETSC_TYPE_SUPPORT_CACHE[key] = ok
+        return ok
+
+    def _resolve_petsc_backend(self, opts):
+        """Determine the effective PETSc backend after capability checks."""
+        requested_mat_type = opts.get('mat_type')
+        requested_vec_type = opts.get('vec_type')
+        requested_gpu = (
+            requested_mat_type in _PETSC_GPU_MAT_TYPES
+            or requested_vec_type in _PETSC_GPU_VEC_TYPES
+        )
+
+        effective_mat_type = requested_mat_type
+        effective_vec_type = requested_vec_type
+        reasons = []
+
+        if effective_mat_type in _PETSC_GPU_MAT_TYPES and not self._petsc_type_supported('mat', effective_mat_type):
+            reasons.append(f"matrix type '{effective_mat_type}'")
+            effective_mat_type = None
+        if effective_vec_type in _PETSC_GPU_VEC_TYPES and not self._petsc_type_supported('vec', effective_vec_type):
+            reasons.append(f"vector type '{effective_vec_type}'")
+            effective_vec_type = None
+
+        if effective_mat_type in _PETSC_GPU_MAT_TYPES and effective_vec_type is None:
+            paired_vec = _PETSC_GPU_PAIR_FOR_MAT.get(effective_mat_type)
+            if paired_vec and self._petsc_type_supported('vec', paired_vec):
+                effective_vec_type = paired_vec
+        if effective_vec_type in _PETSC_GPU_VEC_TYPES and effective_mat_type is None:
+            paired_mat = _PETSC_GPU_PAIR_FOR_VEC.get(effective_vec_type)
+            if paired_mat and self._petsc_type_supported('mat', paired_mat):
+                effective_mat_type = paired_mat
+
+        use_gpu = (
+            effective_mat_type in _PETSC_GPU_MAT_TYPES
+            and effective_vec_type in _PETSC_GPU_VEC_TYPES
+        )
+
+        if requested_gpu and not use_gpu:
+            warn_key = (requested_mat_type, requested_vec_type)
+            if warn_key not in self._petsc_gpu_warned:
+                detail = ", ".join(reasons) if reasons else "the requested PETSc GPU backend"
+                warnings.warn(
+                    f"Requested PETSc GPU backend is unavailable on this PETSc build ({detail}). "
+                    "Falling back to CPU PETSc objects.",
+                    RuntimeWarning,
+                )
+                self._petsc_gpu_warned.add(warn_key)
+            effective_mat_type = None
+            effective_vec_type = None
+
+        return effective_mat_type, effective_vec_type, use_gpu
+
     def _solve_with_petsc(self, J, b, rtol=None):
         """Solve linear system using PETSc with configurable Krylov solver and preconditioner.
 
@@ -2599,10 +2978,16 @@ class ImplicitEquationSolver:
             os.environ['PETSC_OPTIONS'] = '-use_gpu_aware_mpi 0'
         """
         n = J.shape[0]
-        opts = self.petsc_options
+        opts = dict(self.petsc_options)
+        comm = self._resolve_petsc_comm()
+        comm_size = self._petsc_comm_size(comm) or 1
+        distributed = comm_size > 1
+        effective_mat_type, effective_vec_type, use_gpu = self._resolve_petsc_backend(opts)
 
-        # Check for GPU types
-        use_gpu = opts.get('mat_type') in ('aijcusparse', 'aijkokkos') or opts.get('vec_type') == 'cuda'
+        if distributed:
+            raise NotImplementedError(
+                "Distributed PETSc communicators are not supported yet."
+            )
 
         # Convert J to CSR if needed
         if not sp.issparse(J):
@@ -2612,15 +2997,25 @@ class ImplicitEquationSolver:
         else:
             J_csr = J
 
+        if distributed and J_csr.shape[0] != J_csr.shape[1]:
+            raise NotImplementedError(
+                "Distributed PETSc prototype currently assumes square matrices."
+            )
+
+        row_start, row_stop = self._petsc_owned_range(J_csr.shape[0], comm)
+        local_n = row_stop - row_start
+
         # Determine if we need to rebuild the KSP
+        is_direct_solver = opts.get('ksp_type') == 'preonly' and opts.get('pc_type') in ('lu', 'cholesky')
+        reuse_budget = max(1, self.petsc_reuse_steps)
         need_rebuild = (
             self._petsc_ksp is None
             or self._petsc_shape != J.shape
-            or self._petsc_build_count >= self.petsc_reuse_steps
+            or self._petsc_comm_obj is not comm
+            or self._petsc_effective_mat_type != effective_mat_type
+            or self._petsc_effective_vec_type != effective_vec_type
+            or (is_direct_solver and self._petsc_build_count >= reuse_budget)
         )
-
-        # Check if this is a direct solver (LU/Cholesky) - these cache factorizations
-        is_direct_solver = opts.get('ksp_type') == 'preonly' and opts.get('pc_type') in ('lu', 'cholesky')
 
         # For direct solvers, we want to reuse the factorization like SPLU does.
         # The key insight: SPLU reuses stale factorizations for precond_reuse_steps solves.
@@ -2630,7 +3025,10 @@ class ImplicitEquationSolver:
         # is slow), the fresh matrix MUST be factorised — otherwise the Newton
         # step is based on a stale system and convergence stalls or fails.
         if getattr(self, '_petsc_needs_matrix_update', False):
-            need_rebuild = True
+            if is_direct_solver:
+                need_rebuild = True
+            else:
+                self._petsc_pc_needs_update = True
             self._petsc_needs_matrix_update = False
 
         if is_direct_solver and not need_rebuild:
@@ -2651,32 +3049,39 @@ class ImplicitEquationSolver:
                     pass
 
             # Create PETSc matrix from scipy CSR
-            if use_gpu and opts.get('mat_type') == 'aijcusparse':
-                # Create GPU matrix via cuSPARSE
+            if use_gpu:
+                # Create GPU matrix with the effective PETSc matrix type.
                 # Ensure indices are the correct type (int32 for most PETSc builds)
-                indptr = J_csr.indptr.astype(PETSc.IntType, copy=False)
-                indices = J_csr.indices.astype(PETSc.IntType, copy=False)
-                data = np.ascontiguousarray(J_csr.data, dtype=PETSc.ScalarType)
-                
-                self._petsc_mat = PETSc.Mat().create(comm=PETSc.COMM_SELF)
-                self._petsc_mat.setType('aijcusparse')
-                self._petsc_mat.setSizes(J_csr.shape)
+                J_local = J_csr[row_start:row_stop].tocsr() if distributed else J_csr
+                indptr = J_local.indptr.astype(PETSc.IntType, copy=False)
+                indices = J_local.indices.astype(PETSc.IntType, copy=False)
+                data = np.ascontiguousarray(J_local.data, dtype=PETSc.ScalarType)
+
+                self._petsc_mat = PETSc.Mat().create(comm=comm)
+                self._petsc_mat.setType(effective_mat_type)
+                if distributed:
+                    self._petsc_mat.setSizes(((local_n, J_csr.shape[0]), (local_n, J_csr.shape[1])))
+                else:
+                    self._petsc_mat.setSizes(J_csr.shape)
                 self._petsc_mat.setPreallocationCSR((indptr, indices))
-                self._petsc_mat.setUp()  # Required before setValuesCSR for GPU
+                self._petsc_mat.setUp()
                 self._petsc_mat.setValuesCSR(indptr, indices, data)
             else:
-                # Standard CPU matrix - use COMM_SELF for independent per-rank solves
+                # Standard CPU matrix. For multi-rank runs, each rank hands PETSc
+                # only its owned contiguous row block while the outer solver still
+                # retains the full SciPy matrix for residual/Jacobian evaluation.
+                J_local = J_csr[row_start:row_stop].tocsr() if distributed else J_csr
+                size_spec = ((local_n, J_csr.shape[0]), (local_n, J_csr.shape[1])) if distributed else J_csr.shape
                 self._petsc_mat = PETSc.Mat().createAIJ(
-                    size=J_csr.shape,
-                    csr=(J_csr.indptr.astype(PETSc.IntType, copy=False),
-                         J_csr.indices.astype(PETSc.IntType, copy=False),
-                         J_csr.data),
-                    comm=PETSc.COMM_SELF,  # Each rank solves independently
+                    size=size_spec,
+                    csr=(J_local.indptr.astype(PETSc.IntType, copy=False),
+                         J_local.indices.astype(PETSc.IntType, copy=False),
+                         J_local.data),
+                    comm=comm,
                 )
             self._petsc_mat.assemble()
 
-            # Create KSP (Krylov solver) - also on COMM_SELF
-            self._petsc_ksp = PETSc.KSP().create(comm=PETSc.COMM_SELF)
+            self._petsc_ksp = PETSc.KSP().create(comm=comm)
             self._petsc_ksp.setOperators(self._petsc_mat)
 
             # Apply user options
@@ -2715,7 +3120,8 @@ class ImplicitEquationSolver:
             for k, v in opts.items():
                 # Skip keys we've already handled manually
                 if k in ('ksp_type', 'pc_type', 'pc_hypre_type', 'pc_factor_mat_solver_type',
-                         'ksp_rtol', 'ksp_max_it', 'ksp_gmres_restart'):
+                         'ksp_rtol', 'ksp_max_it', 'ksp_gmres_restart',
+                         'mat_type', 'vec_type'):
                     continue
                 # Handle flag options (value is None or True)
                 if v is None or v is True:
@@ -2731,8 +3137,8 @@ class ImplicitEquationSolver:
                     # CRITICAL: Use numeric names '0', '1' to match option keys 'fieldsplit_0_*'
                     self._petsc_field_is = []
                     for i, sl in enumerate(self.component_slices):
-                        indices = np.arange(sl.start, sl.stop, dtype=PETSc.IntType)
-                        is_field = PETSc.IS().createGeneral(indices, comm=PETSc.COMM_SELF)
+                        indices = self._component_indices(sl, n=J.shape[0], dtype=PETSc.IntType)
+                        is_field = PETSc.IS().createGeneral(indices, comm=comm)
                         self._petsc_field_is.append(is_field)
                         pc.setFieldSplitIS((str(i), is_field))  # '0', '1' not 'field0', 'field1'
                     
@@ -2749,29 +3155,33 @@ class ImplicitEquationSolver:
             self._petsc_shape = J.shape
             self._petsc_build_count = 0
             self._petsc_use_gpu = use_gpu
+            self._petsc_comm_obj = comm
+            self._petsc_effective_mat_type = effective_mat_type
+            self._petsc_effective_vec_type = effective_vec_type
+            self._petsc_owned_rows = (row_start, row_stop)
             self._petsc_pc_needs_update = True  # First solve needs PC setup
         else:
             # Reuse existing KSP - only update matrix values if needed
             # For direct solvers, skip matrix update entirely (reuse factorization)
             # For iterative solvers, update matrix but reuse preconditioner
             if not is_direct_solver:
-                # Only update matrix values every petsc_reuse_steps
-                if self._petsc_build_count % max(1, self.petsc_reuse_steps) == 0:
-                    try:
-                        # Update the matrix values
-                        self._petsc_mat.setValuesCSR(
-                            J_csr.indptr.astype(PETSc.IntType, copy=False),
-                            J_csr.indices.astype(PETSc.IntType, copy=False),
-                            J_csr.data,
-                        )
-                        self._petsc_mat.assemble()
-                        self._petsc_pc_needs_update = True
-                    except Exception:
-                        # If in-place update fails, rebuild
-                        self._petsc_build_count = self.petsc_reuse_steps
-                        return self._solve_with_petsc(J, b, rtol=rtol)
-                
-                # Update preconditioner only when matrix changed
+                try:
+                    J_local = J_csr[row_start:row_stop].tocsr() if distributed else J_csr
+                    self._petsc_mat.setValuesCSR(
+                        J_local.indptr.astype(PETSc.IntType, copy=False),
+                        J_local.indices.astype(PETSc.IntType, copy=False),
+                        J_local.data,
+                    )
+                    self._petsc_mat.assemble()
+                except Exception:
+                    # If in-place update fails, rebuild
+                    self._petsc_build_count = reuse_budget
+                    return self._solve_with_petsc(J, b, rtol=rtol)
+
+                # Refresh the preconditioner on demand, but keep the operator current.
+                if self._petsc_build_count % reuse_budget == 0:
+                    self._petsc_pc_needs_update = True
+
                 if getattr(self, '_petsc_pc_needs_update', True):
                     pc = self._petsc_ksp.getPC()
                     pc.setUp()
@@ -2780,31 +3190,51 @@ class ImplicitEquationSolver:
         self._petsc_build_count += 1
 
         # Create PETSc vectors (GPU or CPU)
-        opts = self.petsc_options
-        if getattr(self, '_petsc_use_gpu', False) and opts.get('vec_type') == 'cuda':
-            # GPU vectors - ensure contiguous array
+        if distributed:
+            local_b = np.ascontiguousarray(b[row_start:row_stop], dtype=np.float64)
+            b_petsc = PETSc.Vec().createMPI((local_n, n), comm=comm)
+            b_petsc.setArray(local_b)
+            x_petsc = self._petsc_mat.createVecRight()
+        elif getattr(self, '_petsc_use_gpu', False) and effective_vec_type in _PETSC_GPU_VEC_TYPES:
             b_arr = np.ascontiguousarray(b, dtype=np.float64)
-            
-            b_petsc = PETSc.Vec().create(comm=PETSc.COMM_SELF)
-            b_petsc.setType('cuda')
+
+            b_petsc = PETSc.Vec().create(comm=comm)
+            b_petsc.setType(effective_vec_type)
             b_petsc.setSizes(n)
             b_petsc.setUp()
             b_petsc.setArray(b_arr)
-            
-            x_petsc = PETSc.Vec().create(comm=PETSc.COMM_SELF)
-            x_petsc.setType('cuda')
+
+            x_petsc = PETSc.Vec().create(comm=comm)
+            x_petsc.setType(effective_vec_type)
             x_petsc.setSizes(n)
             x_petsc.setUp()
         else:
-            # CPU vectors - use COMM_SELF for independent per-rank solves
-            b_petsc = PETSc.Vec().createWithArray(b.copy(), comm=PETSc.COMM_SELF)
+            b_petsc = PETSc.Vec().createWithArray(b.copy(), comm=comm)
             x_petsc = self._petsc_mat.createVecRight()
 
         # Solve
         self._petsc_ksp.solve(b_petsc, x_petsc)
 
         # Extract solution (copy from GPU if needed)
-        x = x_petsc.getArray().copy()
+        if distributed:
+            scatter = None
+            x_all = None
+            try:
+                scatter, x_all = PETSc.Scatter.toAll(x_petsc)
+                scatter.scatter(
+                    x_petsc,
+                    x_all,
+                    addv=PETSc.InsertMode.INSERT_VALUES,
+                    mode=PETSc.ScatterMode.FORWARD,
+                )
+                x = x_all.getArray().copy()
+            finally:
+                if x_all is not None:
+                    x_all.destroy()
+                if scatter is not None:
+                    scatter.destroy()
+        else:
+            x = x_petsc.getArray().copy()
 
         # Check convergence
         reason = self._petsc_ksp.getConvergedReason()
@@ -2830,4 +3260,3 @@ class ImplicitEquationSolver:
         x_petsc.destroy()
 
         return (x, success)
-

@@ -8,7 +8,7 @@
 
    .. autosummary::
    
-      solve_ivp_ns
+      solve_nivp
    
 .. rubric:: Modules
 

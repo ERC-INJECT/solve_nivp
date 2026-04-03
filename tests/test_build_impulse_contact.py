@@ -116,6 +116,36 @@ class TestContactSystemStructure:
         cs = build_impulse_contact(A, rhs, y0, contacts, gap)
         assert isinstance(cs.projection, MuScaledSOCProjection)
 
+    def test_gap_tol_propagated_to_soc_projection(self):
+        A, rhs, y0, contacts, gap = _bouncing_ball_setup()
+        cs = build_impulse_contact(A, rhs, y0, contacts, gap, gap_tol=1.0e-9)
+        assert cs.projection.gap_tol == pytest.approx(1.0e-9)
+
+    def test_gap_tol_activates_near_zero_gap(self):
+        A, rhs, y0, contacts, _ = _bouncing_ball_setup()
+
+        def tiny_positive_gap(y, t):
+            return np.array([5.0e-13])
+
+        # Same candidate, different activation tolerance.
+        z = np.array([0.0, 0.0, 0.0, 0.0, 1.0, 0.1])
+
+        cs_inactive = build_impulse_contact(
+            A, rhs, y0, contacts, tiny_positive_gap, gap_tol=0.0
+        )
+        cs_active = build_impulse_contact(
+            A, rhs, y0, contacts, tiny_positive_gap, gap_tol=1.0e-12
+        )
+
+        p_inactive = cs_inactive.projection.project(z, z)
+        p_active = cs_active.projection.project(z, z)
+
+        # zero_inactive=True -> inactive block is projected to zero
+        np.testing.assert_allclose(p_inactive[4:], 0.0, atol=1e-14)
+        # With positive gap_tol the same near-open block is treated as active,
+        # so an already-admissible reaction stays unchanged.
+        np.testing.assert_allclose(p_active[4:], z[4:], atol=1e-14)
+
 
 # =====================================================================
 # Frémond coefficient tests
@@ -300,7 +330,7 @@ class TestCallableMu:
 
 
 # =====================================================================
-# Integration test (end-to-end via solve_ivp_ns)
+# Integration test (end-to-end via solve_nivp)
 # =====================================================================
 
 class TestIntegration:
@@ -317,7 +347,7 @@ class TestIntegration:
             component_slices=[slice(0, 2), slice(2, 4)],
         )
 
-        t_auto, y_auto, *_ = solve_nivp.solve_ivp_ns(
+        t_auto, y_auto, *_ = solve_nivp.solve_nivp(
             fun=cs.rhs,
             t_span=(0.0, 1.0),
             y0=cs.y0,
@@ -530,7 +560,7 @@ class TestFremondContact:
             component_slices=[slice(0, 2), slice(2, 4)],
         )
 
-        t_out, y_out, *_ = solve_nivp.solve_ivp_ns(
+        t_out, y_out, *_ = solve_nivp.solve_nivp(
             fun=cs.rhs,
             t_span=(0.0, 1.0),
             y0=cs.y0,

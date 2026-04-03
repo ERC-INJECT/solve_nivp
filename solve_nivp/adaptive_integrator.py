@@ -206,7 +206,7 @@ class AdaptiveStepping:
 
     @atol.setter
     def atol(self, value):
-        """Allow ``stepper.atol = X`` from outside (e.g. solve_ivp_ns tuning)."""
+        """Allow ``stepper.atol = X`` from outside (e.g. solve_nivp tuning)."""
         self._atol_raw = value
         self._atol_vec = None          # invalidate cache so next call re-expands
 

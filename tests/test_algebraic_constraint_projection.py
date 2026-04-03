@@ -9,7 +9,7 @@ and both nonlinear solver strategies (VI, semismooth_newton).
 import numpy as np
 import pytest
 from solve_nivp import (
-    solve_ivp_ns,
+    solve_nivp,
     AlgebraicConstraintProjection,
     ImplicitEquationSolver,
     BackwardEuler,
@@ -162,7 +162,7 @@ class TestProjectionUnit:
 # ---------- Integration tests ----------
 
 class TestAlgebraicDAEIntegration:
-    """Full DAE integration using the algebraic projection through solve_ivp_ns."""
+    """Full DAE integration using the algebraic projection through solve_nivp."""
 
     @pytest.fixture
     def dae_setup(self):
@@ -181,7 +181,7 @@ class TestAlgebraicDAEIntegration:
             dq = q - C @ y
             return np.concatenate([dy, dq])
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             rhs, (0.0, T), y0,
             method=method,
             projection='algebraic',
@@ -230,7 +230,7 @@ class TestAlgebraicDAEIntegration:
             dq = q - C @ y
             return np.concatenate([dy, dq])
 
-        t, y_hist, h, fk, info = solve_ivp_ns(
+        t, y_hist, h, fk, info = solve_nivp(
             rhs, (0.0, T), y0,
             method='backward_euler',
             projection='algebraic',
@@ -266,7 +266,7 @@ class TestAlgebraicDAEIntegration:
             dq = q - C @ y
             return np.concatenate([dy, dq])
 
-        t, y_hist, h, fk, info = solve_ivp_ns(
+        t, y_hist, h, fk, info = solve_nivp(
             rhs, (0.0, T_long), y0,
             method='composite',
             projection='algebraic',
@@ -298,7 +298,7 @@ class TestAlgebraicDAEIntegration:
 # ---------- Low-level construction test ----------
 
 class TestLowLevelConstruction:
-    """Verify manual construction (no solve_ivp_ns) works end-to-end."""
+    """Verify manual construction (no solve_nivp) works end-to-end."""
 
     def test_manual_pipeline(self):
         """Build Projection → Solver → Integrator → ODESystem → ODESolver by hand."""
@@ -436,7 +436,7 @@ class TestSDIRK2TimingComparison:
         times_proj = []
         for _ in range(n_runs):
             t0 = time.perf_counter()
-            t_p, y_p, h_p, fk_p, info_p = solve_ivp_ns(
+            t_p, y_p, h_p, fk_p, info_p = solve_nivp(
                 rhs_augmented, (0.0, T), y0_full,
                 method='sdirk2',
                 projection='algebraic',
@@ -463,7 +463,7 @@ class TestSDIRK2TimingComparison:
         times_dyn = []
         for _ in range(n_runs):
             t0 = time.perf_counter()
-            t_d, y_d, h_d, fk_d, info_d = solve_ivp_ns(
+            t_d, y_d, h_d, fk_d, info_d = solve_nivp(
                 rhs_augmented, (0.0, T), y0_full,
                 method='sdirk2',
                 projection='identity',
@@ -754,7 +754,7 @@ class TestMultiConstraintDAEIntegration:
 
         C_qp, C_su = m['C_qp'], m['C_su']
 
-        t, z, h, fk, info = solve_ivp_ns(
+        t, z, h, fk, info = solve_nivp(
             rhs, (0.0, 1.0), z0,
             method='sdirk2',
             projection='algebraic',
@@ -807,7 +807,7 @@ class TestMultiConstraintDAEIntegration:
 
         C_qp, C_su = m['C_qp'], m['C_su']
 
-        t, z, h, fk, info = solve_ivp_ns(
+        t, z, h, fk, info = solve_nivp(
             rhs, (0.0, 0.5), z0,
             method=method,
             projection='algebraic',
@@ -950,7 +950,7 @@ class TestClosureCaptureArity:
 
         component_slices = [sl['p'], sl['u'], sl['lqp'], sl['lqm'],
                             sl['lsp'], sl['lsm']]
-        t, z, *_ = solve_ivp_ns(
+        t, z, *_ = solve_nivp(
             fun=rhs, t_span=(0.0, 0.5), y0=y0,
             method='backward_euler', projection='algebraic',
             solver='semismooth_newton',
@@ -966,3 +966,28 @@ class TestClosureCaptureArity:
             np.testing.assert_allclose(z[i, sl['lqm']], C2 @ z[i, sl['p']], atol=1e-10)
             np.testing.assert_allclose(z[i, sl['lsp']], C3 @ z[i, sl['u']], atol=1e-10)
             np.testing.assert_allclose(z[i, sl['lsm']], C4 @ z[i, sl['u']], atol=1e-10)
+
+    def test_build_constraint_patch_repeated_zero_jacobian_keeps_identity_rows(self):
+        """Zero-dg constraints must not lose their q=q identity rows on cache reuse."""
+        n = 6
+        q_sl = slice(3, 6)
+        proj = AlgebraicConstraintProjection(
+            constraints=[dict(
+                g=lambda y: np.zeros(3),
+                dg_dy=lambda y: np.zeros((3, 3)),
+                y_slice=q_sl,
+                q_slice=q_sl,
+            )]
+        )
+
+        y0 = np.zeros(n)
+        y1 = np.array([0.0, 0.0, 0.0, 1.0, -2.0, 3.0])
+
+        patch0 = proj.build_constraint_patch(y0, n).toarray()
+        patch1 = proj.build_constraint_patch(y1, n).toarray()
+
+        expected = np.zeros((n, n))
+        expected[q_sl, q_sl] = np.eye(3)
+
+        np.testing.assert_allclose(patch0, expected, atol=1e-14)
+        np.testing.assert_allclose(patch1, expected, atol=1e-14)

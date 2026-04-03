@@ -21,6 +21,8 @@ import pytest
 import solve_nivp
 from solve_nivp.projections import (
     MuScaledSOCProjection,
+    MoreauSOCProjection,
+    AnisotropicSOCProjection,
     CompositeContactProjection,
     AlgebraicConstraintProjection,
     Projection,
@@ -196,6 +198,70 @@ class TestRegimeChangedMask:
         assert proj.regime_changed_mask(None, n) is None
 
 
+class TestDerivedProjectionRegimeTracking:
+    """Derived SOC projectors should expose regime snapshots consistently."""
+
+    def test_moreau_snapshot_updates_from_tangent_cone_split(self):
+        proj = MoreauSOCProjection(
+            blocks=[(0, [1])],
+            get_mu=lambda y: 0.5,
+        )
+        y = np.array([0.0, 1.0])
+        z = np.array([0.0, 2.0])  # boundary after forward De Saxce shift
+
+        _ = proj.tangent_cone_split(z, y)
+        snap = proj.regime_snapshot()
+
+        assert isinstance(snap, np.ndarray)
+        np.testing.assert_array_equal(snap, [2])
+
+    def test_moreau_changed_mask_detects_transition(self):
+        proj = MoreauSOCProjection(
+            blocks=[(0, [1])],
+            get_mu=lambda y: 0.5,
+        )
+        y = np.array([0.0, 1.0])
+
+        _ = proj.tangent_cone_split(np.array([0.0, 2.0]), y)   # boundary
+        snap = proj.regime_snapshot()
+        _ = proj.tangent_cone_split(np.array([-1.0, 0.0]), y)  # polar
+
+        mask = proj.regime_changed_mask(snap, 2)
+        assert mask is not None
+        np.testing.assert_array_equal(mask, [0.0, 0.0])
+
+    def test_anisotropic_snapshot_updates_from_tangent_cone(self):
+        proj = AnisotropicSOCProjection(
+            blocks=[(0, [1])],
+            get_mu=lambda y: 0.5,
+            get_B=lambda y, k: np.array([[2.0]]),
+        )
+        y = np.array([0.0, 1.0])
+        z = np.array([0.5, 2.0])  # boundary in whitened coordinates
+
+        _ = proj.tangent_cone(z, y)
+        snap = proj.regime_snapshot()
+
+        assert isinstance(snap, np.ndarray)
+        np.testing.assert_array_equal(snap, [2])
+
+    def test_anisotropic_changed_mask_detects_transition(self):
+        proj = AnisotropicSOCProjection(
+            blocks=[(0, [1])],
+            get_mu=lambda y: 0.5,
+            get_B=lambda y, k: np.array([[2.0]]),
+        )
+        y = np.array([0.0, 1.0])
+
+        _ = proj.tangent_cone(np.array([0.5, 2.0]), y)  # boundary
+        snap = proj.regime_snapshot()
+        _ = proj.tangent_cone(np.array([5.0, 0.1]), y)  # interior
+
+        mask = proj.regime_changed_mask(snap, 2)
+        assert mask is not None
+        np.testing.assert_array_equal(mask, [0.0, 0.0])
+
+
 # =====================================================================
 # 3. CompositeContactProjection delegation
 # =====================================================================
@@ -340,7 +406,7 @@ class TestActiveSetFilterEndToEnd:
         """Verify active_set_filter reaches AdaptiveStepping."""
         cs = self._spring_slider_problem()
         # Run with filter=True — just check it doesn't crash
-        t, y, h, fk, info = solve_nivp.solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp.solve_nivp(
             fun=cs.rhs,
             t_span=(0.0, 0.5),
             y0=cs.y0,
@@ -384,8 +450,8 @@ class TestActiveSetFilterEndToEnd:
             atol=1e-4,
             rtol=1e-3,
         )
-        t_off, y_off, *_ = solve_nivp.solve_ivp_ns(**common_kw, active_set_filter=False)
-        t_on, y_on, *_ = solve_nivp.solve_ivp_ns(**common_kw, active_set_filter=True)
+        t_off, y_off, *_ = solve_nivp.solve_nivp(**common_kw, active_set_filter=False)
+        t_on, y_on, *_ = solve_nivp.solve_nivp(**common_kw, active_set_filter=True)
 
         n_off = len(t_off)
         n_on = len(t_on)
@@ -396,7 +462,7 @@ class TestActiveSetFilterEndToEnd:
     def test_filter_preserves_physics(self):
         """With filter on, the solution should still be physically correct."""
         cs = self._spring_slider_problem()
-        t, y, h, fk, info = solve_nivp.solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp.solve_nivp(
             fun=cs.rhs,
             t_span=(0.0, 1.0),
             y0=cs.y0,
@@ -424,7 +490,7 @@ class TestActiveSetFilterEndToEnd:
     def test_backward_euler_with_filter(self):
         """The filter should also work with BE (Richardson path)."""
         cs = self._spring_slider_problem()
-        t, y, h, fk, info = solve_nivp.solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp.solve_nivp(
             fun=cs.rhs,
             t_span=(0.0, 0.5),
             y0=cs.y0,

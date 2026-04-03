@@ -44,9 +44,9 @@ def test_adaptive_controller_skip_indices_and_no_stall():
 
 
 def test_api_imports_and_solve_shapes():
-    from solve_nivp import solve_ivp_ns, SignProjection, CoulombProjection, IdentityProjection
+    from solve_nivp import solve_nivp, SignProjection, CoulombProjection, IdentityProjection
 
-    t, y, h, fk, info = solve_ivp_ns(
+    t, y, h, fk, info = solve_nivp(
         fun=_rhs,
         t_span=(0.0, 0.05),
         y0=np.array([1.0]),
@@ -56,3 +56,16 @@ def test_api_imports_and_solve_shapes():
     )
     assert t.ndim == 1 and y.ndim == 2 and h.ndim == 1
     assert y.shape[1] == 1
+
+
+def test_odesystem_accepts_sdirk2_method_string():
+    from solve_nivp import ODESystem
+
+    system = ODESystem(
+        fun=_rhs,
+        y0=np.array([1.0]),
+        method='sdirk2',
+        adaptive=False,
+    )
+
+    assert system.method.__class__.__name__ == 'SDIRK2'

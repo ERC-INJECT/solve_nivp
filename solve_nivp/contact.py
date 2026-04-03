@@ -10,10 +10,10 @@ The user provides:
 * ``gap_func`` — signed gap on the *physical* state.
 * Optionally ``B`` — coupling matrix (auto-generated if omitted).
 
-The helper returns everything needed to call :func:`solve_ivp_ns`::
+The helper returns everything needed to call :func:`solve_nivp`::
 
     cs = build_impulse_contact(A, rhs, y0, contacts, gap_func)
-    t, y, *_ = solve_ivp_ns(
+    t, y, *_ = solve_nivp(
         fun=cs.rhs, y0=cs.y0, A=cs.A,
         projection=cs.projection,
         component_slices=cs.component_slices,
@@ -42,7 +42,7 @@ from .projections import (
 # ──────────────────────────────────────────────────────────────────────
 @dataclass
 class ContactSystem:
-    """Augmented system ready for ``solve_ivp_ns``.
+    """Augmented system ready for ``solve_nivp``.
 
     Attributes
     ----------
@@ -108,6 +108,7 @@ def build_impulse_contact(
     get_B=None,
     step_size_ref=None,
     rhs_jac=None,
+    gap_tol=0.0,
 ):
     r"""Build an augmented impulse-level system for frictional contact.
 
@@ -138,10 +139,15 @@ def build_impulse_contact(
     gap_func : callable or None, optional
         Signed gap on the *physical* state:
         ``gap(y_phys, t) -> ndarray(n_contacts)``.
-        Contact *k* is active when ``gap[k] <= 0``.
+        Contact *k* is active when ``gap[k] <= gap_tol``.
         If *None* and ``C_extract`` is provided, auto-generated from
         the normal rows of ``C_extract`` (gap = ``C @ y_phys`` at
         the normal indices).  Required when ``C_extract`` is None.
+    gap_tol : float, default 0.0
+        Tolerance used for gap-based activation of the SOC contact blocks.
+        A small positive value can prevent roundoff-sized open/closed
+        sign changes from chattering the active set when the interface is
+        intended to remain closed.
     B : ndarray or sparse, shape ``(n_phys, n_react)``, optional
         Coupling matrix mapping reaction unknowns to generalised forces.
         If *None* and ``C_extract`` is provided, auto-generated as
@@ -325,7 +331,7 @@ def build_impulse_contact(
     -------
     ContactSystem
         Dataclass whose attributes plug directly into
-        :func:`solve_ivp_ns`.
+        :func:`solve_nivp`.
 
     Notes
     -----
@@ -555,6 +561,7 @@ def build_impulse_contact(
         blocks=soc_blocks,
         get_mu=get_mu_aug,
         gap_func=gap_aug,
+        gap_tol=float(gap_tol),
         zero_inactive=True,
     )
     if get_s0 is not None:
@@ -927,9 +934,19 @@ def build_impulse_contact(
                 shape=(n_react, _n))
 
             # 4) Assemble block matrix
+            # Use a small negative diagonal instead of zero so that
+            # the reaction-block has structural AND numerical diagonal.
+            # Direct solvers need the structural positions; the SSN
+            # needs nonzero J_in[react,react] to avoid a singular
+            # Jacobian when contact sticks (D=I → I−D=0 without it).
+            _rr = np.arange(n_react)
+            _eps_react = -1.0e-12
+            Z_react = sp.csr_matrix(
+                (np.full(n_react, _eps_react), (_rr, _rr)),
+                shape=(n_react, n_react))
             return sp.bmat([
                 [J_s,   B_coup],
-                [J_ds,  None  ],
+                [J_ds,  Z_react],
             ], format='csr')
 
         # ── Dense fallback ──
@@ -948,6 +965,13 @@ def build_impulse_contact(
             J[:_n, _n:] = (_B / (_theta * h_val)).toarray()
         else:
             J[:_n, _n:] = _B / (_theta * h_val)
+
+        # Mirror the sparse fast-path safeguard: keep a tiny reaction-block
+        # diagonal so the natural-map Jacobian is structurally and
+        # numerically non-singular when an active SOC block returns D = I
+        # on its normal component at a closed-contact sticking state.
+        _rr = np.arange(_n, _n_aug_jac)
+        J[_rr, _rr] = -1.0e-12
 
         if _C is not None:
             if _rate:

@@ -384,6 +384,61 @@ class TestMoreauPrestress:
         assert np.all(np.isfinite(p))
 
 
+class TestMoreauZeroInactive:
+    """Inactive Moreau blocks should be forced to zero when requested."""
+
+    def _make(self):
+        return MoreauSOCProjection(
+            blocks=[(0, [1])],
+            get_mu=lambda y: 0.5,
+            gap_func=lambda y, t: np.array([1.0]),  # gap > 0 -> inactive
+            zero_inactive=True,
+        )
+
+    def test_inactive_block_zeroed_in_dense_paths(self):
+        """Small systems should return zero value/Jacobians on inactive blocks."""
+        proj = self._make()
+        y = np.array([0.0, 0.0])
+        z = np.array([3.0, 4.0])
+
+        np.testing.assert_allclose(proj.project(y, z, t=0.0), [0.0, 0.0], atol=1e-14)
+
+        D = tangent_as_dense(proj.tangent_cone(z, y, t=0.0), z.size)
+        np.testing.assert_allclose(D, np.zeros((2, 2)), atol=1e-14)
+
+        D_cand, D_state = proj.tangent_cone_split(z, y, t=0.0)
+        np.testing.assert_allclose(tangent_as_dense(D_cand, z.size), np.zeros((2, 2)), atol=1e-14)
+        np.testing.assert_allclose(tangent_as_dense(D_state, z.size), np.zeros((2, 2)), atol=1e-14)
+
+    def test_inactive_block_zeroed_in_sparse_paths(self):
+        """Large systems should zero inactive Moreau rows in sparse assembly too."""
+        proj = self._make()
+        n = 80
+        y = np.zeros(n)
+        z = np.zeros(n)
+        z[0] = 3.0
+        z[1] = 4.0
+
+        p = proj.project(y, z, t=0.0)
+        np.testing.assert_allclose(p[:2], [0.0, 0.0], atol=1e-14)
+        np.testing.assert_allclose(p[2:], 0.0, atol=1e-14)
+
+        D = proj.tangent_cone(z, y, t=0.0)
+        assert sp.issparse(D)
+        D_dense = D.toarray()
+        np.testing.assert_allclose(D_dense[:2, :], 0.0, atol=1e-14)
+        np.testing.assert_allclose(np.diag(D_dense)[2:], 1.0, atol=1e-14)
+
+        D_cand, D_state = proj.tangent_cone_split(z, y, t=0.0)
+        assert sp.issparse(D_cand)
+        assert sp.issparse(D_state)
+        D_cand_dense = D_cand.toarray()
+        D_state_dense = D_state.toarray()
+        np.testing.assert_allclose(D_cand_dense[:2, :], 0.0, atol=1e-14)
+        np.testing.assert_allclose(np.diag(D_cand_dense)[2:], 1.0, atol=1e-14)
+        np.testing.assert_allclose(D_state_dense, 0.0, atol=1e-14)
+
+
 # =====================================================================
 # 7. AnisotropicSOCProjection with pre-stress
 # =====================================================================

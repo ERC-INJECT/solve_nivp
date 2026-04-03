@@ -19,7 +19,7 @@ def test_fun_receives_time_and_fk():
     y0 = np.array([1.0, 2.0])
     t_span = (0.0, 0.05)
 
-    result = sivp.solve_ivp_ns(
+    result = sivp.solve_nivp(
         fun=fun,
         t_span=t_span,
         y0=y0,
@@ -73,3 +73,29 @@ def test_projection_receives_time_and_fk_in_vi():
     assert received["t"] is not None
     # Fk_val may be None in simple flows, but ensure key is present
     assert "fk" in received
+
+
+def test_fixed_step_odesolver_stops_on_failed_nonlinear_step():
+    from solve_nivp.ODESolver import ODESolver
+
+    class FailingSystem:
+        adaptive = False
+        verbose = False
+
+        def __init__(self):
+            self.current_y = np.array([1.0])
+
+        def step(self, t, h):
+            return np.array([9.0]), np.array([7.0]), 2.5, False, 11
+
+    system = FailingSystem()
+    solver = ODESolver(system, t_span=(0.0, 1.0), h=0.5)
+    t_vals, y_vals, h_vals, fk_vals, error_estimates = solver.solve()
+
+    np.testing.assert_allclose(t_vals, [0.0])
+    np.testing.assert_allclose(y_vals[:, 0], [1.0])
+    np.testing.assert_allclose(h_vals, [0.5])
+    assert fk_vals.size == 0
+    assert error_estimates == [(2.5, False, 11)]
+    np.testing.assert_allclose(system.current_y, [1.0])
+    assert solver.terminal_failure == (2.5, False, 11)

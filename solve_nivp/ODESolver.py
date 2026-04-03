@@ -39,6 +39,7 @@ class ODESolver:
         thin_output: int = 1,
         store_fk: bool = True,
         gc_interval: int = 0,
+        abort_on_fixed_failure: bool = True,
     ):
         """
         Initialize the ODESolver.
@@ -54,6 +55,10 @@ class ODESolver:
             gc_interval: Call ``gc.collect()`` every *N* accepted steps
                 (0 = disabled). Useful for large problems where stale
                 solver factorisations may linger.
+            abort_on_fixed_failure: Stop fixed-step integration at the first
+                nonlinear failure instead of marching forward with the failed
+                state. The failed attempt is still recorded in
+                ``error_estimates``.
         """
         self.system = system
         self.t0, self.tf = t_span
@@ -67,6 +72,8 @@ class ODESolver:
         self.thin_output = max(1, int(thin_output))
         self.store_fk = bool(store_fk)
         self.gc_interval = max(0, int(gc_interval))
+        self.abort_on_fixed_failure = bool(abort_on_fixed_failure)
+        self.terminal_failure: Optional[Tuple[Any, bool, int]] = None
 
     def solve(self, return_attempts: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Tuple[Any, bool, int]]]:
         """Integrate from ``t0`` to ``tf``.
@@ -84,18 +91,23 @@ class ODESolver:
         y_values : ndarray (m, n)
             State history.
         h_values : ndarray (m,)
-            Step sizes used; first entry equals initial ``h`` guess.
-        fk : object ndarray (m,)
-            Residual / implicit function evaluations per accepted step.
+            Step-size history aligned with ``t_values``. The first entry is the
+            initial ``h`` guess; later entries are the accepted step sizes for
+            the stored states.
+        fk : object ndarray (m-1,)
+            Residual / implicit function evaluations for the stored accepted
+            steps (one entry per stored state after the initial condition).
         error_estimates : list[tuple]
-            Per-step tuples ``(solver_error, success, iterations)`` coming from
-            the nonlinear solver (solver_error is typically final residual norm).
+            Nonlinear-solver diagnostics ``(solver_error, success, iterations)``
+            for the stored accepted states. In fixed-step mode a terminal
+            failure tuple is appended even if the failed state is not stored.
         attempts : dict or None, optional
             Only returned when ``return_attempts`` is ``True``. Contains arrays of
             attempted times, step sizes, acceptance flags, etc., if recorded.
         """
         t = self.t0
         h = self.h_initial
+        self.terminal_failure = None
         stepper = getattr(self.system, 'adaptive_stepper', None)
         if stepper is not None and hasattr(stepper, 'reset_attempt_log'):
             stepper.reset_attempt_log()
@@ -130,7 +142,7 @@ class ODESolver:
                             self.fk.append(fk_new.copy() if fk_new is not None else None)
                         else:
                             self.fk.append(None)
-                        self.h_values.append(h_new)
+                        self.h_values.append(h_step)
                         self.error_estimates.append((solver_error, success, iterations))
                     self.system.current_y = y_new
                     h = h_new  # Update step size for next iteration.
@@ -147,21 +159,47 @@ class ODESolver:
             else:
                 # Fixed stepping mode.
                 y_new, fk_new, solver_error, success, iterations = self.system.step(t, h_step)
-                t += h_step
-                _step_count += 1
-                _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
-                if _step_count % _thin == 0 or _is_last:
-                    self.t_values.append(t)
-                    self.y_values.append(y_new.copy())
-                    if self.store_fk:
-                        self.fk.append(fk_new.copy() if fk_new is not None else None)
-                    else:
-                        self.fk.append(None)
-                    self.h_values.append(h_step)
-                    self.error_estimates.append((solver_error, success, iterations))
-                self.system.current_y = y_new
-                if _gc_iv > 0 and _step_count % _gc_iv == 0:
-                    gc.collect()
+                if success:
+                    t += h_step
+                    _step_count += 1
+                    _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
+                    if _step_count % _thin == 0 or _is_last:
+                        self.t_values.append(t)
+                        self.y_values.append(y_new.copy())
+                        if self.store_fk:
+                            self.fk.append(fk_new.copy() if fk_new is not None else None)
+                        else:
+                            self.fk.append(None)
+                        self.h_values.append(h_step)
+                        self.error_estimates.append((solver_error, success, iterations))
+                    self.system.current_y = y_new
+                    if _gc_iv > 0 and _step_count % _gc_iv == 0:
+                        gc.collect()
+                else:
+                    self.terminal_failure = (solver_error, success, iterations)
+                    if self.abort_on_fixed_failure:
+                        self.error_estimates.append((solver_error, success, iterations))
+                        if self.system.verbose:
+                            print(
+                                f"Failed fixed-step integration: nonlinear solve did not converge "
+                                f"at t={t:.5f} with h={h_step:.5f}."
+                            )
+                        break
+                    t += h_step
+                    _step_count += 1
+                    _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
+                    if _step_count % _thin == 0 or _is_last:
+                        self.t_values.append(t)
+                        self.y_values.append(y_new.copy())
+                        if self.store_fk:
+                            self.fk.append(fk_new.copy() if fk_new is not None else None)
+                        else:
+                            self.fk.append(None)
+                        self.h_values.append(h_step)
+                        self.error_estimates.append((solver_error, success, iterations))
+                    self.system.current_y = y_new
+                    if _gc_iv > 0 and _step_count % _gc_iv == 0:
+                        gc.collect()
             # pbar.update(h_step)
         # pbar.close()
         t_arr = np.array(self.t_values)

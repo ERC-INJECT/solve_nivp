@@ -6,7 +6,7 @@ Verifies that:
  - Per-slice tolerances are expanded correctly
  - Weighted RMS norm in nonlinear solver converges
  - Different tolerances per component actually affect acceptance
- - Top-level solve_ivp_ns forwards nl_atol / nl_rtol correctly
+ - Top-level solve_nivp forwards nl_atol / nl_rtol correctly
 """
 
 import numpy as np
@@ -246,17 +246,17 @@ class TestImplicitSolverSolveWRMS:
 
 
 # ===================================================================
-# 5. Top-level solve_ivp_ns with per-DOF tolerances
+# 5. Top-level solve_nivp with per-DOF tolerances
 # ===================================================================
 
 class TestSolveIvpNsVectorTol:
-    """Verify the full solve_ivp_ns pipeline with vector tolerances."""
+    """Verify the full solve_nivp pipeline with vector tolerances."""
 
     def test_per_dof_atol_rtol(self):
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
         y0 = np.array([1.0, 1.0])
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_2d,
             t_span=(0.0, 0.1),
             y0=y0,
@@ -276,10 +276,10 @@ class TestSolveIvpNsVectorTol:
 
     def test_nl_atol_nl_rtol(self):
         """Forward nl_atol / nl_rtol to the nonlinear solver."""
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
         y0 = np.array([1.0, 1.0])
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_2d,
             t_span=(0.0, 0.1),
             y0=y0,
@@ -297,10 +297,10 @@ class TestSolveIvpNsVectorTol:
 
     def test_scalar_backward_compat(self):
         """Scalar tolerances still work identically to before."""
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
         y0 = np.array([1.0])
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_decay,
             t_span=(0.0, 1.0),
             y0=y0,
@@ -316,12 +316,12 @@ class TestSolveIvpNsVectorTol:
 
     def test_per_slice_tol(self):
         """Per-slice tolerances expand correctly through the pipeline."""
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
         y0 = np.array([1.0, 1.0, 1.0])
         slices = [slice(0, 1), slice(1, 3)]
 
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=lambda t, y: -y,
             t_span=(0.0, 0.5),
             y0=y0,
@@ -338,10 +338,10 @@ class TestSolveIvpNsVectorTol:
 
     def test_adaptive_opts_vector_override(self):
         """Vector atol/rtol passed through adaptive_opts are honoured."""
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
         y0 = np.array([1.0, 1.0])
-        t, y, h, fk, info = solve_ivp_ns(
+        t, y, h, fk, info = solve_nivp(
             fun=_rhs_2d,
             t_span=(0.0, 0.05),
             y0=y0,

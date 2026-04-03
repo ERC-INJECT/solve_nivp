@@ -4,7 +4,7 @@ Covers:
 1. CompositeContactProjection standalone — project, tangent_cone, disjoint
    validation, active-set delegation, batch.
 2. build_impulse_contact with constraints= — composite creation, type check,
-   solve_ivp_ns integration with a coupled DAE + contact problem.
+   solve_nivp integration with a coupled DAE + contact problem.
 """
 
 import numpy as np
@@ -151,6 +151,32 @@ class TestCompositeProjectionStandalone:
         soc_block = D_arr[4:6, 4:6]
         assert not np.allclose(soc_block, np.eye(2)), \
             "Boundary SOC must have non-trivial Jacobian"
+
+    def test_soc_batch_tangent_keeps_active_apex_as_identity(self):
+        """The batch SOC fast-path must match the scalar apex classification.
+
+        At the cone apex ``(s, w) = (0, 0)`` the exact projector treats the
+        point as interior, so the Clarke selection is the identity.  This is a
+        regression test for the vectorized ``n > 64`` path used by large
+        contact systems.
+        """
+        n_blocks = 40  # 80 DOFs -> forces the vectorized batch tangent path
+        blocks = [(2 * k, [2 * k + 1]) for k in range(n_blocks)]
+        soc = MuScaledSOCProjection(
+            blocks=blocks,
+            get_mu=lambda y: 0.3,
+            gap_func=lambda y, t: np.zeros(n_blocks),
+            zero_inactive=True,
+        )
+
+        z = np.zeros(2 * n_blocks)
+        D = soc.tangent_cone(z, z, t=0.0)
+        D_arr = D.toarray() if sp.issparse(D) else np.asarray(D)
+
+        np.testing.assert_allclose(
+            D_arr, np.eye(2 * n_blocks), atol=1e-14,
+            err_msg="Active apex must keep the identity tangent in batch mode",
+        )
 
     def test_tangent_cone_formula_D_alg_plus_D_soc_minus_I(self):
         """Verify D_comp = D_alg + D_soc - I explicitly."""
@@ -305,6 +331,31 @@ class TestBuildImpulseContactConstraints:
         assert isinstance(cs.projection.soc_projection,
                           MuScaledSOCProjection)
 
+    def test_gap_tol_propagated_to_composite_soc_projection(self):
+        """gap_tol reaches the SOC sub-projection inside the composite."""
+        n_phys = 4
+        M = np.diag([1.0, 1.0, 0.0, 0.0])
+        y0 = np.zeros(n_phys)
+        contacts = [dict(vel_normal_idx=0, vel_tangential_idx=[1], mu=0.3)]
+        constraints = [
+            dict(
+                g=lambda y: 2.0 * y,
+                dg_dy=lambda y: 2.0 * np.eye(2),
+                y_slice=slice(0, 2),
+                q_slice=slice(2, 4),
+            ),
+        ]
+        cs = build_impulse_contact(
+            M,
+            lambda t, y: np.zeros(n_phys),
+            y0,
+            contacts,
+            gap_func=lambda y, t: np.array([y[0]]),
+            constraints=constraints,
+            gap_tol=1.0e-9,
+        )
+        assert cs.projection.soc_projection.gap_tol == pytest.approx(1.0e-9)
+
     def test_augmented_dimensions(self):
         """Augmented system has correct dimensions."""
         n_phys = 4
@@ -387,7 +438,7 @@ class TestBuildImpulseContactConstraints:
 
 
 # ======================================================================
-# Test class: solve_ivp_ns integration with composite
+# Test class: solve_nivp integration with composite
 # ======================================================================
 
 class TestSolveWithComposite:
@@ -398,9 +449,9 @@ class TestSolveWithComposite:
 
         State: [q_x, q_y, v_x, v_y, w] where w = C*q_y (algebraic).
         q_y = vertical position. Contact: gap = q_y, normal = v_y.
-        This ensures the composite projection works through solve_ivp_ns.
+        This ensures the composite projection works through solve_nivp.
         """
-        from solve_nivp import solve_ivp_ns
+        from solve_nivp import solve_nivp
 
         # Physical system: [q_x, q_y, v_x, v_y, w]
         #   dq/dt = v, dv_x/dt = 0, dv_y/dt = -g, 0 = w - C*q_y
@@ -439,7 +490,7 @@ class TestSolveWithComposite:
 
         t_span = (0.0, 0.3)
 
-        sol_t, sol_y, *_ = solve_ivp_ns(
+        sol_t, sol_y, *_ = solve_nivp(
             fun=cs.rhs, y0=cs.y0, A=cs.A, t_span=t_span,
             projection=cs.projection,
             component_slices=cs.component_slices,
