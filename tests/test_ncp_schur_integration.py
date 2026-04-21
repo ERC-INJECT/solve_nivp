@@ -49,7 +49,8 @@ def test_block_assembly_returns_correct_shapes():
     blocks = bs.assemble_blocks(y_aug, t=0.01, h=0.01, y_prev=y_aug)
 
     assert blocks["H"].shape == (2, 2)
-    assert blocks["J"].shape == (1, 2)
+    assert blocks["B_top"].shape == (2, 1)
+    assert blocks["B_bot"].shape == (1, 2)
     assert blocks["C"].shape == (1, 1)
     assert blocks["g"].shape == (2,)
     assert blocks["h_c"].shape == (1,)

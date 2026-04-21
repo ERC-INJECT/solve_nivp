@@ -1207,12 +1207,22 @@ class NCPBlockSystem:
         self._jac_aug = cs.rhs_jac
 
     def assemble_blocks(self, y, t, h, y_prev):
-        """Return H, J, C, g, h_c, precond_diag for the saddle-point system.
+        """Return the four independent blocks of the Newton Jacobian.
+
+        The Newton system for the augmented implicit equation is::
+
+            [H,      B_top] [Δu]   [g]
+            [B_bot,    C  ] [Δλ] = [h_c]
+
+        where ``B_top`` and ``B_bot`` are **not** transposes of each other
+        because the NCP normal constraint is position-level (gap) while the
+        reaction force acts on the velocity DOFs.
 
         Returns
         -------
         dict
-            Keys ``H``, ``J``, ``C``, ``g``, ``h_c``, ``precond_diag``.
+            Keys ``H``, ``B_top``, ``B_bot``, ``C``, ``g``, ``h_c``,
+            ``precond_diag``.
         """
         n_p = self.n_phys
         n_r = self.n_react
@@ -1222,41 +1232,32 @@ class NCPBlockSystem:
             jac_full = jac_full.toarray()
         jac_full = np.asarray(jac_full, dtype=float)
 
-        J_rhs_tl = jac_full[:n_p, :n_p]
         A_dense = (self._A_phys.toarray() if sp.issparse(self._A_phys)
                    else np.asarray(self._A_phys, dtype=float))
         A_over_h = A_dense / h
 
-        # Iteration matrix: physical block
-        H = A_over_h - J_rhs_tl
-
-        # Constraint Jacobian (bottom-left of RHS Jacobian, negated)
-        J = -jac_full[n_p:, :n_p]
-
-        # NCP compliance (bottom-right, negated)
+        H = A_over_h - jac_full[:n_p, :n_p]
+        B_top = -jac_full[:n_p, n_p:]
+        B_bot = -jac_full[n_p:, :n_p]
         C = -jac_full[n_p:, n_p:]
 
         rhs_val = self._cs.rhs(t, y, y_prev, None, h)
-
-        # Momentum residual
         F = A_over_h @ (y[:n_p] - y_prev[:n_p]) - rhs_val[:n_p]
         g = -F
-
-        # Contact residual (NCP rows)
         h_c = rhs_val[n_p:]
 
-        # Diagonal Macklin preconditioner: approximate J H^{-1} J^T
         H_diag = np.diag(H)
         safe_diag = np.where(np.abs(H_diag) > 1e-30, H_diag, 1.0)
         precond_diag = np.array([
-            float(np.sum(J[i, :] ** 2 / safe_diag))
+            float(np.sum(B_bot[i, :] ** 2 / safe_diag))
             for i in range(n_r)
         ])
         precond_diag = np.where(precond_diag > 1e-30, precond_diag, 1.0)
 
         return {
             "H": H,
-            "J": J,
+            "B_top": B_top,
+            "B_bot": B_bot,
             "C": C,
             "g": g,
             "h_c": h_c,
