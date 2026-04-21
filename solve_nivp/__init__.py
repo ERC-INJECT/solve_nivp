@@ -62,7 +62,7 @@ from .projections import (
   CompositeContactProjection,
 )
 from .nonlinear_solvers import ImplicitEquationSolver, UMFPACK_AVAILABLE, PETSC_AVAILABLE
-from .integrations import BackwardEuler, BackwardEulerSchur, Trapezoidal, ThetaMethod, CompositeMethod, EmbeddedBETR, SDIRK2, RadauIIA  # , BDFMethod
+from .integrations import BackwardEuler, BackwardEulerSchur, RadauIIASchur, Trapezoidal, ThetaMethod, CompositeMethod, EmbeddedBETR, SDIRK2, RadauIIA  # , BDFMethod
 from .block_system import SchurComplementSolver, BlockStructuredSystem
 from .ODESystem import ODESystem
 from .ODESolver import ODESolver
@@ -102,7 +102,7 @@ __all__ = [
   # Nonlinear solver
   'ImplicitEquationSolver',
   # Integrators
-  'BackwardEuler', 'BackwardEulerSchur', 'Trapezoidal', 'ThetaMethod', 'CompositeMethod', 'EmbeddedBETR', 'SDIRK2', 'RadauIIA',
+  'BackwardEuler', 'BackwardEulerSchur', 'RadauIIASchur', 'Trapezoidal', 'ThetaMethod', 'CompositeMethod', 'EmbeddedBETR', 'SDIRK2', 'RadauIIA',
   # Projections
   'Projection',
   'CoulombProjection', 'SignProjection', 'IdentityProjection',

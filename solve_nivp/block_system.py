@@ -258,3 +258,151 @@ class SchurComplementSolver:
             float(np.linalg.norm(blocks["h_c"])),
         )
         return y.copy(), err, False, self.maxiter
+
+    # ------------------------------------------------------------------
+    # Multi-stage coupled Newton (RadauIIA)
+    # ------------------------------------------------------------------
+
+    def solve_coupled(
+        self,
+        block_system: BlockStructuredSystem,
+        y0: np.ndarray,
+        t: float,
+        h: float,
+        y_prev: np.ndarray,
+        rk_A: np.ndarray,
+        rk_c: np.ndarray,
+        A_phys: np.ndarray,
+    ) -> Tuple[np.ndarray, float, bool, int]:
+        """Coupled Newton for multi-stage Radau IIA with Schur reduction.
+
+        Stacks all *s* stages into a single Newton system.  The velocity
+        block ``H_full`` carries Butcher cross-stage coupling; ``B_bot``
+        and ``C`` are block-diagonal (each stage's NCP depends only on
+        its own state).  ``B_top`` has off-diagonal blocks because the
+        physical RHS includes the contact-force coupling ``B·λ``.
+
+        Parameters
+        ----------
+        block_system : BlockStructuredSystem
+        y0 : (n_aug,)
+        t : float
+            Time at beginning of step.
+        h : float
+            Full step size.
+        y_prev : (n_aug,)
+        rk_A : (s, s)
+            Butcher A matrix.
+        rk_c : (s,)
+        A_phys : (n_phys, n_phys)
+            Physical mass matrix.
+
+        Returns
+        -------
+        Y_s, err, converged, iterations
+        """
+        s = rk_A.shape[0]
+        n_p = block_system.n_phys
+        n_r = block_system.n_react
+        n_aug = n_p + n_r
+        sn_p = s * n_p
+        sn_r = s * n_r
+
+        A_arr = self._to_dense(A_phys)
+        Z = np.tile(y0, s)
+
+        for iteration in range(1, self.maxiter + 1):
+            # -- Per-stage block assembly --
+            per_stage = []
+            f_phys = []
+            for i in range(s):
+                Y_i = Z[i * n_aug:(i + 1) * n_aug]
+                aii = rk_A[i, i]
+                stage_h = aii * h
+                t_i = t + rk_c[i] * h
+
+                bi = block_system.assemble_blocks(Y_i, t_i, stage_h, y_prev)
+                per_stage.append(bi)
+
+                A_over_aih = A_arr / stage_h
+                f_i = bi["g"] + A_over_aih @ (Y_i[:n_p] - y_prev[:n_p])
+                f_phys.append(f_i)
+
+            # -- Stacked residual --
+            g_full = np.empty(sn_p)
+            hc_full = np.empty(sn_r)
+            for i in range(s):
+                aii = rk_A[i, i]
+                g_i = per_stage[i]["g"].copy()
+                for j in range(s):
+                    if j != i:
+                        g_i += (rk_A[i, j] / aii) * f_phys[j]
+                g_full[i * n_p:(i + 1) * n_p] = g_i
+                hc_full[i * n_r:(i + 1) * n_r] = per_stage[i]["h_c"]
+
+            err = max(float(np.linalg.norm(g_full)),
+                      float(np.linalg.norm(hc_full)))
+            if err < self.tol:
+                Y_s = Z[(s - 1) * n_aug:s * n_aug]
+                return Y_s.copy(), err, True, iteration
+
+            # -- H_full: (s·n_p × s·n_p) with Butcher cross-stage coupling --
+            H_full = np.zeros((sn_p, sn_p))
+            for i in range(s):
+                aii = rk_A[i, i]
+                r0, r1 = i * n_p, (i + 1) * n_p
+                for j in range(s):
+                    c0, c1 = j * n_p, (j + 1) * n_p
+                    if i == j:
+                        H_full[r0:r1, c0:c1] = self._to_dense(per_stage[i]["H"])
+                    else:
+                        H_j = self._to_dense(per_stage[j]["H"])
+                        dfdu_j = A_arr / (rk_A[j, j] * h) - H_j
+                        H_full[r0:r1, c0:c1] = -(rk_A[i, j] / aii) * dfdu_j
+
+            # -- B_top_full: (s·n_p × s·n_r) — NOT block-diagonal --
+            Bt_full = np.zeros((sn_p, sn_r))
+            for i in range(s):
+                aii = rk_A[i, i]
+                r0, r1 = i * n_p, (i + 1) * n_p
+                for j in range(s):
+                    c0, c1 = j * n_r, (j + 1) * n_r
+                    if i == j:
+                        Bt_full[r0:r1, c0:c1] = self._to_dense(
+                            per_stage[i]["B_top"],
+                        )
+                    else:
+                        Bt_full[r0:r1, c0:c1] = (
+                            (rk_A[i, j] / aii)
+                            * self._to_dense(per_stage[j]["B_top"])
+                        )
+
+            # -- B_bot_diag, C_diag: block-diagonal --
+            Bb_diag = np.zeros((sn_r, sn_p))
+            C_diag = np.zeros((sn_r, sn_r))
+            for i in range(s):
+                Bb_diag[i * n_r:(i + 1) * n_r,
+                        i * n_p:(i + 1) * n_p] = self._to_dense(
+                    per_stage[i]["B_bot"],
+                )
+                C_diag[i * n_r:(i + 1) * n_r,
+                       i * n_r:(i + 1) * n_r] = self._to_dense(
+                    per_stage[i]["C"],
+                )
+
+            # -- Solve the stacked saddle-point system --
+            delta_u, delta_lam, info = self.solve_linear(
+                H_full, Bt_full, Bb_diag, C_diag, g_full, hc_full,
+            )
+
+            alpha = self.damped_step_fraction
+            for i in range(s):
+                Z[i * n_aug:i * n_aug + n_p] += (
+                    alpha * delta_u[i * n_p:(i + 1) * n_p]
+                )
+                Z[i * n_aug + n_p:(i + 1) * n_aug] += (
+                    alpha * delta_lam[i * n_r:(i + 1) * n_r]
+                )
+
+        Y_s = Z[(s - 1) * n_aug:s * n_aug]
+        return Y_s.copy(), err, False, self.maxiter

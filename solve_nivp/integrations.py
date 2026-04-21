@@ -486,6 +486,92 @@ class BackwardEulerSchur(IntegrationMethod):
         return y_new, Fk, err, converged, iters
 
 
+class RadauIIASchur(IntegrationMethod):
+    """RadauIIA with coupled Newton via Schur-complement reduction.
+
+    All *s* stages are solved simultaneously.  The velocity block
+    ``H_full`` carries Butcher cross-stage coupling; the contact blocks
+    ``B_bot``, ``C`` are block-diagonal.  ``B_top`` has off-diagonal
+    blocks from the ``B·λ`` coupling in the physical RHS.
+
+    For ``stages=1`` this delegates to :class:`BackwardEulerSchur`.
+
+    Parameters
+    ----------
+    stages : {1, 2, 3}
+    A : ndarray or sparse or None
+        Augmented mass matrix (n_aug × n_aug).
+    schur_solver_opts : dict
+        Forwarded to ``SchurComplementSolver``.
+    """
+
+    def __init__(self, stages=2, A=None, schur_solver_opts=None):
+        if stages not in (1, 2, 3):
+            raise ValueError(f"stages must be 1, 2, or 3; got {stages}")
+        self.stages = int(stages)
+        self.A = A
+        self._schur_opts = schur_solver_opts or {}
+        self.has_embedded_error = False
+
+        _sq6 = math.sqrt(6.0)
+        if stages == 1:
+            self._rk_A = np.array([[1.0]])
+            self._rk_c = np.array([1.0])
+            self.order = 1
+        elif stages == 2:
+            self._rk_A = np.array([
+                [5.0 / 12.0, -1.0 / 12.0],
+                [3.0 / 4.0,   1.0 / 4.0],
+            ])
+            self._rk_c = np.array([1.0 / 3.0, 1.0])
+            self.order = 3
+        else:
+            self._rk_A = np.array([
+                [(88 - 7 * _sq6) / 360,
+                 (296 - 169 * _sq6) / 1800,
+                 (-2 + 3 * _sq6) / 225],
+                [(296 + 169 * _sq6) / 1800,
+                 (88 + 7 * _sq6) / 360,
+                 (-2 - 3 * _sq6) / 225],
+                [(16 - _sq6) / 36,
+                 (16 + _sq6) / 36,
+                 1.0 / 9.0],
+            ])
+            self._rk_c = np.array(
+                [(4 - _sq6) / 10, (4 + _sq6) / 10, 1.0],
+            )
+            self.order = 5
+
+    def step(self, fun, t, y, h):
+        from .block_system import SchurComplementSolver
+
+        s = self.stages
+        solver = SchurComplementSolver(**self._schur_opts)
+
+        if s == 1:
+            y_new, err, ok, iters = solver.solve(fun, y, t + h, h, y)
+            return y_new, None, err, ok, iters
+
+        A_phys = getattr(fun, '_A_phys', None)
+        if A_phys is None:
+            n_p = fun.n_phys
+            A_aug = self.A
+            if A_aug is not None:
+                A_phys = (A_aug.toarray()[:n_p, :n_p]
+                          if sp.issparse(A_aug)
+                          else np.asarray(A_aug)[:n_p, :n_p])
+            else:
+                A_phys = np.eye(n_p)
+
+        y_new, err, ok, iters = solver.solve_coupled(
+            fun, y, t, h, y,
+            rk_A=self._rk_A,
+            rk_c=self._rk_c,
+            A_phys=A_phys,
+        )
+        return y_new, None, err, ok, iters
+
+
 class AlgebraicBackwardEuler(IntegrationMethod):
     """Backward Euler variant supporting a subset of algebraic (index-1) constraints.
 

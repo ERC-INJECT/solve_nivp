@@ -209,3 +209,67 @@ def test_backward_euler_schur_free_flight_trajectory():
     assert np.all(positions >= -1e-8), (
         f"Floor penetration detected: min gap = {positions.min():.2e}"
     )
+
+
+# ── RadauIIASchur tests ──────────────────────────────────────────────
+
+
+def test_radau_coupled_schur_spring_impact():
+    """RadauIIA s=2 coupled Newton with Schur solver on spring-loaded impact."""
+    A, rhs, rhs_jac, y0, contacts, gap_func = _spring_impact_setup()
+    bs = build_ncp_contact_blocked(
+        A=A, rhs_smooth=rhs, y0=y0, contacts=contacts,
+        gap_func=gap_func, rhs_jac=rhs_jac,
+    )
+    from solve_nivp.integrations import RadauIIASchur
+
+    integrator = RadauIIASchur(
+        stages=2,
+        A=bs._cs.A,
+        schur_solver_opts={"maxiter": 30, "tol": 1e-8},
+    )
+    n_p = bs.n_phys
+    n_aug = n_p + bs.n_react
+    y_cur = np.zeros(n_aug)
+    y_cur[:n_p] = y0
+
+    h = 0.005
+    t = 0.0
+    n_steps = 50
+    for _ in range(n_steps):
+        y_new, _, err, success, _ = integrator.step(bs, t, y_cur, h)
+        assert success, f"RadauIIA+Schur failed at t={t:.4f}, err={err}"
+        t += h
+        y_cur = y_new
+
+    assert y_cur[1] >= -1e-8, "Gap penetration"
+
+
+def test_radau_s1_matches_backward_euler_schur():
+    """RadauIIA s=1 (= Backward Euler) matches BackwardEulerSchur exactly."""
+    A, rhs, rhs_jac, y0, contacts, gap_func = _spring_impact_setup()
+    bs = build_ncp_contact_blocked(
+        A=A, rhs_smooth=rhs, y0=y0, contacts=contacts,
+        gap_func=gap_func, rhs_jac=rhs_jac,
+    )
+    from solve_nivp.integrations import RadauIIASchur, BackwardEulerSchur
+
+    opts = {"maxiter": 30, "tol": 1e-10}
+    n_p = bs.n_phys
+    n_aug = n_p + bs.n_react
+    y_init = np.zeros(n_aug)
+    y_init[:n_p] = y0
+    h = 0.005
+
+    y_be, _, _, ok_be, _ = BackwardEulerSchur(
+        A=bs._cs.A, schur_solver_opts=opts,
+    ).step(bs, 0.0, y_init, h)
+    assert ok_be
+
+    y_r1, _, _, ok_r1, _ = RadauIIASchur(
+        stages=1, A=bs._cs.A, schur_solver_opts=opts,
+    ).step(bs, 0.0, y_init, h)
+    assert ok_r1
+
+    assert_allclose(y_r1, y_be, atol=1e-12,
+                    err_msg="RadauIIA s=1 ≠ Backward Euler")
