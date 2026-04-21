@@ -1,5 +1,6 @@
-import numpy as np
+import inspect
 import math
+import numpy as np
 from abc import ABC, abstractmethod
 import scipy.sparse as sp
 from .nonlinear_solvers import ImplicitEquationSolver  # Relative import for a solver class
@@ -34,6 +35,35 @@ class IntegrationMethod(ABC):
         pass
 
 
+def _call_projection_with_context(
+    projection,
+    current_state,
+    candidate,
+    *,
+    rhok=None,
+    t=None,
+    Fk_val=None,
+    prev_state=None,
+    step_size=None,
+):
+    """Call ``projection.project`` while passing only supported context."""
+    params = inspect.signature(projection.project).parameters
+    kwargs = {}
+    if "rhok" in params:
+        kwargs["rhok"] = rhok
+    elif "rho" in params:
+        kwargs["rho"] = rhok
+    if "t" in params:
+        kwargs["t"] = t
+    if "Fk_val" in params:
+        kwargs["Fk_val"] = Fk_val
+    if "prev_state" in params:
+        kwargs["prev_state"] = prev_state
+    if "step_size" in params:
+        kwargs["step_size"] = step_size
+    return projection.project(current_state, candidate, **kwargs)
+
+
 class BackwardEuler(IntegrationMethod):
     """
     Implements the Backward Euler implicit integration method.
@@ -53,7 +83,15 @@ class BackwardEuler(IntegrationMethod):
     # Keys: ('dense'| 'csr', n)
     _ID_CACHE = {}
 
-    def __init__(self, solver=None, A=None, pass_prev_state=False, pass_step_size=False):
+    def __init__(
+        self,
+        solver=None,
+        A=None,
+        pass_prev_state=False,
+        pass_step_size=False,
+        post_step_projection=None,
+        post_step_rhok=1.0,
+    ):
         """
         Initialize a Backward Euler integration method.
 
@@ -77,6 +115,8 @@ class BackwardEuler(IntegrationMethod):
         self.use_identity = (A is None)
         self.pass_prev_state = pass_prev_state
         self.pass_step_size = pass_step_size
+        self.post_step_projection = post_step_projection
+        self.post_step_rhok = post_step_rhok
         # Method order (for adaptive controllers)
         self.order = 1
         # Per-instance caches for bound call wrappers to avoid repeated try/except dispatch
@@ -226,6 +266,92 @@ class BackwardEuler(IntegrationMethod):
                 self._ID_CACHE[key] = np.eye(n)
             return self._ID_CACHE[key]
 
+    def _refresh_solver_step_cache(self, h):
+        """Swap / invalidate cached linear solver state when the step size changes."""
+        _prev_h = getattr(self, '_cached_step_h', None)
+        if _prev_h is not None and _prev_h != h:
+            _cache = getattr(self, '_lu_h_cache', None)
+            if _cache is None:
+                self._lu_h_cache = _cache = {}
+            _cache[_prev_h] = (
+                self.solver._lu,
+                getattr(self.solver, '_lu_shape', None),
+                getattr(self.solver, '_lu_pattern', None),
+                getattr(self.solver, '_lu_use_count', 0),
+                getattr(self.solver, '_J_cross_call', None),
+            )
+            if len(_cache) > 2:
+                _oldest = next(iter(_cache))
+                del _cache[_oldest]
+
+            _cached_state = _cache.get(h)
+            if _cached_state is not None:
+                (self.solver._lu,
+                 self.solver._lu_shape,
+                 self.solver._lu_pattern,
+                 self.solver._lu_use_count,
+                 self.solver._J_cross_call) = _cached_state
+            else:
+                self.solver._lu = None
+                self.solver._lu_shape = None
+                if hasattr(self.solver, '_J_cross_call'):
+                    self.solver._J_cross_call = None
+            self.solver._petsc_needs_matrix_update = True
+        self._cached_step_h = h
+
+    def _set_solver_lam_from_step(self, A_local, h, diag_factor=1.0):
+        """Equilibrate the natural-map parameter with the implicit diagonal."""
+        try:
+            if getattr(self.solver, 'method', None) != 'semismooth_newton':
+                return
+            if getattr(self.solver, '_is_identity_proj', False):
+                return
+            if getattr(self.solver, '_is_rho_independent', False):
+                return
+
+            h_eff = float(h) / float(diag_factor)
+            if not np.isfinite(h_eff) or h_eff <= 0.0:
+                return
+
+            A_diag = (A_local.diagonal() if sp.issparse(A_local)
+                      else np.diag(np.asarray(A_local)))
+            lam_vec = np.ones_like(np.asarray(A_diag, dtype=float))
+            phys_mask = np.abs(A_diag) > 0.0
+            lam_vec[phys_mask] = h_eff / A_diag[phys_mask]
+            self.solver.lam = lam_vec
+        except Exception:
+            pass
+
+    def _apply_post_step_projection(
+        self, prev_state, candidate, *, t_new, h, Fk_val=None, residual_eval=None
+    ):
+        """Apply an optional end-of-step projection stage."""
+        projection = getattr(self, "post_step_projection", None)
+        if projection is None:
+            return candidate, Fk_val, None
+
+        projected = _call_projection_with_context(
+            projection,
+            prev_state,
+            candidate,
+            rhok=getattr(self, "post_step_rhok", 1.0),
+            t=t_new,
+            Fk_val=Fk_val,
+            prev_state=prev_state,
+            step_size=h,
+        )
+        projected = np.asarray(projected, dtype=float).reshape(candidate.shape)
+
+        projected_fk = Fk_val
+        if residual_eval is not None:
+            try:
+                projected_fk = residual_eval(projected)
+            except Exception:
+                projected_fk = Fk_val
+
+        proj_delta = projected - candidate
+        return projected, projected_fk, proj_delta
+
     def step(self, fun, t, y, h):
         """Perform one implicit Backward Euler step.
 
@@ -259,52 +385,8 @@ class BackwardEuler(IntegrationMethod):
             Number of nonlinear iterations executed.
         """
         A_local = self._get_A(len(y))
-
-        # When h changes the iteration matrix A/h − J changes, so the
-        # cached SPLU from a different step size cannot be reused directly.
-        # However, Richardson extrapolation *alternates* between h and h/2
-        # every adaptive step.  Instead of discarding the factorisation we
-        # save it under the old step size and restore a cached one (if any)
-        # for the new step size.  This avoids re-factorising a 33k × 33k
-        # system twice per adaptive step when the Jacobian hasn't changed.
-        _prev_h = getattr(self, '_cached_step_h', None)
-        if _prev_h is not None and _prev_h != h:
-            # ---- save current LU state under the old step size ----
-            _cache = getattr(self, '_lu_h_cache', None)
-            if _cache is None:
-                self._lu_h_cache = _cache = {}
-            _cache[_prev_h] = (
-                self.solver._lu,
-                getattr(self.solver, '_lu_shape', None),
-                getattr(self.solver, '_lu_pattern', None),
-                getattr(self.solver, '_lu_use_count', 0),
-                getattr(self.solver, '_J_cross_call', None),
-            )
-            # keep at most 2 entries (full-step + half-step)
-            if len(_cache) > 2:
-                _oldest = next(iter(_cache))
-                del _cache[_oldest]
-
-            # ---- restore cached state for the new step size ----
-            _cached_state = _cache.get(h)
-            if _cached_state is not None:
-                (self.solver._lu,
-                 self.solver._lu_shape,
-                 self.solver._lu_pattern,
-                 self.solver._lu_use_count,
-                 self.solver._J_cross_call) = _cached_state
-            else:
-                self.solver._lu = None
-                self.solver._lu_shape = None
-                if hasattr(self.solver, '_J_cross_call'):
-                    self.solver._J_cross_call = None
-            # PETSc/MUMPS factorisation cannot be swapped like SPLU;
-            # force a refactorisation on the next linear solve.
-            self.solver._petsc_needs_matrix_update = True
-        if _prev_h is None:
-            # First call ever — no state to save/restore
-            pass
-        self._cached_step_h = h
+        self._refresh_solver_step_cache(h)
+        self._set_solver_lam_from_step(A_local, h)
 
         # Helper to flexibly call fun with optional Fk_val
         prev_state_arg = y if self.pass_prev_state else None
@@ -345,7 +427,63 @@ class BackwardEuler(IntegrationMethod):
         except Exception:
             pass
 
-        return self.solver.solve(implicit_eq, y)
+        y_new, Fk_new, err_est, success, iterations = self.solver.solve(implicit_eq, y)
+        if success:
+            y_new, Fk_new, proj_delta = self._apply_post_step_projection(
+                y,
+                y_new,
+                t_new=t + h,
+                h=h,
+                Fk_val=Fk_new,
+                residual_eval=implicit_eq,
+            )
+            if proj_delta is not None:
+                try:
+                    self.last_post_step_delta = np.asarray(proj_delta, dtype=float)
+                except Exception:
+                    self.last_post_step_delta = None
+            if Fk_new is not None:
+                try:
+                    err_est = float(np.linalg.norm(np.asarray(Fk_new).ravel(), ord=np.inf))
+                except Exception:
+                    pass
+        return y_new, Fk_new, err_est, success, iterations
+
+
+class BackwardEulerSchur(IntegrationMethod):
+    """Backward Euler with Schur-complement Newton solver.
+
+    Uses the Macklin (2019) compliance-formulation: the 2x2 block system
+    [H, -J^T; J, C] is reduced via Schur complement to an n_react-sized
+    PCR solve, then back-substituted for the velocity update.
+
+    The ``fun`` argument to ``step()`` must be a ``BlockStructuredSystem``
+    (i.e. an ``NCPBlockSystem`` from ``build_ncp_contact_blocked``),
+    not a plain callable.
+
+    Parameters
+    ----------
+    A : ndarray or sparse or None
+        Mass / descriptor matrix.
+    schur_solver_opts : dict
+        Keyword arguments forwarded to ``SchurComplementSolver``.
+    """
+
+    def __init__(self, A=None, schur_solver_opts=None):
+        self.A = A
+        self.order = 1
+        self.has_embedded_error = False
+        self._schur_opts = schur_solver_opts or {}
+
+    def step(self, fun, t, y, h):
+        from .block_system import SchurComplementSolver
+
+        solver = SchurComplementSolver(**self._schur_opts)
+        y_new, err, converged, iters = solver.solve(
+            fun, y, t + h, h, y,
+        )
+        Fk = None
+        return y_new, Fk, err, converged, iters
 
 
 class AlgebraicBackwardEuler(IntegrationMethod):
@@ -522,6 +660,8 @@ class Trapezoidal(BackwardEuler):
         :meth:`BackwardEuler.step`.
         """
         A_local = self._get_A(len(y))
+        self._refresh_solver_step_cache(h)
+        self._set_solver_lam_from_step(A_local, h)
 
         prev_state_arg = y if self.pass_prev_state else None
         step_size_arg = h if self.pass_step_size else None
@@ -603,6 +743,8 @@ class ThetaMethod(BackwardEuler):
         Returns: 5-tuple as in :meth:`BackwardEuler.step`.
         """
         A_local = self._get_A(len(y))
+        self._refresh_solver_step_cache(h)
+        self._set_solver_lam_from_step(A_local, h)
 
         prev_state_arg = y if self.pass_prev_state else None
         step_size_arg = h if self.pass_step_size else None
@@ -715,9 +857,13 @@ class CompositeMethod(IntegrationMethod):
                 fun, t + h, y_new, getattr(self.backward_euler.solver, 'last_Fk_val', None)
             )
 
+        A_stage2 = self.backward_euler._get_A(len(y))
+        self.backward_euler._refresh_solver_step_cache(h)
+        self.backward_euler._set_solver_lam_from_step(A_stage2, h, diag_factor=3.0)
+
         rhs_jac = getattr(self.backward_euler.solver, 'rhs_jacobian', None)
         if callable(rhs_jac) and getattr(self.backward_euler.solver, 'method', None) != 'VI':
-            A_over_h = self.backward_euler._get_A(len(y)) / h
+            A_over_h = A_stage2 / h
 
             def jac_eq_second(y_new, _Aoh=A_over_h, _t=t, _h=h, _rhs_jac=rhs_jac, _solver=self.backward_euler.solver):
                 fk_val = getattr(_solver, 'last_Fk_val', None)
@@ -969,6 +1115,20 @@ class SDIRK2(BackwardEuler):
         # y_{n+1} = Y2  (already the second-order solution)
         y_new = Y2
 
+        y_new, Fk2, proj_delta = self._apply_post_step_projection(
+            y,
+            y_new,
+            t_new=t + h,
+            h=h,
+            Fk_val=Fk2,
+            residual_eval=implicit_s2,
+        )
+        if proj_delta is not None:
+            try:
+                self.last_post_step_delta = np.asarray(proj_delta, dtype=float)
+            except Exception:
+                self.last_post_step_delta = None
+
         # Embedded error estimate (mass-matrix agnostic, uses stage values):
         #   err = h γ (K2 − K1)
         #       = (Y2 − y_shift) − (Y1 − y)
@@ -977,6 +1137,671 @@ class SDIRK2(BackwardEuler):
 
         total_iters = it1 + it2
         return y_new, Fk2, err_embed, True, total_iters
+
+
+class RadauIIA(BackwardEuler):
+    r"""s-stage Radau IIA collocation method — stiffly accurate, L-stable, order 2s-1.
+
+    Radau IIA methods are collocation schemes at shifted Gauss–Legendre nodes that
+    include the right endpoint (``c_s = 1``).  Their key properties for stiff and
+    nonsmooth dynamics are:
+
+    * **L-stability** — ``|R(∞)| = 0``, spurious modes are annihilated in one step.
+    * **Stiff accuracy** — ``a_{s,j} = b_j`` for all j, so the last stage IS the
+      step output (``y_{n+1} = Y_s``); no additional combination is needed.
+    * **Order 2s-1** — the highest order achievable with s stages for a one-step method.
+
+    +-------+-------+---------------------------------------------------+
+    | stages | order | Notes                                             |
+    +=======+=======+===================================================+
+    | 1      | 1     | Equivalent to Backward Euler (delegated directly) |
+    +-------+-------+---------------------------------------------------+
+    | 2      | 3     | Preferred for contact/impact problems             |
+    +-------+-------+---------------------------------------------------+
+    | 3      | 5     | High accuracy in smooth regions                   |
+    +-------+-------+---------------------------------------------------+
+
+    Multi-stage solve via waveform relaxation
+    ------------------------------------------
+    For s ≥ 2 the stage equations are **fully coupled** (the Butcher matrix A is
+    not lower-triangular).  The implementation uses *waveform relaxation* (block
+    Gauss–Seidel on the stage index): stage i is solved as a Backward-Euler-like
+    system::
+
+        A_M (Y_i − y) / (a_{ii} h) − f(t + c_i h, Y_i) = C_i
+
+    where ``C_i = Σ_{j≠i} (a_{ij}/a_{ii}) · f(t + c_j h, Y_j)`` is the explicit
+    coupling contribution from all other stages.  Typically 1–3 outer sweeps
+    suffice for moderate stiffness; for purely smooth problems a single sweep
+    (``wf_maxiter=1``) already achieves full order.
+
+    The constant ``C_i`` shifts only the RHS by an additive term — it does **not**
+    change the Jacobian structure — so the same solver/projection infrastructure
+    (including semismooth Newton with contact projections) is reused unchanged
+    for every stage.
+
+    LU factorisation reuse
+    ----------------------
+    Within a single stage, the iteration matrix ``A_M/(a_{ii}h) − ∂f/∂Y`` is
+    fixed.  The existing cross-call LU cache in :class:`ImplicitEquationSolver`
+    reuses the factorisation across Newton iterations of the same stage, and
+    across waveform-relaxation outer sweeps when ``h`` is unchanged.  Separate
+    per-stage-step-size caches are maintained so that the LU for stage 1
+    (step ``a_{11}h``) and stage 2 (step ``a_{22}h``) are swapped rather than
+    recomputed when the solver alternates between stages.
+
+    Velocity projection (Breuling Stage 2)
+    ----------------------------------------
+    Pass a ``post_step_projection`` to enforce Newton's impact law after the
+    RK stage system is solved.  The projection receives ``(y_prev, Y_s)`` and
+    returns the corrected step output.  This corresponds exactly to Stage 2 of
+    the *nonsmooth projected Radau IIA* described in Breuling (2024), Chapters 4–5.
+
+    Embedded error estimate
+    -----------------------
+    For ``s=2`` the order-3 result ``Y_2`` is compared with the linear
+    extrapolation of stage 1 to the end of the interval (a free first-order
+    estimate)::
+
+        err = Σ_k e_k · (Y_k − y),   e = e_s − b̂ᵀ A⁻¹,  b̂ = [1, 0, …]
+            ≡ 0.5·Y_2 − 1.5·Y_1 + y   (s=2 Radau IIA)
+
+    For ``s=3`` a quadratic extrapolation through stages 1 and 2 serves as the
+    lower-order companion.  Both estimates are mass-matrix agnostic (no M⁻¹
+    required) and are returned as element-wise vectors compatible with the
+    adaptive step-size controller.
+
+    Parameters
+    ----------
+    stages : {1, 2, 3}, default 2
+        Number of collocation stages.  ``stages=1`` is equivalent to
+        :class:`BackwardEuler` and is delegated directly.
+    wf_maxiter : int, default 3
+        Maximum outer waveform-relaxation sweeps.  1 = single Gauss–Seidel
+        pass; sufficient for smooth problems.  Increase to 4–6 near impact
+        events where stage coupling is strong.
+    wf_tol : float, default 1e-12
+        Outer-loop early-exit tolerance.  Iteration stops when the maximum
+        relative change in any stage value falls below this threshold.
+    solver : :class:`~solve_nivp.ImplicitEquationSolver`, optional
+    A : ndarray or sparse matrix, optional
+        Mass / descriptor matrix; identity when *None*.
+    pass_prev_state, pass_step_size : bool
+        Forwarded to :class:`BackwardEuler`.
+    post_step_projection : callable or None
+        Velocity projection (Breuling Stage 2).  Uses the standard
+        :func:`_call_projection_with_context` interface.
+    """
+
+    def __init__(
+        self,
+        stages: int = 2,
+        solver=None,
+        A=None,
+        wf_maxiter: int = 3,
+        wf_tol: float = 1e-12,
+        use_coupled_newton: bool = True,
+        **kwargs,
+    ):
+        if stages not in (1, 2, 3):
+            raise ValueError(f"RadauIIA: stages must be 1, 2, or 3; got {stages!r}")
+        super().__init__(solver=solver, A=A, **kwargs)
+        self.stages = int(stages)
+        self.wf_maxiter = max(1, int(wf_maxiter))
+        self.wf_tol = float(wf_tol)
+        self.use_coupled_newton = bool(use_coupled_newton)
+
+        # ── Butcher tableaux (Hairer & Wanner, Solving ODEs II, §II.7) ────────
+        _sq6 = math.sqrt(6.0)
+        if stages == 1:
+            self._rk_A = np.array([[1.0]])
+            self._rk_b = np.array([1.0])
+            self._rk_c = np.array([1.0])
+            self.order = 1
+        elif stages == 2:
+            # Table II.7.1 — order 3
+            self._rk_A = np.array(
+                [[ 5.0 / 12.0, -1.0 / 12.0],
+                 [ 3.0 /  4.0,  1.0 /  4.0]],
+                dtype=float,
+            )
+            self._rk_b = np.array([3.0 / 4.0, 1.0 / 4.0])
+            self._rk_c = np.array([1.0 / 3.0, 1.0])
+            self.order = 3
+        else:  # stages == 3
+            # Table II.7.2 — order 5
+            self._rk_A = np.array(
+                [
+                    [(88 -   7*_sq6) / 360,  (296 - 169*_sq6) / 1800,  (-2 + 3*_sq6) / 225],
+                    [(296 + 169*_sq6) / 1800, (88 +   7*_sq6) / 360,   (-2 - 3*_sq6) / 225],
+                    [(16 -     _sq6) /  36,  (16 +     _sq6) /  36,     1.0 / 9.0          ],
+                ],
+                dtype=float,
+            )
+            self._rk_b = np.array(
+                [(16 - _sq6) / 36, (16 + _sq6) / 36, 1.0 / 9.0]
+            )
+            self._rk_c = np.array([(4 - _sq6) / 10, (4 + _sq6) / 10, 1.0])
+            self.order = 5
+
+        # Stiff accuracy: a_{s,j} = b_j (guaranteed for Radau IIA)
+        # → y_{n+1} = Y_s, no extra combination step required.
+        #
+        # Embedded error strategy (stage-count dependent):
+        #   s=2: Use an O(h²) embedded estimate from the first-order companion
+        #        b̂=[1,0].  The adaptive controller uses exponent 1/(q+1)=1/2 via
+        #        ``embedded_order=1``, giving proper step-size calibration.
+        #   s=3: Fall back to Richardson extrapolation (step-doubling).  The
+        #        b̂=[1,0,0] companion has a larger error constant than the s=2
+        #        analogue, making the embedded step inefficient.  Richardson gives
+        #        an O(h^6) estimate correctly calibrated for the p=5 exponent
+        #        (1/6), yielding ~4–10× larger steps for smooth problems.
+        self.has_embedded_error = (stages == 2)
+
+        # ── Embedded error estimate coefficients (mass-matrix agnostic) ───────
+        # For s=2: companion b̂=[1,0] — mass-matrix-free formula using A^{-1}.
+        # err = Σ_k _err_coeffs[k] · (Y_k − y)
+        # = (e_s − b̂^T · A^{-1}) · (Y − y)   [no M^{-1} needed]
+        if stages == 2:
+            _rk_Ainv = np.linalg.inv(self._rk_A)
+            # b̂^T @ Ainv = [1,0] @ Ainv = first row of Ainv
+            _b_hat_Ainv = _rk_Ainv[0, :]          # shape (2,)
+            _e_s = np.array([0.0, 1.0])
+            self._err_coeffs = _e_s - _b_hat_Ainv  # shape (2,)
+        else:
+            self._err_coeffs = np.zeros(max(stages, 1))
+
+        # Order of the embedded companion for s=2.  AdaptiveStepping reads this
+        # via ``embedded_order`` and uses exponent 1/(q+1) = 1/2 for q=1.
+        self.embedded_order: int = 1
+
+        # Per-stage-step-size LU swap cache (key: stage_h float, value: LU state tuple)
+        # Allows O(1) LU restoration when cycling through stages with different aii*h.
+        self._stage_lu_cache: dict = {}
+        self._cached_stage_h: float | None = None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _swap_stage_lu(self, new_stage_h: float) -> None:
+        """Swap the solver's LU state when moving to a stage with a different step size.
+
+        Maintains a small cache keyed by ``a_{ii}·h`` so that returning to a
+        previously computed stage restores the factorisation rather than
+        recomputing it from scratch.  The cache is bounded to 6 entries
+        (3 stages × 2 consecutive step sizes) to avoid unbounded growth.
+        """
+        prev_h = self._cached_stage_h
+        if prev_h is None or prev_h == new_stage_h:
+            self._cached_stage_h = new_stage_h
+            return
+
+        # Save current LU under prev_h
+        self._stage_lu_cache[prev_h] = (
+            getattr(self.solver, '_lu', None),
+            getattr(self.solver, '_lu_shape', None),
+            getattr(self.solver, '_lu_pattern', None),
+            getattr(self.solver, '_lu_use_count', 0),
+            getattr(self.solver, '_J_cross_call', None),
+        )
+        # Bound the cache size
+        while len(self._stage_lu_cache) > 6:
+            oldest = next(iter(self._stage_lu_cache))
+            del self._stage_lu_cache[oldest]
+
+        # Restore (or invalidate) the LU for new_stage_h
+        cached = self._stage_lu_cache.get(new_stage_h)
+        if cached is not None:
+            (self.solver._lu,
+             self.solver._lu_shape,
+             self.solver._lu_pattern,
+             self.solver._lu_use_count,
+             self.solver._J_cross_call) = cached
+        else:
+            self.solver._lu = None
+            self.solver._lu_shape = None
+            if hasattr(self.solver, '_J_cross_call'):
+                self.solver._J_cross_call = None
+        self.solver._petsc_needs_matrix_update = True
+        self._cached_stage_h = new_stage_h
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Coupled Newton
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _step_coupled_newton_impl(
+        self,
+        t: float,
+        y: np.ndarray,
+        h: float,
+        n: int,
+        A_local,
+        rk_A: np.ndarray,
+        rk_c: np.ndarray,
+        s: int,
+        _call_fun,
+        _jac_wrapper,
+        prev_state_arg,
+        step_size_arg,
+    ):
+        """Full Newton on the stacked (s·n) stage system.
+
+        Assembles the (s·n × s·n) block Jacobian from per-stage analytical
+        Jacobians and factorises it with SPLU on every Newton iteration.
+        Cross-stage coupling is represented in the Jacobian, eliminating
+        the linear-stability constraint on ``|a_{ij}/a_{ii}|`` that limits
+        waveform-relaxation convergence for Radau IIA s=2
+        (where ``a[1,0]/a[1,1] = 3``).
+
+        Block Jacobian structure (i = row block, j = column block)::
+
+            J[i, i] = A_M / (a_{ii}·h) − ∂f/∂Y_i(t + c_i·h, Y_i)
+            J[i, j] = −(a_{ij}/a_{ii}) · ∂f/∂Y_j(t + c_j·h, Y_j)   j ≠ i
+
+        Parameters
+        ----------
+        _call_fun : callable
+            ``_call_fun(tt, yy, stage_h_override=v)`` returns f(tt, yy).
+        _jac_wrapper : callable
+            ``_jac_wrapper(tt, yy, fk, prev, h_val)`` returns ∂f/∂y as
+            a dense ndarray or sparse matrix.
+
+        Returns
+        -------
+        tuple ``(Y_list, f_stage, Fk_last, converged, total_iters)``
+            Y_list : list of s ndarrays, shape (n,) each
+            f_stage : list of s ndarrays — RHS evaluated at final Y_i
+            Fk_last : last element of f_stage (last stage value)
+            converged : bool
+            total_iters : number of SPLU linear solves performed
+        ``None``
+            Returned when the method cannot proceed (Jacobian evaluation
+            error or SPLU failure on the first iteration).  The caller
+            should fall back to waveform relaxation.
+        """
+        solver = self.solver
+
+        # Route the (s·n) stacked system through the standard Newton path so
+        # it inherits WRMS convergence, damped-step fraction, diagonal
+        # regularisation, cold-start slices and modified-Newton Jacobian
+        # reuse.  The path is only available for identity projections (the
+        # common case for NCP / Alart-Curnier / DAE residual formulations);
+        # other projectors fall back to waveform relaxation.
+        if not getattr(solver, '_is_identity_proj', False):
+            return None
+
+        A_sp = A_local.tocsr() if sp.issparse(A_local) else sp.csr_matrix(A_local)
+        sn = s * n
+
+        # Stage RHS values cached by ``F_stacked`` and consumed by
+        # ``J_stacked`` to avoid a second round of per-stage evaluations.
+        _cache = {'f_stage': None, 'Y_list': None}
+
+        def F_stacked(Z):
+            Y_list = [Z[i * n:(i + 1) * n] for i in range(s)]
+            f_stage = [
+                _call_fun(
+                    t + rk_c[i] * h, Y_list[i],
+                    stage_h_override=rk_A[i, i] * h,
+                )
+                for i in range(s)
+            ]
+            _cache['f_stage'] = f_stage
+            _cache['Y_list'] = Y_list
+            F_out = np.empty(sn, dtype=float)
+            for i in range(s):
+                aii = rk_A[i, i]
+                Fi = A_local @ ((Y_list[i] - y) / (aii * h)) - f_stage[i]
+                for j in range(s):
+                    if j != i:
+                        Fi = Fi - (rk_A[i, j] / aii) * f_stage[j]
+                F_out[i * n:(i + 1) * n] = Fi
+            return F_out
+
+        def J_stacked(Z):
+            f_stage = _cache['f_stage']
+            Y_list = _cache['Y_list']
+            if Y_list is None:
+                Y_list = [Z[i * n:(i + 1) * n] for i in range(s)]
+                f_stage = [None] * s
+            J_rhs = []
+            for j in range(s):
+                h_j = (rk_A[j, j] * h) if step_size_arg is not None else None
+                fk_hint_j = f_stage[j] if f_stage is not None else None
+                Jj = _jac_wrapper(
+                    t + rk_c[j] * h, Y_list[j], fk_hint_j, prev_state_arg, h_j,
+                )
+                J_rhs.append(
+                    Jj.tocsr() if sp.issparse(Jj) else sp.csr_matrix(Jj)
+                )
+            block_rows = []
+            for i in range(s):
+                aii = rk_A[i, i]
+                row = []
+                for j in range(s):
+                    if j == i:
+                        row.append((A_sp / (aii * h) - J_rhs[j]).tocsr())
+                    else:
+                        row.append((-(rk_A[i, j] / aii) * J_rhs[j]).tocsr())
+                block_rows.append(sp.hstack(row, format='csr'))
+            return sp.vstack(block_rows, format='csr')
+
+        # Save solver state that must be restored after the call.
+        # * cold_start_slices: index ranges get shifted to stacked layout,
+        #   must not leak into subsequent (n, n) solver.solve invocations.
+        # * jacobian: set to J_stacked, must be restored for the embedded
+        #   error / post-projection paths that still use (n, n) sizes.
+        # * _nl_atol_vec / _nl_rtol_vec: expanded to stacked size; restored
+        #   so the next call lazily re-expands at the right shape.
+        # Shape-sensitive caches (_J_cached, _lu, _J_cross_call) are guarded
+        # by shape checks in the solver and self-invalidate on mismatch, so
+        # they are left alone to preserve SPLU reuse across coupled steps.
+        saved_cold = solver._cold_start_slices
+        saved_jac = solver.jacobian
+        saved_atol_vec = solver._nl_atol_vec
+        saved_rtol_vec = solver._nl_rtol_vec
+
+        if saved_cold:
+            stacked_cs = []
+            for stage_idx in range(s):
+                off = stage_idx * n
+                for sl in saved_cold:
+                    start = (sl.start if sl.start is not None else 0) + off
+                    stop = (sl.stop if sl.stop is not None else n) + off
+                    stacked_cs.append(slice(start, stop, sl.step))
+            solver._cold_start_slices = stacked_cs
+
+        if solver._use_weighted_norm:
+            atol_n, rtol_n = solver._ensure_nl_tol_vectors(n)
+            solver._nl_atol_vec = np.tile(np.asarray(atol_n), s)
+            solver._nl_rtol_vec = np.tile(np.asarray(rtol_n), s)
+
+        solver.jacobian = J_stacked
+        Z0 = np.tile(y, s)
+
+        try:
+            try:
+                Z_sol, _F_sol, _err_sol, ok, iters = solver.solve(F_stacked, Z0)
+            except Exception:
+                return None
+        finally:
+            solver._cold_start_slices = saved_cold
+            solver.jacobian = saved_jac
+            solver._nl_atol_vec = saved_atol_vec
+            solver._nl_rtol_vec = saved_rtol_vec
+
+        Y_list = [Z_sol[i * n:(i + 1) * n].copy() for i in range(s)]
+        f_stage_out = [
+            _call_fun(
+                t + rk_c[i] * h, Y_list[i], stage_h_override=rk_A[i, i] * h
+            )
+            for i in range(s)
+        ]
+        Fk_last = f_stage_out[-1]
+        return Y_list, f_stage_out, Fk_last, bool(ok), int(iters)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Main step
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def step(self, fun, t, y, h):
+        r"""Advance by one Radau IIA step of size *h*.
+
+        For ``stages=1`` this is identical to :meth:`BackwardEuler.step`.
+
+        For ``stages≥2`` the step consists of:
+
+        1. **Waveform-relaxation stage loop** — up to ``wf_maxiter`` outer
+           sweeps over the ``s`` stages, each solved as a Backward-Euler-like
+           implicit equation augmented with explicit coupling contributions.
+        2. **Post-step velocity projection** (optional) — applied if
+           ``post_step_projection`` is set (Breuling Stage 2).
+
+        Returns
+        -------
+        y_new : ndarray
+            State at ``t + h``.  Equal to the last stage value ``Y_s``
+            (stiff accuracy).
+        Fk_new : ndarray or None
+            Residual at convergence of the last stage solve.
+        err : ndarray
+            Element-wise embedded error estimate (mass-matrix agnostic).
+        success : bool
+            *True* only if every stage solve converged.
+        iterations : int
+            Total nonlinear iterations summed over all stage solves.
+        """
+        # 1-stage: delegate unchanged to BackwardEuler
+        if self.stages == 1:
+            return super().step(fun, t, y, h)
+
+        n = len(y)
+        A_local = self._get_A(n)
+        rk_A = self._rk_A   # shape (s, s)
+        rk_c = self._rk_c   # shape (s,)
+        s = self.stages
+
+        # ── RHS / Jacobian wrapper (same pattern as SDIRK2) ────────────────
+        prev_state_arg = y if self.pass_prev_state else None
+        # pass_step_size: use full h as the outer scale hint;
+        # each stage overrides to aii*h via explicit arg in _rhs calls below.
+        step_size_arg = h if self.pass_step_size else None
+
+        _rhs = self._get_bound_wrapper(
+            fun,
+            has_prev=(prev_state_arg is not None),
+            has_h=(step_size_arg is not None),
+            cache=self._fun_bindings,
+        )
+
+        def _call_fun(tt, yy, Fk=None, stage_h_override=None):
+            # stage_h_override lets us pass the diagonal sub-step as h_val
+            h_arg = stage_h_override if (stage_h_override is not None and step_size_arg is not None) else step_size_arg
+            return _rhs(tt, yy, Fk, prev_state_arg, h_arg)
+
+        rhs_jac = getattr(self.solver, 'rhs_jacobian', None)
+        _jac_wrapper = None
+        if callable(rhs_jac) and getattr(self.solver, 'method', None) != 'VI':
+            _jac_wrapper = self._get_bound_wrapper(
+                rhs_jac,
+                has_prev=(prev_state_arg is not None),
+                has_h=(step_size_arg is not None),
+                cache=self._jac_bindings,
+            )
+
+        # ── Diagonal mass-matrix ρ (proximal equilibration) ────────────────
+        _A_diag = (A_local.diagonal() if sp.issparse(A_local) else np.diag(A_local))
+        _phys_mask = np.abs(_A_diag) > 0.0
+
+        def _set_stage_rho(aii):
+            rho_vec = np.ones(n, dtype=float)
+            rho_vec[_phys_mask] = (aii * h) / _A_diag[_phys_mask]
+            self.solver.lam = rho_vec
+
+        # ── Initial stage values and cached RHS evaluations ────────────────
+        Y = [y.copy() for _ in range(s)]
+        # f_stage[i] = fun(t + c_i*h, Y[i]) — re-evaluated after each stage solve
+        f_stage = [
+            _call_fun(t + rk_c[i] * h, Y[i], stage_h_override=rk_A[i, i] * h)
+            for i in range(s)
+        ]
+
+        total_iters = 0
+        Fk_last: np.ndarray | None = None
+        ok_all = True
+        _cn_used = False
+        _implicit_i = None  # set by WF path; used for _residual_last
+
+        # ── Coupled-Newton primary path (requires analytical Jacobian) ──────
+        # Solves the fully coupled (s·n × s·n) block system in one Newton loop,
+        # bypassing the waveform-relaxation coupling-ratio stability limit.
+        if self.use_coupled_newton and _jac_wrapper is not None:
+            cn_result = self._step_coupled_newton_impl(
+                t, y, h, n, A_local, rk_A, rk_c, s,
+                _call_fun, _jac_wrapper, prev_state_arg, step_size_arg,
+            )
+            if cn_result is not None:
+                Y, f_stage, Fk_last, ok_all, total_iters = cn_result
+                _cn_used = True
+                if not ok_all:
+                    return y, Fk_last, np.zeros(n), False, total_iters
+
+        if not _cn_used:
+            # ── Waveform-relaxation outer loop ────────────────────────────────
+            # Fallback used when no analytical Jacobian is available (VI method).
+            for wf_iter in range(self.wf_maxiter):
+                Y_prev_wf = [Yi.copy() for Yi in Y]
+
+                for i in range(s):
+                    aii = rk_A[i, i]
+                    stage_h = aii * h
+
+                    # Explicit coupling: C_i = Σ_{j≠i} (a_{ij}/a_{ii}) * f_stage[j]
+                    # On the first sweep (wf_iter==0) use zero coupling so each stage
+                    # is solved as a backward-Euler sub-step at size a_{ii}*h.  This
+                    # gives a stable DIRK predictor that avoids the destabilising effect
+                    # of large negative cross-coupling terms (e.g. a[0,1] = −1/12 for
+                    # s=2) when f_stage is initialised from a seeded or transient state.
+                    # Subsequent sweeps correct the coupling to the full Radau value.
+                    C_i = np.zeros(n, dtype=float)
+                    if wf_iter > 0:
+                        for j in range(s):
+                            if j != i:
+                                C_i += (rk_A[i, j] / aii) * f_stage[j]
+                    # Freeze for closure
+                    _C = C_i  # already a fresh array each iteration
+
+                    # Stage i implicit residual:
+                    #   A_M (Yi − y)/(a_{ii}·h) − f(t+c_i·h, Yi) − C_i = 0
+                    # The constant C_i does NOT affect the Jacobian structure.
+                    def _implicit_i(
+                        Yi,
+                        _Aloc=A_local,
+                        _y=y,
+                        _ci=rk_c[i],
+                        _aii=aii,
+                        _h=h,
+                        _C=_C,
+                    ):
+                        return (
+                            _Aloc @ ((Yi - _y) / (_aii * _h))
+                            - _call_fun(t + _ci * _h, Yi, stage_h_override=_aii * _h)
+                            - _C
+                        )
+
+                    # Swap in (or invalidate) the LU for this stage's step size
+                    self._swap_stage_lu(stage_h)
+                    # Proximal parameter equilibration for this stage
+                    _set_stage_rho(aii)
+
+                    # Exact Jacobian (if available): same as BackwardEuler at step=stage_h
+                    if _jac_wrapper is not None:
+                        A_over_sth = A_local / stage_h
+                        def _jac_i(
+                            Yi,
+                            _A=A_over_sth,
+                            _ci=rk_c[i],
+                            _h=h,
+                            _aii=aii,
+                            _jw=_jac_wrapper,
+                        ):
+                            fk_val = getattr(self.solver, 'last_Fk_val', None)
+                            J_rhs = _jw(
+                                t + _ci * _h, Yi, fk_val,
+                                prev_state_arg,
+                                (_aii * _h) if step_size_arg is not None else None,
+                            )
+                            return _A - J_rhs
+
+                        self.solver.jacobian = _jac_i
+
+                    # Thread step-context
+                    try:
+                        self.solver.current_time = t + rk_c[i] * h
+                        self.solver.prev_state = y
+                        self.solver.prev_time = t
+                        self.solver.prev_step = stage_h
+                    except Exception:
+                        pass
+
+                    Yi_new, Fki, erri, oki, itsi = self.solver.solve(_implicit_i, Y[i])
+                    total_iters += itsi
+
+                    if not oki:
+                        return y, Fki, np.zeros(n), False, total_iters
+
+                    Y[i] = Yi_new
+                    Fk_last = Fki
+                    # Update cached RHS for stage i (needed for coupling in next stages/sweeps)
+                    f_stage[i] = _call_fun(
+                        t + rk_c[i] * h, Yi_new, stage_h_override=aii * h
+                    )
+
+                # Early exit if outer-loop converged
+                if wf_iter > 0:
+                    max_rel = max(
+                        np.linalg.norm(Y[i] - Y_prev_wf[i])
+                        / (1.0e-15 + np.linalg.norm(Y_prev_wf[i]))
+                        for i in range(s)
+                    )
+                    if max_rel < self.wf_tol:
+                        break
+
+        # ── Stiffly accurate output: y_new = Y_s ───────────────────────────
+        y_new = Y[-1].copy()
+
+        # ── Post-step velocity projection (Breuling Stage 2) ───────────────
+        # Define the last-stage residual for re-evaluating Fk after projection.
+        if _cn_used:
+            # Freeze coupling from converged coupled-Newton solution
+            _f_coup = list(f_stage)
+            _aii_s = rk_A[s - 1, s - 1]
+            _ci_s = rk_c[s - 1]
+
+            def _residual_last(Yev,
+                               _A=A_local, _y=y, _h=h,
+                               _ci=_ci_s, _aii=_aii_s,
+                               _fc=_f_coup, _s=s, _rkA=rk_A):
+                f_ev = _call_fun(t + _ci * _h, Yev, stage_h_override=_aii * _h)
+                C_last = np.zeros(len(Yev), dtype=float)
+                for jj in range(_s - 1):
+                    C_last += (_rkA[_s - 1, jj] / _aii) * _fc[jj]
+                return _A @ ((Yev - _y) / (_aii * _h)) - f_ev - C_last
+        else:
+            # WF path: _implicit_i is the closure from the last stage solve
+            def _residual_last(Yev):
+                return _implicit_i(Yev)
+
+        y_new, Fk_last, proj_delta = self._apply_post_step_projection(
+            y,
+            y_new,
+            t_new=t + h,
+            h=h,
+            Fk_val=Fk_last,
+            residual_eval=_residual_last,
+        )
+        if proj_delta is not None:
+            try:
+                self.last_post_step_delta = np.asarray(proj_delta, dtype=float)
+            except Exception:
+                self.last_post_step_delta = None
+
+        # ── Embedded error estimate (mass-matrix agnostic) ─────────────────
+        # Uses precomputed coefficients from __init__:
+        #   err = Σ_k _err_coeffs[k] · (Y[k] − y)
+        # Derived from the difference between the main method (b = Radau weights)
+        # and a first-order companion (b̂ = [1, 0, …]) expressed in terms of
+        # stage increments via the Butcher A inverse.  Scales as O(h²) for all
+        # stage counts (leading term of the order-1 companion LTE).
+        # The adaptive controller uses exponent 1/(embedded_order+1) = 1/2 via
+        # the ``embedded_order`` attribute, giving correct step-size selection.
+        coeffs = self._err_coeffs          # shape (s,)
+        err_embed = np.zeros(n, dtype=float)
+        for k in range(s):
+            err_embed += coeffs[k] * (Y[k] - y)
+
+        return y_new, Fk_last, err_embed, True, total_iters
 
 
 class EmbeddedBETR(IntegrationMethod):

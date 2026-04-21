@@ -62,7 +62,8 @@ from .projections import (
   CompositeContactProjection,
 )
 from .nonlinear_solvers import ImplicitEquationSolver, UMFPACK_AVAILABLE, PETSC_AVAILABLE
-from .integrations import BackwardEuler, Trapezoidal, ThetaMethod, CompositeMethod, EmbeddedBETR, SDIRK2  # , BDFMethod
+from .integrations import BackwardEuler, BackwardEulerSchur, Trapezoidal, ThetaMethod, CompositeMethod, EmbeddedBETR, SDIRK2, RadauIIA  # , BDFMethod
+from .block_system import SchurComplementSolver, BlockStructuredSystem
 from .ODESystem import ODESystem
 from .ODESolver import ODESolver
 from .contact import build_impulse_contact, ContactSystem
@@ -73,6 +74,24 @@ from .alart_curnier_contact import (
 from .ncp_contact import (
   build_ncp_contact,
   build_dynamic_ncp_contact,
+  build_ncp_contact_blocked,
+)
+from .desaxce_contact import (
+  build_dynamic_desaxce_contact,
+  build_dynamic_desaxce_projected_contact,
+  build_dynamic_desaxce_residual_contact,
+)
+from .rattle_contact import (
+  build_dynamic_rattle_contact,
+  solve_dynamic_rattle_contact,
+  build_rattle_system,
+  RattleMechanicalSystem,
+  RattleContactSpec,
+  RattleBilateralSpec,
+  RattleAlgebraicSpec,
+  RattleContactSystem,
+  RattleSolveResult,
+  RattleSolver,
 )
 
 # Curated public API
@@ -83,7 +102,7 @@ __all__ = [
   # Nonlinear solver
   'ImplicitEquationSolver',
   # Integrators
-  'BackwardEuler', 'Trapezoidal', 'ThetaMethod', 'CompositeMethod', 'EmbeddedBETR', 'SDIRK2',
+  'BackwardEuler', 'BackwardEulerSchur', 'Trapezoidal', 'ThetaMethod', 'CompositeMethod', 'EmbeddedBETR', 'SDIRK2', 'RadauIIA',
   # Projections
   'Projection',
   'CoulombProjection', 'SignProjection', 'IdentityProjection',
@@ -93,7 +112,22 @@ __all__ = [
   # Contact helpers
   'build_impulse_contact', 'build_alart_curnier_contact',
   'build_dynamic_alart_curnier_contact', 'build_ncp_contact',
-  'build_dynamic_ncp_contact', 'ContactSystem',
+  'build_dynamic_ncp_contact', 'build_ncp_contact_blocked',
+  'SchurComplementSolver', 'BlockStructuredSystem',
+  'build_dynamic_desaxce_contact',
+  'build_dynamic_desaxce_projected_contact',
+  'build_dynamic_desaxce_residual_contact',
+  'build_dynamic_rattle_contact',
+  'solve_dynamic_rattle_contact',
+  'build_rattle_system',
+  'ContactSystem',
+  'RattleMechanicalSystem',
+  'RattleContactSpec',
+  'RattleBilateralSpec',
+  'RattleAlgebraicSpec',
+  'RattleContactSystem',
+  'RattleSolveResult',
+  'RattleSolver',
 ]
 
 
@@ -140,7 +174,9 @@ def solve_nivp(
     Initial state.
   method : str, default 'composite'
     Time stepping scheme: ``'backward_euler'``, ``'trapezoidal'``, ``'theta'``,
-    ``'composite'`` (TR-BE like second order), ``'embedded_betr'``, ``'sdirk2'``.
+    ``'composite'`` (TR-BE like second order), ``'embedded_betr'``, ``'sdirk2'``,
+    ``'radau_iia'`` (L-stable, stiffly accurate, order 3 or 5; stages controlled
+    via ``integrator_opts={'stages': 2}`` or ``{'stages': 3}``).
   projection : str or Projection or None, default 'identity'
     Name of projection to build: ``'coulomb'``, ``'sign'``, ``'identity'`` or
     ``None``. At the high-level API, ``None`` is promoted to the identity
@@ -348,6 +384,8 @@ def solve_nivp(
     integrator = EmbeddedBETR(solver=solver_instance, A=A)
   elif m == 'sdirk2':
     integrator = SDIRK2(solver=solver_instance, A=A, **_integrator_opts)
+  elif m in ('radau_iia', 'radau'):
+    integrator = RadauIIA(solver=solver_instance, A=A, **_integrator_opts)
   # elif m == 'bdf':
   #     integrator = BDFMethod(solver=solver_instance, atol=atol, rtol=rtol)
   else:
