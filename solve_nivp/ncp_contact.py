@@ -37,6 +37,7 @@ from .alart_curnier_contact import (
     _eval_s0,
     _eval_w0,
     _parse_prev_and_h,
+    _project_ball_and_jac,
     _vectorize_mu,
 )
 from .contact import ContactSystem
@@ -135,6 +136,77 @@ def _fischer_burmeister_friction_compliance(
     return max(0.0, scale * numer / denom)
 
 
+def _minimum_map_friction_compliance_and_jac(
+    speed, cone_gap, mu_lambda_n, scale, *, tie_tol=1.0e-14
+):
+    """Minimum-map compliance ``W`` and its local partial derivatives."""
+    speed = float(speed)
+    scale = float(scale)
+    cone_gap = float(cone_gap)
+    mu_lambda_n = float(mu_lambda_n)
+    threshold = scale * cone_gap
+    if speed <= threshold + tie_tol:
+        return 0.0, 0.0, 0.0, 0.0
+    denom = mu_lambda_n
+    if denom <= tie_tol:
+        return 0.0, 0.0, 0.0, 0.0
+    numer = speed - threshold
+    W = max(0.0, numer / denom)
+    if W <= 0.0:
+        return 0.0, 0.0, 0.0, 0.0
+    dW_dspeed = 1.0 / denom
+    dW_dgap = -scale / denom
+    dW_dmulambda = -numer / max(denom * denom, tie_tol)
+    return W, dW_dspeed, dW_dgap, dW_dmulambda
+
+
+def _fischer_burmeister_friction_compliance_and_jac(
+    speed, cone_gap, mu_lambda_n, scale, *, tie_tol=1.0e-14
+):
+    """Fischer-Burmeister compliance ``W`` and its local partial derivatives."""
+    speed = float(speed)
+    scale = float(scale)
+    cone_gap = float(cone_gap)
+    mu_lambda_n = float(mu_lambda_n)
+    scaled_gap = scale * cone_gap
+    rad = float(np.hypot(speed, scaled_gap))
+    numer = rad - scaled_gap
+    denom = speed + scale * mu_lambda_n - rad
+    if numer <= tie_tol and abs(denom) <= tie_tol:
+        return 0.0, 0.0, 0.0, 0.0
+    if denom <= tie_tol:
+        if numer <= tie_tol:
+            return 0.0, 0.0, 0.0, 0.0
+        W = scale * numer / tie_tol
+        return W, 0.0, 0.0, 0.0
+
+    W = max(0.0, scale * numer / denom)
+    if W <= 0.0:
+        return 0.0, 0.0, 0.0, 0.0
+
+    if rad <= tie_tol:
+        drad_dspeed = 0.0
+        drad_dscaled_gap = 0.0
+    else:
+        drad_dspeed = speed / rad
+        drad_dscaled_gap = scaled_gap / rad
+
+    dnumer_dspeed = drad_dspeed
+    dnumer_dscaled_gap = drad_dscaled_gap - 1.0
+    ddenom_dspeed = 1.0 - drad_dspeed
+    ddenom_dscaled_gap = -drad_dscaled_gap
+    ddenom_dmulambda = scale
+
+    factor = scale / (denom * denom)
+    dW_dspeed = factor * (dnumer_dspeed * denom - numer * ddenom_dspeed)
+    dW_dscaled_gap = factor * (
+        dnumer_dscaled_gap * denom - numer * ddenom_dscaled_gap
+    )
+    dW_dgap = dW_dscaled_gap * scale
+    dW_dmulambda = factor * (-numer * ddenom_dmulambda)
+    return W, dW_dspeed, dW_dgap, dW_dmulambda
+
+
 def _normal_ncp_residual_and_jac(gap, r_n, ncp_type, scale, *, tie_tol=1.0e-14):
     if ncp_type == "minimum_map":
         return _minimum_map_ncp(gap, r_n, scale, tie_tol=tie_tol)
@@ -151,6 +223,18 @@ def _friction_compliance(speed, cone_gap, mu_lambda_n, ncp_type, scale, *, tie_t
     )
 
 
+def _friction_compliance_and_jac(
+    speed, cone_gap, mu_lambda_n, ncp_type, scale, *, tie_tol=1.0e-14
+):
+    if ncp_type == "minimum_map":
+        return _minimum_map_friction_compliance_and_jac(
+            speed, cone_gap, mu_lambda_n, scale, tie_tol=tie_tol
+        )
+    return _fischer_burmeister_friction_compliance_and_jac(
+        speed, cone_gap, mu_lambda_n, scale, tie_tol=tie_tol
+    )
+
+
 def _contact_block_residual_and_jac(
     gap,
     u_blk,
@@ -160,6 +244,7 @@ def _contact_block_residual_and_jac(
     friction_ncp_type,
     normal_scale,
     friction_scale,
+    friction_law="compliance",
     *,
     tie_tol=1.0e-14,
 ):
@@ -192,18 +277,50 @@ def _contact_block_residual_and_jac(
         df_dr[1:, 1:] = np.eye(m)
         return f_blk, df_dgap, df_du, df_dr
 
+    if friction_law == "natural_map":
+        y_vec = r_blk[1:] - float(friction_scale) * u_blk[1:]
+        proj, dproj_ddelta, dproj_dy = _project_ball_and_jac(
+            y_vec, mu_lambda_n, tie_tol=tie_tol
+        )
+        f_blk[1:] = proj - r_blk[1:]
+        df_du[1:, 1:] = -float(friction_scale) * dproj_dy
+        df_dr[1:, 1:] = dproj_dy - np.eye(m)
+        df_dr[1:, 0] = float(mu) * dproj_ddelta
+        return f_blk, df_dgap, df_du, df_dr
+
     u_t = u_blk[1:]
     r_t = r_blk[1:]
     speed = float(np.linalg.norm(u_t))
     r_t_norm = float(np.linalg.norm(r_t))
     cone_gap = mu_lambda_n - r_t_norm
-    W = _friction_compliance(
+    W, dW_dspeed, dW_dgap, dW_dmulambda = _friction_compliance_and_jac(
         speed, cone_gap, mu_lambda_n, friction_ncp_type, friction_scale, tie_tol=tie_tol
     )
 
     f_blk[1:] = u_t + W * r_t
-    df_du[1:, 1:] = np.eye(m)
-    df_dr[1:, 1:] = W * np.eye(m)
+    if speed > tie_tol:
+        dspeed_du = u_t / speed
+    elif r_t_norm > tie_tol:
+        # At zero slip-rate the norm direction is not unique.  For scalar
+        # / low-dimensional friction blocks a robust semismooth choice is to
+        # follow the impending slip direction, i.e. opposite the current
+        # tangential traction.
+        dspeed_du = -r_t / r_t_norm
+    else:
+        dspeed_du = np.zeros(m, dtype=float)
+
+    if r_t_norm > tie_tol:
+        drnorm_dr = r_t / r_t_norm
+    else:
+        drnorm_dr = np.zeros(m, dtype=float)
+
+    dW_du = dW_dspeed * dspeed_du
+    dW_dr_t = -dW_dgap * drnorm_dr
+    dW_dr_n = (dW_dmulambda + dW_dgap) * float(mu)
+
+    df_du[1:, 1:] = np.eye(m) + np.outer(r_t, dW_du)
+    df_dr[1:, 1:] = W * np.eye(m) + np.outer(r_t, dW_dr_t)
+    df_dr[1:, 0] = r_t * dW_dr_n
 
     return f_blk, df_dgap, df_du, df_dr
 
@@ -242,6 +359,8 @@ def build_ncp_contact(
     normal_r=1.0,
     friction_r=1.0,
     inactive_handling="hard_zero",
+    friction_law="compliance",
+    smooth_rhs_is_affine=False,
 ):
     r"""Build a full-state NCP contact system.
 
@@ -259,9 +378,24 @@ def build_ncp_contact(
 
     ``ncp_type`` sets both the normal and friction NCP choices unless the
     more specific ``normal_ncp_type`` / ``friction_ncp_type`` overrides are
-    supplied. ``normal_r`` and ``friction_r`` are the positive NCP scaling /
+    supplied.
+
+    ``normal_r`` and ``friction_r`` are the positive NCP scaling /
     preconditioning factors from the paper; each may be a scalar, length-
     ``n_contacts`` array, or state-dependent callable returning either.
+    Additionally, passing the string ``"auto"`` selects the Macklin et al.
+    (2019) per-contact complementarity preconditioner
+
+    .. math::
+
+        r_i = h^2 [B^T A^{-1} B]_{ii}
+
+    approximated by the Jacobi diagonal ``r_i = h^2 \\sum_j B_{ji}^2 /
+    A_{jj}``, where ``B`` is the reaction coupling matrix and ``A`` the
+    physical system matrix.  This gives a physically-motivated, step-size-
+    adaptive preconditioner that removes the dimensional mismatch between
+    the gap (length) and reaction (force/impulse) residual rows.
+    Requires ``B`` to be non-trivial (same condition as ``reaction_units='impulse'``).
 
     ``inactive_handling`` controls what happens when ``gap > gap_tol``:
 
@@ -304,12 +438,19 @@ def build_ncp_contact(
         ncp_type if friction_ncp_type is None else friction_ncp_type,
         label="friction_ncp_type",
     )
+    friction_law = str(friction_law).strip().lower().replace("-", "_")
+    if friction_law not in {"compliance", "natural_map"}:
+        raise ValueError(
+            "friction_law must be 'compliance' or 'natural_map' "
+            f"(got {friction_law!r})"
+        )
     inactive_handling = str(inactive_handling).strip().lower().replace("-", "_")
     if inactive_handling not in {"hard_zero", "ncp"}:
         raise ValueError(
             "inactive_handling must be 'hard_zero' or 'ncp' "
             f"(got {inactive_handling!r})"
         )
+    smooth_rhs_is_affine = bool(smooth_rhs_is_affine)
     use_hard_zero_gate = inactive_handling == "hard_zero"
     _incremental_offset_loading = offset_coupling_mode == "incremental_reference"
     _total_offset_loading = offset_coupling_mode == "total_traction"
@@ -333,6 +474,13 @@ def build_ncp_contact(
     load_dw0_nargs = _count_required_args(load_get_dw0_dz)
     ref_s0_nargs = _count_required_args(get_s0_ref)
     ref_w0_nargs = _count_required_args(get_w0_ref)
+    # Detect "auto" Macklin preconditioner before scalar/callable checks.
+    _use_auto_normal_r = isinstance(normal_r, str) and normal_r.strip().lower() == "auto"
+    _use_auto_friction_r = isinstance(friction_r, str) and friction_r.strip().lower() == "auto"
+    if _use_auto_normal_r:
+        normal_r = 1.0   # placeholder; replaced after B_mat is available
+    if _use_auto_friction_r:
+        friction_r = 1.0
     normal_r_nargs = _count_required_args(normal_r) if callable(normal_r) else None
     friction_r_nargs = _count_required_args(friction_r) if callable(friction_r) else None
 
@@ -409,6 +557,17 @@ def build_ncp_contact(
                 f"B shape {B_mat.shape} doesn't match (n_phys={n_phys}, n_react={n_react})"
             )
 
+    # -----------------------------------------------------------------
+    # Macklin complementarity preconditioner — r_i = h² [D^T A^{-1} D]_ii
+    # Jacobi approximation: r_i = h² Σ_j (D_ji² / A_jj)
+    # Uses the kinematic extraction D (not B_mat) so the Delassus
+    # diagonal is independent of interface weighting in B.
+    # -----------------------------------------------------------------
+    _auto_normal_r_base = None
+    _auto_friction_r_base = None
+    _h_cell_auto = [1.0]   # mutable h carrier, updated in rhs_aug / jac_aug
+    _auto_rho_deferred = _use_auto_normal_r or _use_auto_friction_r
+
     if sp.issparse(A):
         A_aug = sp.block_diag([A, sp.csr_matrix((n_react, n_react))], format="csr")
     else:
@@ -447,6 +606,54 @@ def build_ncp_contact(
     else:
         vel_indices = np.asarray(reaction_extract_rows, dtype=int)
         U_contact = None
+
+    # ----- Deferred Macklin auto-rho (uses kinematic D, not B_mat) -----
+    if _auto_rho_deferred:
+        if sp.issparse(A):
+            _A_diag_phys = np.abs(np.asarray(A.diagonal()).ravel())
+        else:
+            _A_diag_phys = np.abs(np.diag(np.asarray(A, dtype=float)))
+        _pos = _A_diag_phys > 0
+        _A_diag_phys = np.where(_pos, _A_diag_phys,
+                                (_A_diag_phys[_pos].min() if _pos.any() else 1.0))
+
+        if U_contact is not None:
+            _D_T = U_contact.T
+            if sp.issparse(_D_T):
+                _D_T_dense = _D_T.toarray()
+            else:
+                _D_T_dense = np.asarray(_D_T, dtype=float)
+        else:
+            _D_T_dense = np.zeros((n_phys, n_react), dtype=float)
+            col = 0
+            for ci in norm_contacts:
+                _D_T_dense[ci["vN"], col] = 1.0
+                col += 1
+                for vt in ci["vT"]:
+                    _D_T_dense[vt, col] = 1.0
+                    col += 1
+
+        _r_base_n = np.zeros(n_blocks, dtype=float)
+        _r_base_f = np.zeros(n_blocks, dtype=float)
+        for _k, _ci in enumerate(norm_contacts):
+            _sl = _ci["block_slice"]
+            _b_n = _D_T_dense[:, _sl.start]
+            _r_base_n[_k] = float(np.sum(_b_n ** 2 / _A_diag_phys))
+            _d = _sl.stop - _sl.start
+            if _d > 1:
+                _rf = 0.0
+                for _col in range(_sl.start + 1, _sl.stop):
+                    _b_t = _D_T_dense[:, _col]
+                    _rf += float(np.sum(_b_t ** 2 / _A_diag_phys))
+                _r_base_f[_k] = _rf / (_d - 1)
+            else:
+                _r_base_f[_k] = _r_base_n[_k]
+
+        _r_base_n = np.where(_r_base_n > 0, _r_base_n, 1.0)
+        _r_base_f = np.where(_r_base_f > 0, _r_base_f, 1.0)
+        _auto_normal_r_base = _r_base_n
+        _auto_friction_r_base = _r_base_f
+        del _D_T_dense
 
     alg_proj = None
     q_slices = []
@@ -630,9 +837,9 @@ def build_ncp_contact(
         offset_vec = _assemble_offset_vector(y, t=t, Fk_val=Fk_val)
         load_offset_vec = _assemble_load_offset_vector(y, t=t, Fk_val=Fk_val)
 
-        if rhs_jac is not None and _rhs_neg_A[0] is not None:
+        if smooth_rhs_is_affine and rhs_jac is not None and _rhs_neg_A[0] is not None:
             out[:n_phys] = np.asarray(_rhs_neg_A[0] @ yp).ravel() + _rhs_b_const[0]
-        elif rhs_jac is not None:
+        elif smooth_rhs_is_affine and rhs_jac is not None:
             J_s = _call_with_time_state_fk(rhs_jac, t, yp, None)
             J_s = _dense_or_sparse(J_s)
             _rhs_neg_A[0] = sp.csr_matrix(J_s) if not sp.issparse(J_s) else J_s.tocsr()
@@ -667,8 +874,24 @@ def build_ncp_contact(
         u_rel = _contact_velocity(yp, prev_state, h_val)
         gaps = np.atleast_1d(gap_aug(y, t))
         mu_arr = _vectorize_mu(norm_contacts, yp, t=t, Fk_val=Fk_val)
-        normal_r_arr = _eval_contact_scalar_field(normal_r, normal_r_nargs, n_blocks, "normal_r", y, t=t, Fk_val=Fk_val)
-        friction_r_arr = _eval_contact_scalar_field(friction_r, friction_r_nargs, n_blocks, "friction_r", y, t=t, Fk_val=Fk_val)
+        if _use_auto_normal_r or _use_auto_friction_r:
+            _h_cell_auto[0] = h_val if (h_val is not None and h_val > 0.0) else 1.0
+        if _use_auto_normal_r:
+            # Gap-level preconditioner: normal_r = h² * schur_base (force units)
+            # or h * schur_base (impulse units, since r_imp = h * r_force absorbs one h).
+            _h_eff = _h_cell_auto[0]
+            _h_scale = _h_eff ** 2 if reaction_units == "force" else _h_eff
+            normal_r_arr = _auto_normal_r_base * _h_scale
+        else:
+            normal_r_arr = _eval_contact_scalar_field(normal_r, normal_r_nargs, n_blocks, "normal_r", y, t=t, Fk_val=Fk_val)
+        if _use_auto_friction_r:
+            # Velocity-level preconditioner: friction_r = h * schur_base (force units)
+            # or 1 * schur_base (impulse units, one h less than gap-level).
+            _h_eff = _h_cell_auto[0]
+            _h_scale = _h_eff if reaction_units == "force" else 1.0
+            friction_r_arr = _auto_friction_r_base * _h_scale
+        else:
+            friction_r_arr = _eval_contact_scalar_field(friction_r, friction_r_nargs, n_blocks, "friction_r", y, t=t, Fk_val=Fk_val)
 
         for k, ci in enumerate(norm_contacts):
             sl = ci["block_slice"]
@@ -691,6 +914,7 @@ def build_ncp_contact(
                     friction_ncp_type,
                     normal_r_arr[k],
                     friction_r_arr[k],
+                    friction_law,
                 )
             out[n_phys + sl.start : n_phys + sl.stop] = -f_blk
 
@@ -718,7 +942,7 @@ def build_ncp_contact(
         offset_jac = _assemble_offset_jac(y, t=t, Fk_val=Fk_val)
         load_offset_jac = _assemble_load_offset_jac(y, t=t, Fk_val=Fk_val)
 
-        if _jac_top_left[0] is None:
+        if _jac_top_left[0] is None or not smooth_rhs_is_affine:
             if rhs_jac is not None:
                 J_s = _call_with_time_state_fk(rhs_jac, t, yp, None)
             else:
@@ -743,9 +967,10 @@ def build_ncp_contact(
                     J_s[qs, :] = (-patch[qs, :]).tolil()
                 J_s = J_s.tocsr()
 
-            _jac_top_left[0] = J_s
+            if smooth_rhs_is_affine:
+                _jac_top_left[0] = J_s
 
-        top_left = _jac_top_left[0]
+        top_left = _jac_top_left[0] if smooth_rhs_is_affine else J_s
 
         cache_key = _reaction_cache_key(h_val)
         if _jac_top_right_key[0] != cache_key:
@@ -784,8 +1009,22 @@ def build_ncp_contact(
         else:
             gap_jac_dense = np.asarray(gap_jac, dtype=float)
         mu_arr = _vectorize_mu(norm_contacts, yp, t=t, Fk_val=Fk_val)
-        normal_r_arr = _eval_contact_scalar_field(normal_r, normal_r_nargs, n_blocks, "normal_r", y, t=t, Fk_val=Fk_val)
-        friction_r_arr = _eval_contact_scalar_field(friction_r, friction_r_nargs, n_blocks, "friction_r", y, t=t, Fk_val=Fk_val)
+        if _use_auto_normal_r or _use_auto_friction_r:
+            _h_cell_auto[0] = h_val if (h_val is not None and h_val > 0.0) else 1.0
+        if _use_auto_normal_r:
+            _h_eff = _h_cell_auto[0]
+            _h_scale = _h_eff ** 2 if reaction_units == "force" else _h_eff
+            normal_r_arr = _auto_normal_r_base * _h_scale
+        else:
+            normal_r_arr = _eval_contact_scalar_field(normal_r, normal_r_nargs, n_blocks, "normal_r", y, t=t, Fk_val=Fk_val)
+        if _use_auto_friction_r:
+            # Velocity-level preconditioner: friction_r = h * schur_base (force units)
+            # or 1 * schur_base (impulse units, one h less than gap-level).
+            _h_eff = _h_cell_auto[0]
+            _h_scale = _h_eff if reaction_units == "force" else 1.0
+            friction_r_arr = _auto_friction_r_base * _h_scale
+        else:
+            friction_r_arr = _eval_contact_scalar_field(friction_r, friction_r_nargs, n_blocks, "friction_r", y, t=t, Fk_val=Fk_val)
 
         U_scaled = None
         if _U_contact_csr is not None:
@@ -825,6 +1064,7 @@ def build_ncp_contact(
                 friction_ncp_type,
                 normal_r_arr[k],
                 friction_r_arr[k],
+                friction_law,
             )
 
             bl_dense = np.zeros((d, n_phys), dtype=float)
@@ -899,6 +1139,8 @@ def build_dynamic_ncp_contact(
     normal_r=1.0,
     friction_r=1.0,
     inactive_handling="hard_zero",
+    friction_law="compliance",
+    smooth_rhs_is_affine=False,
 ):
     r"""Build an explicit-velocity dynamic NCP contact system."""
     return build_ncp_contact(
@@ -933,4 +1175,161 @@ def build_dynamic_ncp_contact(
         normal_r=normal_r,
         friction_r=friction_r,
         inactive_handling=inactive_handling,
+        friction_law=friction_law,
+        smooth_rhs_is_affine=smooth_rhs_is_affine,
     )
+
+
+class NCPBlockSystem:
+    """Block-structured wrapper around NCP contact for Schur-complement solve.
+
+    Exposes the H / J / C / residual decomposition that
+    ``SchurComplementSolver`` consumes.  Internally delegates to
+    ``build_ncp_contact`` for gap evaluation, NCP function computation,
+    and Jacobian assembly, then extracts the 2x2 block structure.
+
+    Parameters
+    ----------
+    cs : ContactSystem
+        Augmented NCP contact system from ``build_ncp_contact``.
+    A_phys : ndarray or sparse, (n_phys, n_phys)
+        Physical mass / descriptor matrix (before augmentation).
+    rhs_jac_func : callable or None
+        Smooth-physics Jacobian (unused here; kept for forward compat).
+    """
+
+    def __init__(self, cs, A_phys, rhs_jac_func=None):
+        self._cs = cs
+        self._A_phys = A_phys
+        self._rhs_jac = rhs_jac_func
+        self.n_phys = int(cs.n_phys)
+        self.n_react = len(cs.y0) - self.n_phys
+        self._jac_aug = cs.rhs_jac
+
+    def assemble_blocks(self, y, t, h, y_prev):
+        """Return H, J, C, g, h_c, precond_diag for the saddle-point system.
+
+        Returns
+        -------
+        dict
+            Keys ``H``, ``J``, ``C``, ``g``, ``h_c``, ``precond_diag``.
+        """
+        n_p = self.n_phys
+        n_r = self.n_react
+
+        jac_full = self._jac_aug(t, y, y_prev, None, h)
+        if sp.issparse(jac_full):
+            jac_full = jac_full.toarray()
+        jac_full = np.asarray(jac_full, dtype=float)
+
+        J_rhs_tl = jac_full[:n_p, :n_p]
+        A_dense = (self._A_phys.toarray() if sp.issparse(self._A_phys)
+                   else np.asarray(self._A_phys, dtype=float))
+        A_over_h = A_dense / h
+
+        # Iteration matrix: physical block
+        H = A_over_h - J_rhs_tl
+
+        # Constraint Jacobian (bottom-left of RHS Jacobian, negated)
+        J = -jac_full[n_p:, :n_p]
+
+        # NCP compliance (bottom-right, negated)
+        C = -jac_full[n_p:, n_p:]
+
+        rhs_val = self._cs.rhs(t, y, y_prev, None, h)
+
+        # Momentum residual
+        F = A_over_h @ (y[:n_p] - y_prev[:n_p]) - rhs_val[:n_p]
+        g = -F
+
+        # Contact residual (NCP rows)
+        h_c = rhs_val[n_p:]
+
+        # Diagonal Macklin preconditioner: approximate J H^{-1} J^T
+        H_diag = np.diag(H)
+        safe_diag = np.where(np.abs(H_diag) > 1e-30, H_diag, 1.0)
+        precond_diag = np.array([
+            float(np.sum(J[i, :] ** 2 / safe_diag))
+            for i in range(n_r)
+        ])
+        precond_diag = np.where(precond_diag > 1e-30, precond_diag, 1.0)
+
+        return {
+            "H": H,
+            "J": J,
+            "C": C,
+            "g": g,
+            "h_c": h_c,
+            "precond_diag": precond_diag,
+        }
+
+
+def build_ncp_contact_blocked(
+    A,
+    rhs_smooth,
+    y0,
+    contacts,
+    gap_func=None,
+    B=None,
+    rhs_jac=None,
+    ncp_type="fischer_burmeister",
+    normal_ncp_type=None,
+    friction_ncp_type=None,
+    normal_r=1.0,
+    friction_r=1.0,
+    gap_tol=0.0,
+    friction_law="compliance",
+    reaction_units="force",
+    **kwargs,
+):
+    """Build an NCP contact system with block decomposition for Schur solve.
+
+    Parameters mirror ``build_ncp_contact``.  Returns an ``NCPBlockSystem``
+    that satisfies the ``BlockStructuredSystem`` protocol.
+
+    Parameters
+    ----------
+    A : ndarray or sparse, (n_phys, n_phys)
+        Physical mass / descriptor matrix.
+    rhs_smooth : callable
+        Smooth-physics RHS ``f(t, y)``.
+    y0 : ndarray, (n_phys,)
+        Physical initial condition.
+    contacts : list of dict
+        Contact descriptors (same format as ``build_ncp_contact``).
+    gap_func : callable or None
+        Gap evaluation ``gap(y, t) -> (n_contacts,)``.
+    B : ndarray or sparse or None
+        Coupling matrix.
+    rhs_jac : callable or None
+        Jacobian of ``rhs_smooth``.
+    ncp_type : str
+        NCP function type.
+    reaction_units : str
+        ``"force"`` or ``"impulse"``.
+    **kwargs
+        Forwarded to ``build_ncp_contact``.
+
+    Returns
+    -------
+    NCPBlockSystem
+    """
+    cs = build_ncp_contact(
+        A=A,
+        rhs_smooth=rhs_smooth,
+        y0=y0,
+        contacts=contacts,
+        gap_func=gap_func,
+        B=B,
+        rhs_jac=rhs_jac,
+        ncp_type=ncp_type,
+        normal_ncp_type=normal_ncp_type,
+        friction_ncp_type=friction_ncp_type,
+        normal_r=normal_r,
+        friction_r=friction_r,
+        gap_tol=gap_tol,
+        friction_law=friction_law,
+        reaction_units=reaction_units,
+        **kwargs,
+    )
+    return NCPBlockSystem(cs, A, rhs_jac_func=rhs_jac)
