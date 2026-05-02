@@ -40,10 +40,11 @@ class ODESolver:
         store_fk: bool = True,
         gc_interval: int = 0,
         abort_on_fixed_failure: bool = True,
+        t_eval: Optional[np.ndarray] = None,
     ):
         """
         Initialize the ODESolver.
-        
+
         Parameters:
             system: The ODE system to be integrated.
             t_span: A tuple (t0, tf) specifying the start and end times.
@@ -59,15 +60,57 @@ class ODESolver:
                 nonlinear failure instead of marching forward with the failed
                 state. The failed attempt is still recorded in
                 ``error_estimates``.
+            t_eval: Strictly increasing array of times in ``[t0, tf]`` that
+                must be evaluated.  When provided, the time loop clips the
+                step so it lands exactly on each ``t_eval`` entry, and the
+                returned histories contain only those entries (matches the
+                scipy ``solve_ivp`` convention).  Pass ``None`` to keep the
+                adaptive/fixed grid as the output.
         """
         self.system = system
         self.t0, self.tf = t_span
         self.h_initial = h
-        self.t_values: List[float] = [self.t0]
-        self.y_values: List[np.ndarray] = [self.system.current_y.copy()]
-        self.h_values: List[float] = [h]
+
+        # ---- t_eval validation and bookkeeping ----
+        self._use_t_eval: bool = False
+        self._t_eval: Optional[np.ndarray] = None
+        self._t_eval_idx: int = 0
+        if t_eval is not None:
+            t_eval_arr = np.asarray(t_eval, dtype=float).reshape(-1)
+            if t_eval_arr.size > 0:
+                if np.any(np.diff(t_eval_arr) <= 0.0):
+                    raise ValueError("t_eval must be strictly increasing")
+                tf_eps = 1.0e-12 * max(abs(self.t0), abs(self.tf), 1.0)
+                if (t_eval_arr[0] < self.t0 - tf_eps
+                        or t_eval_arr[-1] > self.tf + tf_eps):
+                    raise ValueError(
+                        f"t_eval out of range [{self.t0}, {self.tf}]: "
+                        f"got [{t_eval_arr[0]}, {t_eval_arr[-1]}]"
+                    )
+                self._t_eval = np.clip(t_eval_arr, self.t0, self.tf)
+                self._use_t_eval = True
+
+        if self._use_t_eval:
+            self.t_values: List[float] = []
+            self.y_values: List[np.ndarray] = []
+            self.h_values: List[float] = []
+            self.fk: List[Any] = []
+            # If t_eval[0] coincides with t0, record the initial state.
+            te0 = float(self._t_eval[0])
+            t0_eps = 1.0e-12 * max(abs(self.t0), 1.0)
+            if abs(te0 - self.t0) <= t0_eps:
+                self.t_values.append(te0)
+                self.y_values.append(self.system.current_y.copy())
+                self.h_values.append(h)
+                self.fk.append(None)
+                self._t_eval_idx = 1
+        else:
+            self.t_values = [self.t0]
+            self.y_values = [self.system.current_y.copy()]
+            self.h_values = [h]
+            self.fk = []
+
         self.error_estimates: List[Tuple[Any, bool, int]] = []
-        self.fk: List[Any] = []
         # Memory-saving options
         self.thin_output = max(1, int(thin_output))
         self.store_fk = bool(store_fk)
@@ -123,9 +166,38 @@ class ODESolver:
         # fail, falsely reporting "reached minimum step size".
         _tf_eps = 4.0 * np.finfo(float).eps * max(abs(self.t0), abs(self.tf), 1.0)
 
+        # Helper to record a stored sample (handles store_fk + fk fallback).
+        def _record(t_store, y, fk_val, h_taken, errinfo):
+            self.t_values.append(t_store)
+            self.y_values.append(y.copy())
+            if self.store_fk:
+                self.fk.append(fk_val.copy() if fk_val is not None else None)
+            else:
+                self.fk.append(None)
+            self.h_values.append(h_taken)
+            self.error_estimates.append(errinfo)
+
+        # Helper to drain any t_eval points that the latest accepted step
+        # advanced over (catches both exact landings and tiny float drift).
+        def _drain_t_eval(t_now, y_now, fk_val, h_taken, errinfo):
+            if not self._use_t_eval:
+                return
+            te_eps = 1.0e-9 * max(abs(t_now), 1.0)
+            while (self._t_eval_idx < len(self._t_eval)
+                   and self._t_eval[self._t_eval_idx] <= t_now + te_eps):
+                te = float(self._t_eval[self._t_eval_idx])
+                _record(te, y_now, fk_val, h_taken, errinfo)
+                self._t_eval_idx += 1
+
         while self.tf - t > _tf_eps:
             # Ensure we do not overshoot the final time.
             h_step = min(h, self.tf - t)
+            # When t_eval is given, also clip the step so it lands exactly
+            # on the next required output time.
+            if self._use_t_eval and self._t_eval_idx < len(self._t_eval):
+                next_te = float(self._t_eval[self._t_eval_idx])
+                if next_te > t:
+                    h_step = min(h_step, next_te - t)
             if self.system.adaptive:
                 # Adaptive stepping returns:
                 # (y_new, fk_new, h_new, E, success, solver_error, iterations)
@@ -133,17 +205,15 @@ class ODESolver:
                 if success:
                     t += h_step
                     _step_count += 1
-                    # Thin output: only store every Nth step (always store last)
-                    _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
-                    if _step_count % _thin == 0 or _is_last:
-                        self.t_values.append(t)
-                        self.y_values.append(y_new.copy())
-                        if self.store_fk:
-                            self.fk.append(fk_new.copy() if fk_new is not None else None)
-                        else:
-                            self.fk.append(None)
-                        self.h_values.append(h_step)
-                        self.error_estimates.append((solver_error, success, iterations))
+                    if self._use_t_eval:
+                        _drain_t_eval(t, y_new, fk_new, h_step,
+                                      (solver_error, success, iterations))
+                    else:
+                        # Thin output: only store every Nth step (always store last)
+                        _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
+                        if _step_count % _thin == 0 or _is_last:
+                            _record(t, y_new, fk_new, h_step,
+                                    (solver_error, success, iterations))
                     self.system.current_y = y_new
                     h = h_new  # Update step size for next iteration.
                     # Periodic garbage collection for large problems
@@ -162,16 +232,14 @@ class ODESolver:
                 if success:
                     t += h_step
                     _step_count += 1
-                    _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
-                    if _step_count % _thin == 0 or _is_last:
-                        self.t_values.append(t)
-                        self.y_values.append(y_new.copy())
-                        if self.store_fk:
-                            self.fk.append(fk_new.copy() if fk_new is not None else None)
-                        else:
-                            self.fk.append(None)
-                        self.h_values.append(h_step)
-                        self.error_estimates.append((solver_error, success, iterations))
+                    if self._use_t_eval:
+                        _drain_t_eval(t, y_new, fk_new, h_step,
+                                      (solver_error, success, iterations))
+                    else:
+                        _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
+                        if _step_count % _thin == 0 or _is_last:
+                            _record(t, y_new, fk_new, h_step,
+                                    (solver_error, success, iterations))
                     self.system.current_y = y_new
                     if _gc_iv > 0 and _step_count % _gc_iv == 0:
                         gc.collect()
@@ -187,16 +255,14 @@ class ODESolver:
                         break
                     t += h_step
                     _step_count += 1
-                    _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
-                    if _step_count % _thin == 0 or _is_last:
-                        self.t_values.append(t)
-                        self.y_values.append(y_new.copy())
-                        if self.store_fk:
-                            self.fk.append(fk_new.copy() if fk_new is not None else None)
-                        else:
-                            self.fk.append(None)
-                        self.h_values.append(h_step)
-                        self.error_estimates.append((solver_error, success, iterations))
+                    if self._use_t_eval:
+                        _drain_t_eval(t, y_new, fk_new, h_step,
+                                      (solver_error, success, iterations))
+                    else:
+                        _is_last = (t >= self.tf - 1e-14 * abs(self.tf))
+                        if _step_count % _thin == 0 or _is_last:
+                            _record(t, y_new, fk_new, h_step,
+                                    (solver_error, success, iterations))
                     self.system.current_y = y_new
                     if _gc_iv > 0 and _step_count % _gc_iv == 0:
                         gc.collect()

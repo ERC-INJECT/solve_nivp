@@ -160,6 +160,7 @@ def solve_nivp(
   abort_on_fixed_failure=True,
   jacobian_scaling=None,
   active_set_filter=False,
+  t_eval=None,
 ):
   """Integrate an ODE / simple index–1 DAE with optional nonsmooth projection.
 
@@ -504,6 +505,7 @@ def solve_nivp(
     store_fk=store_fk,
     gc_interval=gc_interval,
     abort_on_fixed_failure=abort_on_fixed_failure,
+    t_eval=t_eval,
   )
   return solver_obj.solve(return_attempts=return_attempts)
 
