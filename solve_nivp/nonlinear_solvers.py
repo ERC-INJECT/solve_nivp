@@ -1112,6 +1112,9 @@ class ImplicitEquationSolver:
                                     else J_local.tocsr())
                                 rhs_solve = self._scale_rhs(rhs)
                             J_csr = self._to_csr(J_local) if not sp.issparse(J_local) else J_local
+                        if self.diagonal_regularization > 0.0:
+                            J_csr = J_csr + self.diagonal_regularization * sp.eye(
+                                J_csr.shape[0], format='csr')
                         try:
                             J_csc = J_csr.tocsc() if not sp.isspmatrix_csc(J_csr) else J_csr
                             lu_local = spla.splu(J_csc, permc_spec=self.splu_permc_spec)
