@@ -26,7 +26,7 @@ The helper returns everything needed to call :func:`solve_nivp`::
 
 import numpy as np
 import scipy.sparse as sp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from .projections import (
@@ -80,6 +80,7 @@ class ContactSystem:
     n_phys: int
     B: Any = None
     rhs_jac: Optional[Callable] = None
+    solver_opts: Dict[str, Any] = field(default_factory=dict)
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -4128,7 +4128,7 @@ class GeneralMoreauVIProjection(Projection):
         return r
 
     # ---------- shared assembly for W and b on the active set ----------
-    def _build_W_b(self, t, y_bar, prev_state, active_idx_full):
+    def _build_W_b(self, t, y_bar, prev_state, active_idx_full, step_size=None):
         J = np.asarray(self.J_u(t, y_bar), float)  # (m, n)
         m = J.shape[0]
         act = np.asarray(active_idx_full, int)
@@ -4159,7 +4159,7 @@ class GeneralMoreauVIProjection(Projection):
         W = np.zeros((ma, ma))
         for j in range(ma):
             ej_full = embed(np.eye(ma)[:, j])
-            dy = self.G_apply(t, y_bar, ej_full)   # (n,)
+            dy = self.G_apply(t, y_bar, ej_full, step_size=step_size)
             du_full = J @ dy                       # (m,)
             W[:, j] = restrict(du_full)            # (m_a,)
         return W, b, J, restrict, embed, act
@@ -4184,10 +4184,13 @@ class GeneralMoreauVIProjection(Projection):
         if active.size == 0:
             return y_bar
 
-        W, b, J, restrict, embed, act = self._build_W_b(t, y_bar, prev_state, active)
+        step_size = kw.get('step_size', None)
+        W, b, J, restrict, embed, act = self._build_W_b(
+            t, y_bar, prev_state, active, step_size=step_size,
+        )
         lam_a = self._solve_Rplus_LCP_pg(W, b, self.lcp_maxit, self.lcp_tol)
         lam_full = embed(lam_a)
-        dy = self.G_apply(t, y_bar, lam_full)
+        dy = self.G_apply(t, y_bar, lam_full, step_size=step_size)
         return y_bar + dy
 
     # ---------- tangent cone (Clarke selection) ----------
@@ -4208,7 +4211,10 @@ class GeneralMoreauVIProjection(Projection):
             return sp.eye(n, format='csr')
 
         prev_for_b = prev_state if prev_state is not None else y_it
-        W, b, J, restrict, embed, act = self._build_W_b(t, y_bar, prev_for_b, active)
+        step_size = kw.get('step_size', None)
+        W, b, J, restrict, embed, act = self._build_W_b(
+            t, y_bar, prev_for_b, active, step_size=step_size,
+        )
         lam_a = self._solve_Rplus_LCP_pg(W, b, self.lcp_maxit, self.lcp_tol)
         u_free = restrict(self.u_map(t, y_bar))
         u_plus = u_free + W @ lam_a

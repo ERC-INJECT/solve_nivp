@@ -1848,7 +1848,6 @@ def build_dynamic_desaxce_residual_contact(
                     mu_all[k] - beta_all[k],
                     rho_all[k],
                     offset=offset_blk,
-                    delassus=_delassus_all[sl],
                 )
                 del phi
 

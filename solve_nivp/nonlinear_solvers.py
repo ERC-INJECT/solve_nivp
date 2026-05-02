@@ -107,6 +107,11 @@ class ImplicitEquationSolver:
         # Jacobian equilibration for improved conditioning
         jacobian_scaling: str = 'none',
         jacobian_sparsity=None,
+        cold_start_slices=None,
+        petsc_field_slices=None,
+        damped_step_fraction: float = 1.0,
+        diagonal_regularization: float = 0.0,
+        modified_newton_identity: bool = False,
     ) -> None:
         if method not in ['VI', 'semismooth_newton']:
             raise ValueError("Unsupported solver method. Use 'VI' or 'semismooth_newton'.")
@@ -148,7 +153,7 @@ class ImplicitEquationSolver:
             self.adaptive_lam = False
         self.lam_update_strategy = strategy
         self.globalization = (globalization or 'none').lower()
-        if self.globalization not in ('none', 'linesearch'):
+        if self.globalization not in ('none', 'linesearch', 'damped'):
             self.globalization = 'none'
         self.ls_c1 = float(ls_c1)
         self.ls_beta = float(ls_beta)
@@ -246,6 +251,12 @@ class ImplicitEquationSolver:
         self.jacobian_sparsity = None
         self._jacobian_sparsity = None
         self.set_jacobian_sparsity(jacobian_sparsity)
+
+        self._cold_start_slices = list(cold_start_slices) if cold_start_slices else None
+        self.petsc_field_slices = list(petsc_field_slices) if petsc_field_slices else None
+        self.damped_step_fraction = float(damped_step_fraction)
+        self.diagonal_regularization = float(diagonal_regularization)
+        self.modified_newton_identity = bool(modified_newton_identity)
 
         # Tangent structure cache (for dense-to-sparse optimization)
         self._D_cached = None
@@ -1253,6 +1264,8 @@ class ImplicitEquationSolver:
                         alpha *= self.ls_beta
                     if not accepted:
                         return (y, F_in, errF, False, iteration)
+            elif self.globalization == 'damped' and self.damped_step_fraction != 1.0:
+                np.add(y, self.damped_step_fraction * delta, out=y)
             else:
                 np.add(y, delta, out=y)
 
@@ -1329,7 +1342,7 @@ class ImplicitEquationSolver:
 
         Fk = func(y)
         self.last_Fk_val = Fk
-        np.multiply(rho_vec, Fk, out=_r_buf)          # residual = rho * F
+        np.copyto(_r_buf, Fk)                         # residual = F (root-finding)
         err = _err(_r_buf, y)
 
         k = 0
@@ -1369,7 +1382,7 @@ class ImplicitEquationSolver:
             Fk = Fk_new
             self.last_Fk_val = Fk
 
-            np.multiply(rho_vec, Fk, out=_r_buf)
+            np.copyto(_r_buf, Fk)
             err = _err(_r_buf, y)
             k += 1
 

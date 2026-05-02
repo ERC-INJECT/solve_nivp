@@ -416,6 +416,10 @@ class AdaptiveStepping:
     # ------------------------------------------------------------------
 
     def _infer_method_order(self, integrator) -> int:
+        p_emb = getattr(integrator, 'embedded_order', None)
+        if isinstance(p_emb, (int, float)) and p_emb > 0:
+            return int(p_emb)
+
         p = getattr(integrator, 'order', None)
         if isinstance(p, (int, float)) and p > 0:
             return int(p)

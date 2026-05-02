@@ -1327,6 +1327,7 @@ class RadauIIA(BackwardEuler):
         wf_maxiter: int = 3,
         wf_tol: float = 1e-12,
         use_coupled_newton: bool = True,
+        projected_radau_contact=None,
         **kwargs,
     ):
         if stages not in (1, 2, 3):
@@ -1336,6 +1337,7 @@ class RadauIIA(BackwardEuler):
         self.wf_maxiter = max(1, int(wf_maxiter))
         self.wf_tol = float(wf_tol)
         self.use_coupled_newton = bool(use_coupled_newton)
+        self.projected_radau_contact = projected_radau_contact
 
         # ── Butcher tableaux (Hairer & Wanner, Solving ODEs II, §II.7) ────────
         _sq6 = math.sqrt(6.0)
@@ -1587,16 +1589,45 @@ class RadauIIA(BackwardEuler):
         saved_jac = solver.jacobian
         saved_atol_vec = solver._nl_atol_vec
         saved_rtol_vec = solver._nl_rtol_vec
+        saved_component_slices = solver.component_slices
+        saved_field_slices = solver.petsc_field_slices
+
+        def _expand_slice(sl, off):
+            start = (sl.start if sl.start is not None else 0) + off
+            stop = (sl.stop if sl.stop is not None else n) + off
+            return slice(start, stop, sl.step)
+
+        def _expand_indices(idx, off):
+            arr = np.arange(*idx.indices(n)) if isinstance(idx, slice) else np.asarray(idx)
+            return arr + off
 
         if saved_cold:
             stacked_cs = []
             for stage_idx in range(s):
                 off = stage_idx * n
                 for sl in saved_cold:
-                    start = (sl.start if sl.start is not None else 0) + off
-                    stop = (sl.stop if sl.stop is not None else n) + off
-                    stacked_cs.append(slice(start, stop, sl.step))
+                    stacked_cs.append(_expand_slice(sl, off))
             solver._cold_start_slices = stacked_cs
+
+        if saved_component_slices:
+            stacked_components = []
+            for stage_idx in range(s):
+                off = stage_idx * n
+                for entry in saved_component_slices:
+                    if isinstance(entry, slice):
+                        stacked_components.append(_expand_slice(entry, off))
+                    else:
+                        stacked_components.append(np.asarray(entry) + off)
+            solver.component_slices = stacked_components
+
+        if saved_field_slices:
+            stacked_fields = []
+            for entry in saved_field_slices:
+                merged = np.concatenate(
+                    [_expand_indices(entry, stage_idx * n) for stage_idx in range(s)]
+                )
+                stacked_fields.append(merged)
+            solver.petsc_field_slices = stacked_fields
 
         if solver._use_weighted_norm:
             atol_n, rtol_n = solver._ensure_nl_tol_vectors(n)
@@ -1616,6 +1647,8 @@ class RadauIIA(BackwardEuler):
             solver.jacobian = saved_jac
             solver._nl_atol_vec = saved_atol_vec
             solver._nl_rtol_vec = saved_rtol_vec
+            solver.component_slices = saved_component_slices
+            solver.petsc_field_slices = saved_field_slices
 
         Y_list = [Z_sol[i * n:(i + 1) * n].copy() for i in range(s)]
         f_stage_out = [
@@ -1658,6 +1691,9 @@ class RadauIIA(BackwardEuler):
         iterations : int
             Total nonlinear iterations summed over all stage solves.
         """
+        if self.projected_radau_contact is not None:
+            return self.projected_radau_contact.step(self, t, y, h)
+
         # 1-stage: delegate unchanged to BackwardEuler
         if self.stages == 1:
             return super().step(fun, t, y, h)
