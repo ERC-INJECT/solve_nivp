@@ -88,7 +88,7 @@ class ImplicitEquationSolver:
         eisenstat_exp: float = 0.5,
         adaptive_lam: bool = True,
         lam_update_strategy: str = 'vi',
-        globalization: str = 'none',
+        globalization: str = 'linesearch',
         ls_c1: float = 1e-4,
         ls_beta: float = 0.5,
         ls_min_alpha: float = 1e-8,
