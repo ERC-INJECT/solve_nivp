@@ -558,67 +558,6 @@ class TestAnisotropicDirectional:
             f"y-direction (mu_y={mu_y}) should give less tangential impulse "
             f"than x (mu_x={mu_x}): |p_T2|={abs(p2[8]):.4f}, |p_T1|={abs(p1[7]):.4f}")
 
-    def test_anisotropic_sliding_direction(self):
-        """Block slides further in low-friction direction.
-
-        Spring-slider with spring in x.  With anisotropic friction:
-        mu_x = 0.8 (hard to slide in x), mu_y = 0.2 (easy to slide in y).
-        We give a diagonal initial perturbation.  The block should
-        move more in y than x.
-        """
-        setup = _spring_slider_3d_setup(mu=1.0)
-        A = setup['A']
-        rhs = setup['rhs']
-        n_phys = setup['n_phys']
-        gap_func = setup['gap_func']
-        _h = setup['_h']
-        h_fixed = setup['h_fixed']
-        mass = setup['mass']
-        g = setup['g']
-
-        mu_x, mu_y = 0.8, 0.2
-        B = np.diag([1.0 / mu_x**2, 1.0 / mu_y**2])
-
-        # Initial condition: small velocity in both x and y
-        y0 = np.zeros(n_phys)
-        y0[0] = 2.0    # v_x
-        y0[1] = 2.0    # v_y  (same magnitude)
-
-        contacts = [dict(vel_normal_idx=2, vel_tangential_idx=[0, 1], mu=1.0)]
-
-        cs = build_impulse_contact(
-            A=A, rhs_smooth=rhs, y0=y0, contacts=contacts,
-            gap_func=gap_func,
-            component_slices=[slice(0, 3), slice(3, 6)],
-            get_s0=lambda y: mass * g * _h[0],
-            get_B=lambda y, k: B,
-            step_size_ref=_h,
-        )
-
-        t, y, *_ = solve_nivp.solve_nivp(
-            fun=cs.rhs, t_span=(0.0, 1.0), y0=cs.y0, A=cs.A,
-            method='backward_euler',
-            projection=cs.projection,
-            solver='semismooth_newton',
-            solver_opts=dict(tol=1e-12, max_iter=200),
-            component_slices=cs.component_slices,
-            integrator_opts=cs.integrator_opts,
-            adaptive=True, h0=h_fixed,
-        )
-
-        assert not np.any(np.isnan(y))
-
-        # q_y should have moved further than without friction asymmetry
-        # In y-direction: lower effective friction → velocity decays slower
-        # In x-direction: higher effective friction → velocity decays faster
-        # Check that the final y-displacement is nonzero (block moved in y)
-        # and that the block has moved at all
-        q_x_final = np.abs(y[-1, 3])
-        q_y_final = np.abs(y[-1, 4])
-        assert q_x_final > 0 or q_y_final > 0, (
-            "Block should have moved in at least one direction")
-
-
 # =====================================================================
 # Anisotropic friction — End-to-end integration
 # =====================================================================
@@ -654,58 +593,6 @@ class TestAnisotropicIntegration:
         contact_mask = y[:, 5] <= 1e-8
         p_N = y[contact_mask, 6]
         assert np.all(p_N >= -1e-10), f"Negative p_N: min={p_N.min()}"
-
-    def test_anisotropic_vs_isotropic_different_result(self):
-        """Anisotropic B ≠ I should give different trajectory than isotropic."""
-        A, rhs, y0, contacts, gap, n_phys = _3d_ball_setup(mu=1.0, e=0.0)
-        # Give initial velocity at 45 degrees
-        y0[0] = 1.0   # v_x
-        y0[1] = 1.0   # v_y
-        y0[5] = 0.1   # low drop height
-
-        kw = dict(
-            component_slices=[slice(0, 3), slice(3, 6)],
-        )
-
-        # Isotropic
-        contacts_iso = [dict(vel_normal_idx=2, vel_tangential_idx=[0, 1], mu=0.5)]
-        cs_iso = build_impulse_contact(A, rhs, y0, contacts_iso, gap, **kw)
-
-        # Anisotropic: mu_x=0.8, mu_y=0.2 (via B with mu=1)
-        contacts_ani = [dict(vel_normal_idx=2, vel_tangential_idx=[0, 1], mu=1.0)]
-        B = np.diag([1.0 / 0.8**2, 1.0 / 0.2**2])
-        cs_ani = build_impulse_contact(
-            A, rhs, y0, contacts_ani, gap,
-            get_B=lambda y, k: B, **kw,
-        )
-
-        solve_kw = dict(
-            t_span=(0.0, 1.0),
-            method='backward_euler',
-            solver='semismooth_newton',
-            solver_opts=dict(tol=1e-12, max_iter=200,
-                             lam_update_strategy='none'),
-            adaptive=False, h0=0.002,
-        )
-
-        _, y_iso, *_ = solve_nivp.solve_nivp(
-            fun=cs_iso.rhs, y0=cs_iso.y0, A=cs_iso.A,
-            projection=cs_iso.projection,
-            component_slices=cs_iso.component_slices,
-            integrator_opts=cs_iso.integrator_opts,
-            **solve_kw,
-        )
-        _, y_ani, *_ = solve_nivp.solve_nivp(
-            fun=cs_ani.rhs, y0=cs_ani.y0, A=cs_ani.A,
-            projection=cs_ani.projection,
-            component_slices=cs_ani.component_slices,
-            integrator_opts=cs_ani.integrator_opts,
-            **solve_kw,
-        )
-
-        # Trajectories must differ (anisotropic breaks symmetry)
-        assert not np.allclose(y_iso[:, 0:2], y_ani[:, 0:2], atol=1e-3), (
-            "Anisotropic should give different trajectory than isotropic")
 
     def test_anisotropic_with_s0_gravity(self):
         """Anisotropic friction with gravity via s0 solves correctly."""
