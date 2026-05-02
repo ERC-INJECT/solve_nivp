@@ -600,6 +600,69 @@ def test_projected_radau_dispatch_runs_without_changing_plain_radau():
     assert plain.projected_radau_contact is None
 
 
+def test_first_bounce_step_with_restitution():
+    """Single Radau IIA step crosses the first impact with Newton restitution e=0.8.
+
+    Frictionless 1-D bouncing ball, small h that brackets the impact.  After the
+    step, the velocity must reverse to +e*|v_pre| (Newton's law) and the gap
+    must remain >= 0.  Newton must converge within a handful of iterations.
+    """
+    mass = 1.0
+    gravity = 9.81
+    restitution = 0.8
+    h = 1.0e-3
+    y_pre = np.array(
+        [-6.337879999999952, 0.0036328800000074418], dtype=float
+    )
+
+    A = np.diag([mass, 1.0])
+
+    def rhs(t, y, *extra):
+        return np.array([-mass * gravity, y[0]], dtype=float)
+
+    def rhs_jac(t, y, *extra):
+        J = np.zeros((2, 2))
+        J[1, 0] = 1.0
+        return J
+
+    def gap_func(y, t=None):
+        return np.array([y[1]])
+
+    cs = build_projected_radau_contact(
+        A=A,
+        rhs_smooth=rhs,
+        y0=y_pre,
+        contacts=[dict(vel_normal_idx=0, mu=0.0)],
+        gap_func=gap_func,
+        rhs_jac=rhs_jac,
+        contact_law="minimum_map",
+        restitution_normal=restitution,
+        reported_reaction_units="force",
+    )
+
+    solver = ImplicitEquationSolver(
+        method="semismooth_newton",
+        proj=cs.projection,
+        component_slices=cs.component_slices,
+        tol=1.0e-11,
+        max_iter=80,
+        linear_solver="splu",
+    )
+    solver.rhs_jacobian = cs.rhs_jac
+    integrator = RadauIIA(solver=solver, A=cs.A, **cs.integrator_opts)
+
+    y, _Fk, _err, ok, iterations = integrator.step(cs.rhs, 0.0, cs.y0, h)
+
+    assert ok, "Radau step did not converge through the first impact"
+    assert iterations <= 4, f"Too many Newton iterations: {iterations}"
+    assert y[0] > 0.0, "Velocity must reverse sign after impact"
+    np.testing.assert_allclose(
+        y[0], restitution * abs(y_pre[0]), rtol=5.0e-3,
+        err_msg="Post-impact velocity must satisfy Newton's restitution law",
+    )
+    assert y[1] >= -1.0e-10, "Position must not penetrate the floor"
+
+
 def test_bouncing_ball_projected_radau_is_inelastic_after_impact():
     mass = 1.0
     gravity = 9.81
