@@ -1,0 +1,10 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include pytest.ini
+include docs/Makefile
+include docs/make.bat
+
+recursive-include solve_nivp *.py
+recursive-include tests *.py
+recursive-include docs/source *.py *.rst

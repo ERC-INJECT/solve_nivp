@@ -9,7 +9,7 @@
 project = 'solve_nivp'
 copyright = '2025, David Riley'
 author = 'David Riley'
-release = 'March 26, 2025'
+release = '0.2.0.dev1'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -23,8 +23,9 @@ extensions = [
     'sphinx.ext.intersphinx',
 ]
 
-# Generate autosummary pages automatically
-autosummary_generate = True
+# API stubs are committed under docs/source/api. Regenerate them explicitly
+# when the public module list changes so normal docs builds do not dirty Git.
+autosummary_generate = False
 
 # Type hints in description for cleaner signatures
 autodoc_typehints = 'description'
@@ -49,10 +50,9 @@ exclude_patterns = []
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = 'alabaster'
-html_static_path = ['_static']
+html_static_path = []
 
 latex_engine = 'xelatex'
 # latex_elements = {
 #     'preamble': r'\usepackage[utf8]{inputenc}\usepackage[T1]{fontenc}',
 # }
-
