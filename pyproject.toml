@@ -66,3 +66,7 @@ solve_nivp-selftest = "solve_nivp._selftest:main"
 Homepage = "https://github.com/ERC-INJECT/solve_nivp"
 Documentation = "https://github.com/ERC-INJECT/solve_nivp/tree/main/docs"
 Issues = "https://github.com/ERC-INJECT/solve_nivp/issues"
+
+[tool.setuptools.packages.find]
+include = ["solve_nivp*"]
+exclude = ["tests*"]

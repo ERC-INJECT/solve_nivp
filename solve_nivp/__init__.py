@@ -49,6 +49,9 @@ See the Sphinx documentation (``docs/``) for extended examples.
 """
 
 import numpy as np
+
+__version__ = "0.2.0.dev1"
+
 from .projections import (
   Projection,
   CoulombProjection,
@@ -94,8 +97,8 @@ from .rattle_contact import (
   RattleSolver,
 )
 
-# Curated public API
-__all__ = [
+_STABLE_PUBLIC_API = [
+  '__version__',
   'solve_nivp',
   # Core system / driver
   'ODESystem', 'ODESolver',
@@ -109,11 +112,16 @@ __all__ = [
   'GeneralMoreauVIProjection', 'MuScaledSOCProjection', 'MoreauSOCProjection',
   'AnisotropicSOCProjection', 'AlgebraicConstraintProjection',
   'CompositeContactProjection',
+]
+
+_EXPERIMENTAL_PUBLIC_API = [
+  # Schur and block helpers
+  'BackwardEulerSchur', 'RadauIIASchur',
+  'SchurComplementSolver', 'BlockStructuredSystem',
   # Contact helpers
   'build_impulse_contact', 'build_alart_curnier_contact',
   'build_dynamic_alart_curnier_contact', 'build_ncp_contact',
   'build_dynamic_ncp_contact', 'build_ncp_contact_blocked',
-  'SchurComplementSolver', 'BlockStructuredSystem',
   'build_dynamic_desaxce_contact',
   'build_dynamic_desaxce_projected_contact',
   'build_dynamic_desaxce_residual_contact',
@@ -129,6 +137,10 @@ __all__ = [
   'RattleSolveResult',
   'RattleSolver',
 ]
+
+# Curated top-level API.  Experimental names remain importable for
+# compatibility; docs/source/public_api.rst defines the support policy.
+__all__ = _STABLE_PUBLIC_API + _EXPERIMENTAL_PUBLIC_API
 
 
 def solve_nivp(

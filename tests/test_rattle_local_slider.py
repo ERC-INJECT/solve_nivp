@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,20 +14,25 @@ EXAMPLES = ROOT / "examples"
 if str(EXAMPLES) not in sys.path:
     sys.path.insert(0, str(EXAMPLES))
 
-from spring_slider_coulomb_backend_helpers import (
-    _rattle_local_slider_backend,
-    _rattle_schur_patch_backend,
+pytestmark = pytest.mark.examples
+
+spring_helpers = pytest.importorskip(
+    "spring_slider_coulomb_backend_helpers",
+    reason="requires the spring-slider example helper module",
 )
-from spring_slider_coulomb_backend_helpers import (
-    make_fem_scaled_chain_case,
-    make_multinode_chain_case,
-    make_schur_patch_case,
-    run_case_bundle,
+_rattle_local_slider_backend = spring_helpers._rattle_local_slider_backend
+_rattle_schur_patch_backend = spring_helpers._rattle_schur_patch_backend
+make_fem_scaled_chain_case = spring_helpers.make_fem_scaled_chain_case
+make_multinode_chain_case = spring_helpers.make_multinode_chain_case
+make_schur_patch_case = spring_helpers.make_schur_patch_case
+run_case_bundle = spring_helpers.run_case_bundle
+
+bouncing_helpers = pytest.importorskip(
+    "bouncing_ball_backend_helpers",
+    reason="requires the bouncing-ball example helper module",
 )
-from bouncing_ball_backend_helpers import (
-    convergence_sweep_dataframe,
-    make_persistent_contact_case,
-)
+convergence_sweep_dataframe = bouncing_helpers.convergence_sweep_dataframe
+make_persistent_contact_case = bouncing_helpers.make_persistent_contact_case
 
 
 def test_rattle_elastic_bounce_detects_repeated_impacts():
