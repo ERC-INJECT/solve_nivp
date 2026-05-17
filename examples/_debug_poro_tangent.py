@@ -1,7 +1,7 @@
 """Minimal poro test for reduced-space De Saxcé tangent_cone_split.
 Reuses the poro setup but only runs 1 step to diagnose the tangent."""
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 os.environ['MPLBACKEND'] = 'Agg'
 
 import numpy as np

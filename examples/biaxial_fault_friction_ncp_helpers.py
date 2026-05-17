@@ -39,8 +39,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PORO_ROOT = Path("/home/david/Documents/Poroelasticity")
 NCP_NOTEBOOK_PATH = REPO_ROOT / "examples" / "prestressed_fault_dynamic_ncp.ipynb"
 
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 if PORO_ROOT.exists() and str(PORO_ROOT) not in sys.path:
     sys.path.insert(0, str(PORO_ROOT))
 

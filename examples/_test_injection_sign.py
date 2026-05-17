@@ -4,7 +4,7 @@ Source placed near the fault (right boundary) so the pressure front arrives
 within the simulation window. Two runs: +Q0 (expansion, should weaken friction)
 and -Q0 (compression, should strengthen). Compares final slip."""
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
 import numpy as np
 import matplotlib.pyplot as plt

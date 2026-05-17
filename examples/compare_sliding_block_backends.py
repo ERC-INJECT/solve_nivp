@@ -30,7 +30,7 @@ PORO_ROOT = Path("/home/david/Documents/Poroelasticity")
 
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
-sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
 if PORO_ROOT.exists():
     sys.path.insert(0, str(PORO_ROOT))
 

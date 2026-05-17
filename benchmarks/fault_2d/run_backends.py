@@ -16,7 +16,10 @@ import scipy.sparse as sp
 from numba import njit
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_SRC_DIR = _REPO_ROOT / "src"
 _RL_DIR = _REPO_ROOT / "RL_Adaption" / "2D_FAULT"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 if str(_RL_DIR) not in sys.path:
     sys.path.insert(0, str(_RL_DIR))
 

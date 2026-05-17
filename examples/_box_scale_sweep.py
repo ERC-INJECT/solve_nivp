@@ -16,7 +16,7 @@ from __future__ import annotations
 import os, sys, time, json
 os.environ.setdefault('OMP_NUM_THREADS', '4')
 os.environ['MPLBACKEND'] = 'Agg'
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
 import numpy as np
 import scipy.sparse as sp

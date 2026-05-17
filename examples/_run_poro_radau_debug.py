@@ -1,6 +1,6 @@
 """Standalone script extracted from porodynamics_radau_friction notebook for debugging."""
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 os.environ['MPLBACKEND'] = 'Agg'
 
 import numpy as np

@@ -57,9 +57,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 REPO_ROOT = Path.cwd()
-while REPO_ROOT.name and not (REPO_ROOT / "solve_nivp").is_dir():
+while REPO_ROOT.name and not (REPO_ROOT / "src" / "solve_nivp").is_dir():
     REPO_ROOT = REPO_ROOT.parent
-for path in (REPO_ROOT, REPO_ROOT / "examples"):
+for path in (REPO_ROOT / "src", REPO_ROOT / "examples"):
     p = str(path)
     if str(path) not in sys.path:
         sys.path.insert(0, p)

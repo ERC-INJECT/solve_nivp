@@ -6,7 +6,7 @@ to show exactly what the SSN sees.
 """
 import os, sys
 os.environ['OMP_NUM_THREADS'] = '4'
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import numpy as np
 import scipy.sparse as sp

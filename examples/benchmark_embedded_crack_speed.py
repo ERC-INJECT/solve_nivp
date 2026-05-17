@@ -24,6 +24,7 @@ matplotlib.use("Agg")
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
 NB = ROOT / "examples" / "embedded_crack_mohr_coulomb_ncp_constant_mu_2026-04-24.ipynb"
 
 
@@ -80,7 +81,7 @@ def run_cell(nb: dict[str, Any], ns: dict[str, Any], idx: int) -> None:
 
 def prepare_context(args: argparse.Namespace) -> tuple[dict[str, Any], float]:
     nb = load_notebook()
-    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(SRC))
     ns: dict[str, Any] = {"__name__": "__embedded_crack_speed__"}
 
     run_cell(nb, ns, 2)

@@ -1,7 +1,7 @@
 """Diagnostic: compare FD Jacobian of VI residual vs assembled Newton Jacobian
 for the De Saxcé reduced-space backend with state-dependent friction."""
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
 import numpy as np
 import scipy.sparse as sp
