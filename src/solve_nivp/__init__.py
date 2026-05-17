@@ -64,9 +64,9 @@ from .projections import (
   AlgebraicConstraintProjection,
   CompositeContactProjection,
 )
-from .nonlinear_solvers import ImplicitEquationSolver, UMFPACK_AVAILABLE, PETSC_AVAILABLE
+from .solvers.nonlinear_solvers import ImplicitEquationSolver, UMFPACK_AVAILABLE, PETSC_AVAILABLE
 from .integrations import BackwardEuler, BackwardEulerSchur, RadauIIASchur, Trapezoidal, ThetaMethod, CompositeMethod, EmbeddedBETR, SDIRK2, RadauIIA  # , BDFMethod
-from .block_system import SchurComplementSolver, BlockStructuredSystem
+from .solvers.block_system import SchurComplementSolver, BlockStructuredSystem
 from .ODESystem import ODESystem
 from .ODESolver import ODESolver
 from .contact import build_impulse_contact, ContactSystem

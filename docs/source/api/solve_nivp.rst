@@ -34,4 +34,5 @@ Modules
    solve_nivp.projections
    solve_nivp.rattle_contact
    solve_nivp.rl
+   solve_nivp.solvers
    solve_nivp.soccp_pgs

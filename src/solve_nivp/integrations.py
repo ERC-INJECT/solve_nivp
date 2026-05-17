@@ -3,7 +3,7 @@ import math
 import numpy as np
 from abc import ABC, abstractmethod
 import scipy.sparse as sp
-from .nonlinear_solvers import ImplicitEquationSolver  # Relative import for a solver class
+from .solvers.nonlinear_solvers import ImplicitEquationSolver  # Relative import for a solver class
 
 
 class IntegrationMethod(ABC):
@@ -476,7 +476,7 @@ class BackwardEulerSchur(IntegrationMethod):
         self._schur_opts = schur_solver_opts or {}
 
     def step(self, fun, t, y, h):
-        from .block_system import SchurComplementSolver
+        from .solvers.block_system import SchurComplementSolver
 
         solver = SchurComplementSolver(**self._schur_opts)
         y_new, err, converged, iters = solver.solve(
@@ -543,7 +543,7 @@ class RadauIIASchur(IntegrationMethod):
             self.order = 5
 
     def step(self, fun, t, y, h):
-        from .block_system import SchurComplementSolver
+        from .solvers.block_system import SchurComplementSolver
 
         s = self.stages
         solver = SchurComplementSolver(**self._schur_opts)
