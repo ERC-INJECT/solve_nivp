@@ -16,5 +16,5 @@ This site documents the public API and provides guidance for using the solvers a
    quickstart
    public_api
    examples
-   modules
+   api/solve_nivp
    development

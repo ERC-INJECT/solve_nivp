@@ -1,11 +1,11 @@
 """Alart-Curnier frictional contact helpers.
 
 This module provides a full-state benchmark implementation of the
-Alart-Curnier residual discussed in:
+Alart-Curnier residual discussed in::
 
-  Bertails-Descoubes, Cadoux, Daviet, Acary (2011)
-  "A Nonsmooth Newton Solver for Capturing Exact Coulomb Friction
-   in Fiber Assemblies"
+    Bertails-Descoubes, Cadoux, Daviet, Acary (2011)
+    "A Nonsmooth Newton Solver for Capturing Exact Coulomb Friction
+     in Fiber Assemblies"
 
 Unlike :mod:`solve_nivp.contact`, which augments the physical system
 with reaction DOFs and enforces the Coulomb cone through an external
@@ -374,7 +374,8 @@ def build_alart_curnier_contact(
     A, rhs_smooth, y0, contacts, gap_func, B, theta, coupling_theta,
     component_slices, C_extract, D_extract, rate_form, constraints,
     rhs_jac
-        Same interpretation as in :func:`build_impulse_contact`,
+        Same interpretation as in
+        :func:`solve_nivp.contact.build_impulse_contact`,
         except that ``e`` / restitution coefficients in ``contacts`` are
         currently ignored by this benchmark implementation.
     rho_n, rho_t : float, default 1.0

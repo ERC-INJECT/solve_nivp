@@ -30,6 +30,13 @@ autosummary_generate = False
 # Type hints in description for cleaner signatures
 autodoc_typehints = 'description'
 
+# Optional extras are documented without requiring their runtime dependencies.
+autodoc_mock_imports = [
+    'gymnasium',
+    'stable_baselines3',
+    'sb3_contrib',
+]
+
 # Napoleon options
 napoleon_google_docstring = False
 napoleon_numpy_docstring = True

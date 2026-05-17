@@ -1226,26 +1226,24 @@ class SDIRK2(BackwardEuler):
 
 
 class RadauIIA(BackwardEuler):
-    r"""s-stage Radau IIA collocation method — stiffly accurate, L-stable, order 2s-1.
+    r"""s-stage Radau IIA collocation method.
 
     Radau IIA methods are collocation schemes at shifted Gauss–Legendre nodes that
     include the right endpoint (``c_s = 1``).  Their key properties for stiff and
     nonsmooth dynamics are:
 
-    * **L-stability** — ``|R(∞)| = 0``, spurious modes are annihilated in one step.
-    * **Stiff accuracy** — ``a_{s,j} = b_j`` for all j, so the last stage IS the
+    * **L-stability**: ``R(infinity) = 0``, so spurious modes are annihilated in
+      one step.
+    * **Stiff accuracy**: ``a_{s,j} = b_j`` for all j, so the last stage is the
       step output (``y_{n+1} = Y_s``); no additional combination is needed.
-    * **Order 2s-1** — the highest order achievable with s stages for a one-step method.
+    * **Order 2s-1**: the highest order achievable with ``s`` stages for a
+      one-step method.
 
-    +-------+-------+---------------------------------------------------+
-    | stages | order | Notes                                             |
-    +=======+=======+===================================================+
-    | 1      | 1     | Equivalent to Backward Euler (delegated directly) |
-    +-------+-------+---------------------------------------------------+
-    | 2      | 3     | Preferred for contact/impact problems             |
-    +-------+-------+---------------------------------------------------+
-    | 3      | 5     | High accuracy in smooth regions                   |
-    +-------+-------+---------------------------------------------------+
+    Supported stage counts:
+
+    * ``stages=1``: order 1, equivalent to Backward Euler.
+    * ``stages=2``: order 3, preferred for contact/impact problems.
+    * ``stages=3``: order 5, high accuracy in smooth regions.
 
     Multi-stage solve via waveform relaxation
     ------------------------------------------

@@ -42,30 +42,35 @@ class ODESolver:
         abort_on_fixed_failure: bool = True,
         t_eval: Optional[np.ndarray] = None,
     ):
-        """
-        Initialize the ODESolver.
+        """Initialize the time integration driver.
 
-        Parameters:
-            system: The ODE system to be integrated.
-            t_span: A tuple (t0, tf) specifying the start and end times.
-            h: The initial time step size.
-            thin_output: Store every *N*-th accepted step (1 = store all).
-                First and last steps are always stored.
-            store_fk: Whether to store per-step residual vectors.
-                Setting to False saves ~1× state-vector memory per step.
-            gc_interval: Call ``gc.collect()`` every *N* accepted steps
-                (0 = disabled). Useful for large problems where stale
-                solver factorisations may linger.
-            abort_on_fixed_failure: Stop fixed-step integration at the first
-                nonlinear failure instead of marching forward with the failed
-                state. The failed attempt is still recorded in
-                ``error_estimates``.
-            t_eval: Strictly increasing array of times in ``[t0, tf]`` that
-                must be evaluated.  When provided, the time loop clips the
-                step so it lands exactly on each ``t_eval`` entry, and the
-                returned histories contain only those entries (matches the
-                scipy ``solve_ivp`` convention).  Pass ``None`` to keep the
-                adaptive/fixed grid as the output.
+        Parameters
+        ----------
+        system : object
+            ODE system to integrate.
+        t_span : tuple of float
+            ``(t0, tf)`` start and end times.
+        h : float, default 1e-2
+            Initial time step size.
+        thin_output : int, default 1
+            Store every *N*-th accepted step. First and last steps are always
+            stored.
+        store_fk : bool, default True
+            Whether to store per-step residual vectors. Setting this to
+            ``False`` saves about one state-vector of memory per step.
+        gc_interval : int, default 0
+            Call ``gc.collect()`` every *N* accepted steps. ``0`` disables
+            explicit garbage collection.
+        abort_on_fixed_failure : bool, default True
+            Stop fixed-step integration at the first nonlinear failure instead
+            of marching forward with the failed state. The failed attempt is
+            still recorded in ``error_estimates``.
+        t_eval : ndarray or None, optional
+            Strictly increasing array of times in ``[t0, tf]`` that must be
+            evaluated. When provided, the time loop clips each step so it lands
+            exactly on each requested entry, and the returned histories contain
+            only those entries. Pass ``None`` to keep the adaptive or fixed
+            integration grid as the output.
         """
         self.system = system
         self.t0, self.tf = t_span

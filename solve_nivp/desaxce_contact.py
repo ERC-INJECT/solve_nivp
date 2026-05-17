@@ -628,8 +628,8 @@ def build_dynamic_desaxce_contact(
     ----------
     A, rhs_smooth, y0, contacts, gap_func, B, component_slices, constraints,
     rhs_jac
-        Same interpretation as in :func:`solve_nivp.alart_curnier_contact.
-        build_dynamic_alart_curnier_contact`.
+        Same interpretation as in
+        :func:`solve_nivp.alart_curnier_contact.build_dynamic_alart_curnier_contact`.
     gap_extract, vel_extract : ndarray or sparse, optional
         Constant extraction operators for the signed gaps and the local
         relative velocities. When ``gap_func`` is omitted, ``gap_extract`` is

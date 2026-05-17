@@ -4,40 +4,35 @@ import numpy as np
 import math
 
 class AdaptiveStepping:
-    """
-    Adaptive step-size controller with Richardson error estimation.
+    """Adaptive step-size controller with Richardson error estimation.
 
-    Two operating modes controlled by `mode`:
+    Two operating modes are selected by ``mode``:
 
-    1. mode="classic":
-       - Acceptance rule: accept step if E_curr <= 1.0 (standard LTE criterion).
-       - Step-size update: classical P / PI controller
-             h_next = h_curr * safety * E_curr^{-alpha_PI} * E_prev^{-beta_PI}
-         (if E_prev is available); otherwise just proportional.
-       - Growth/shrink clamped by h_up, h_down each step, and [h_min,h_max] globally.
+    ``"classic"``
+        Accepts a step when ``E_curr <= 1.0`` and updates the next step size
+        with a classical P or PI controller::
 
-    2. mode="ratio":
-       - Uses Gustafsson / Söderlind-style digital filter on the step-size ratio.
-       - Computes rho_prop from a multi-step PI-like recurrence involving
-         c_n = 1/E_n, c_{n-1}, and the previous ratio.
-       - Acceptance is based on the proposed ratio rho_prop compared to
-         [r_min, r_max]. If rho_prop is too small, the step is *rejected*
-         and we only shrink h; if within band or above band, the step is
-         *accepted*, potentially clamping rho_prop to r_max.
-       - Supports controller presets:
-            'elementary', 'PI3040', 'PI3333', 'PI4020', 'H211PI', 'H211b'
-         The H211b case uses b_param to tune beta1,beta2,alpha_ctrl=1/b_param.
+            h_next = h_curr * safety * E_curr**(-alpha_PI) * E_prev**(-beta_PI)
 
-    Common behavior:
-    - We estimate local error via Richardson extrapolation from
-         one full step of size h
-         two half steps of size h/2
-      and compute a scaled RMS relative error E_curr.
-    - The lower-accuracy full step (y_full) is used only for error estimation;
-      the accepted state is always the high-accuracy y_hi (two half steps).
+        The update is clamped by ``h_up`` and ``h_down`` each step, then by
+        the global ``[h_min, h_max]`` bounds.
 
-    step(...) returns:
-        (y_new, fk_new, h_next, E_curr, success, solver_error, iterations)
+    ``"ratio"``
+        Uses a Gustafsson / Soderlind-style digital filter on the step-size
+        ratio. It computes ``rho_prop`` from a multi-step PI-like recurrence
+        involving ``c_n = 1 / E_n``, ``c_{n-1}``, and the previous ratio.
+        Acceptance is based on ``rho_prop`` compared with
+        ``[r_min, r_max]``. The controller presets are ``"elementary"``,
+        ``"PI3040"``, ``"PI3333"``, ``"PI4020"``, ``"H211PI"``, and
+        ``"H211b"``.
+
+    Local error is estimated by Richardson extrapolation from one full step of
+    size ``h`` and two half steps of size ``h / 2``. The full step
+    ``y_full`` is used only for error estimation; the accepted state is always
+    the higher-accuracy ``y_hi`` from the two half steps.
+
+    ``step(...)`` returns ``(y_new, fk_new, h_next, E_curr, success,
+    solver_error, iterations)``.
 
     Parameters
     ----------
