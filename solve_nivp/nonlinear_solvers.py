@@ -189,6 +189,9 @@ class ImplicitEquationSolver:
         self._petsc_mat = None
         self._petsc_build_count = 0
         self._petsc_shape = None
+        self._petsc_pattern_key = None
+        self._petsc_indptr = None
+        self._petsc_indices = None
         self._petsc_field_is = None  # Index sets for field-split
         self._petsc_needs_matrix_update = False  # set True when Newton recomputes J
         self._petsc_use_gpu = False
@@ -745,6 +748,9 @@ class ImplicitEquationSolver:
             self._petsc_mat = None
         self._petsc_build_count = 0
         self._petsc_shape = None
+        self._petsc_pattern_key = None
+        self._petsc_indptr = None
+        self._petsc_indices = None
         self._petsc_field_is = None
         self._petsc_use_gpu = False
         self._petsc_comm_obj = None
@@ -3020,18 +3026,46 @@ class ImplicitEquationSolver:
 
         row_start, row_stop = self._petsc_owned_range(J_csr.shape[0], comm)
         local_n = row_stop - row_start
+        J_local = J_csr[row_start:row_stop].tocsr() if distributed else J_csr
+        pattern_key = (J_local.shape, int(J_local.nnz))
+
+        def _same_petsc_pattern():
+            return (
+                self._petsc_pattern_key == pattern_key
+                and self._petsc_indptr is not None
+                and self._petsc_indices is not None
+                and np.array_equal(J_local.indptr, self._petsc_indptr)
+                and np.array_equal(J_local.indices, self._petsc_indices)
+            )
+
+        def _remember_petsc_pattern():
+            self._petsc_pattern_key = pattern_key
+            self._petsc_indptr = np.array(J_local.indptr, copy=True)
+            self._petsc_indices = np.array(J_local.indices, copy=True)
+
+        def _forget_petsc_pattern():
+            self._petsc_pattern_key = None
+            self._petsc_indptr = None
+            self._petsc_indices = None
 
         # Determine if we need to rebuild the KSP
         is_direct_solver = opts.get('ksp_type') == 'preonly' and opts.get('pc_type') in ('lu', 'cholesky')
         reuse_budget = max(1, self.petsc_reuse_steps)
-        need_rebuild = (
+        matrix_update_requested = bool(getattr(self, '_petsc_needs_matrix_update', False))
+        backend_changed = (
             self._petsc_ksp is None
             or self._petsc_shape != J.shape
             or self._petsc_comm_obj is not comm
             or self._petsc_effective_mat_type != effective_mat_type
             or self._petsc_effective_vec_type != effective_vec_type
-            or (is_direct_solver and self._petsc_build_count >= reuse_budget)
         )
+        need_rebuild = backend_changed or (
+            is_direct_solver
+            and self._petsc_build_count >= reuse_budget
+            and not matrix_update_requested
+        )
+        update_matrix_values = False
+        force_direct_pc_setup = False
 
         # For direct solvers, we want to reuse the factorization like SPLU does.
         # The key insight: SPLU reuses stale factorizations for precond_reuse_steps solves.
@@ -3040,16 +3074,24 @@ class ImplicitEquationSolver:
         # However, when Newton explicitly recomputes the Jacobian (convergence
         # is slow), the fresh matrix MUST be factorised — otherwise the Newton
         # step is based on a stale system and convergence stalls or fails.
-        if getattr(self, '_petsc_needs_matrix_update', False):
+        if matrix_update_requested:
             if is_direct_solver:
-                need_rebuild = True
+                if not backend_changed and _same_petsc_pattern():
+                    update_matrix_values = True
+                    force_direct_pc_setup = True
+                    need_rebuild = False
+                else:
+                    need_rebuild = True
             else:
+                update_matrix_values = not need_rebuild
                 self._petsc_pc_needs_update = True
             self._petsc_needs_matrix_update = False
+        elif not is_direct_solver and not need_rebuild:
+            update_matrix_values = True
 
-        if is_direct_solver and not need_rebuild:
-            # Reuse existing factorization without updating matrix
-            # This is the key optimization that makes MUMPS competitive with SPLU
+        if is_direct_solver and not need_rebuild and not update_matrix_values:
+            # Reuse existing factorization without updating matrix.
+            # This is the key optimization that makes MUMPS competitive with SPLU.
             pass  # Skip to solve phase
         elif need_rebuild:
             # Destroy old objects if they exist
@@ -3063,12 +3105,12 @@ class ImplicitEquationSolver:
                     self._petsc_ksp.destroy()
                 except Exception:
                     pass
+            _forget_petsc_pattern()
 
             # Create PETSc matrix from scipy CSR
             if use_gpu:
                 # Create GPU matrix with the effective PETSc matrix type.
                 # Ensure indices are the correct type (int32 for most PETSc builds)
-                J_local = J_csr[row_start:row_stop].tocsr() if distributed else J_csr
                 indptr = J_local.indptr.astype(PETSc.IntType, copy=False)
                 indices = J_local.indices.astype(PETSc.IntType, copy=False)
                 data = np.ascontiguousarray(J_local.data, dtype=PETSc.ScalarType)
@@ -3086,7 +3128,6 @@ class ImplicitEquationSolver:
                 # Standard CPU matrix. For multi-rank runs, each rank hands PETSc
                 # only its owned contiguous row block while the outer solver still
                 # retains the full SciPy matrix for residual/Jacobian evaluation.
-                J_local = J_csr[row_start:row_stop].tocsr() if distributed else J_csr
                 size_spec = ((local_n, J_csr.shape[0]), (local_n, J_csr.shape[1])) if distributed else J_csr.shape
                 self._petsc_mat = PETSc.Mat().createAIJ(
                     size=size_spec,
@@ -3096,6 +3137,7 @@ class ImplicitEquationSolver:
                     comm=comm,
                 )
             self._petsc_mat.assemble()
+            _remember_petsc_pattern()
 
             self._petsc_ksp = PETSc.KSP().create(comm=comm)
             self._petsc_ksp.setOperators(self._petsc_mat)
@@ -3176,24 +3218,39 @@ class ImplicitEquationSolver:
             self._petsc_effective_vec_type = effective_vec_type
             self._petsc_owned_rows = (row_start, row_stop)
             self._petsc_pc_needs_update = True  # First solve needs PC setup
-        else:
-            # Reuse existing KSP - only update matrix values if needed
-            # For direct solvers, skip matrix update entirely (reuse factorization)
-            # For iterative solvers, update matrix but reuse preconditioner
-            if not is_direct_solver:
-                try:
-                    J_local = J_csr[row_start:row_stop].tocsr() if distributed else J_csr
-                    self._petsc_mat.setValuesCSR(
-                        J_local.indptr.astype(PETSc.IntType, copy=False),
-                        J_local.indices.astype(PETSc.IntType, copy=False),
-                        J_local.data,
-                    )
-                    self._petsc_mat.assemble()
-                except Exception:
-                    # If in-place update fails, rebuild
-                    self._petsc_build_count = reuse_budget
-                    return self._solve_with_petsc(J, b, rtol=rtol)
+        elif update_matrix_values:
+            try:
+                indptr = J_local.indptr.astype(PETSc.IntType, copy=False)
+                indices = J_local.indices.astype(PETSc.IntType, copy=False)
+                data = (
+                    np.ascontiguousarray(J_local.data, dtype=PETSc.ScalarType)
+                    if use_gpu else J_local.data
+                )
+                self._petsc_mat.setValuesCSR(indptr, indices, data)
+                self._petsc_mat.assemble()
+                self._petsc_ksp.setOperators(self._petsc_mat)
+                _remember_petsc_pattern()
+            except Exception:
+                # If the stored PETSc preallocation cannot accept this structure,
+                # fall back to the full rebuild path on a recursive retry.
+                _forget_petsc_pattern()
+                self._petsc_build_count = reuse_budget
+                return self._solve_with_petsc(J, b, rtol=rtol)
 
+            if force_direct_pc_setup:
+                pc = self._petsc_ksp.getPC()
+                try:
+                    pc.setReusePreconditioner(False)
+                except Exception:
+                    pass
+                pc.setUp()
+                try:
+                    pc.setReusePreconditioner(True)
+                except Exception:
+                    pass
+                self._petsc_pc_needs_update = False
+                self._petsc_build_count = 0
+            elif not is_direct_solver:
                 # Refresh the preconditioner on demand, but keep the operator current.
                 if self._petsc_build_count % reuse_budget == 0:
                     self._petsc_pc_needs_update = True
@@ -3202,6 +3259,8 @@ class ImplicitEquationSolver:
                     pc = self._petsc_ksp.getPC()
                     pc.setUp()
                     self._petsc_pc_needs_update = False
+        else:
+            pass
 
         self._petsc_build_count += 1
 

@@ -1,0 +1,42 @@
+[
+  {
+    "N": 40,
+    "n_c": 15,
+    "plus_best_inside_fraction": 0.6,
+    "minus_best_inside_fraction": 0.4666666666666667,
+    "min_plus_best_bary": -0.28045970306034373,
+    "min_minus_best_bary": -0.2806111313742332,
+    "median_plus_best_bary": 0.0036404874997012448,
+    "median_minus_best_bary": -0.00794981882744269
+  },
+  {
+    "N": 50,
+    "n_c": 19,
+    "plus_best_inside_fraction": 0.5789473684210527,
+    "minus_best_inside_fraction": 0.47368421052631576,
+    "min_plus_best_bary": -0.315392883712666,
+    "min_minus_best_bary": -0.31332757159200325,
+    "median_plus_best_bary": 0.0004947074778432859,
+    "median_minus_best_bary": -0.008540461612869239
+  },
+  {
+    "N": 60,
+    "n_c": 22,
+    "plus_best_inside_fraction": 0.5454545454545454,
+    "minus_best_inside_fraction": 0.45454545454545453,
+    "min_plus_best_bary": -0.40595462303728236,
+    "min_minus_best_bary": -0.4308023854431986,
+    "median_plus_best_bary": 0.0014950121199682215,
+    "median_minus_best_bary": -0.017315086789452573
+  },
+  {
+    "N": 70,
+    "n_c": 25,
+    "plus_best_inside_fraction": 0.64,
+    "minus_best_inside_fraction": 0.36,
+    "min_plus_best_bary": -0.2654793263400127,
+    "min_minus_best_bary": -0.4149715528827101,
+    "median_plus_best_bary": 0.013594336068101924,
+    "median_minus_best_bary": -0.08191431444783077
+  }
+]

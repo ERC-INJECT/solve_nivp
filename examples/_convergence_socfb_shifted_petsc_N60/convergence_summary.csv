@@ -1,0 +1,2 @@
+level,n_elem_target,n_elem_actual,n_c,h_eff,err_l2,ref_l2,rel_l2,rate,gap_shift_rel,min_gap,final_cone_margin_abs,contact_ok,t_build_s,t_solve_s,t_total_s,n_acc,n_rej
+0,60,9462,22,2.056073e-01,9.408846e-04,8.555511e-03,0.109974,,5.560295e-01,-3.227103e-15,4.360885e-10,1,5.304,186.652,191.956,1,0

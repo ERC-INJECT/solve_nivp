@@ -1,0 +1,75 @@
+{
+  "N": 70,
+  "n_c": 25,
+  "h_mesh": 0.2857142857142857,
+  "max_delta": 0.16441003698824494,
+  "max_delta_over_h": 0.5754351294588573,
+  "max_tangential_delta_frac": 1.0305085582892203e-13,
+  "plus_selected_parent_fraction": 0.52,
+  "minus_selected_parent_fraction": 0.48,
+  "plus_inside_selected_fraction": 0.28,
+  "minus_inside_selected_fraction": 0.12,
+  "plus_inside_parent_fraction": 0.24,
+  "minus_inside_parent_fraction": 0.12,
+  "min_plus_bary_selected": -0.7397761554361826,
+  "min_minus_bary_selected": -0.4422751217291631,
+  "min_plus_bary_parent": -0.4135851754833656,
+  "min_minus_bary_parent": -0.6321138074670177,
+  "top_error_nodes": [
+    {
+      "node": 7,
+      "s_true": 0.9862583020047722,
+      "abs_err": 0.00043141210882606355,
+      "class": "sliding",
+      "delta_over_h": 0.17682462450655012,
+      "plus_selected_is_parent": 1,
+      "minus_selected_is_parent": 0,
+      "plus_bary_min_selected": -0.08919951340688588,
+      "minus_bary_min_selected": -0.163998933570791
+    },
+    {
+      "node": 15,
+      "s_true": 0.4290607099798769,
+      "abs_err": 0.0002712819397787613,
+      "class": "sliding",
+      "delta_over_h": 0.5754351294588573,
+      "plus_selected_is_parent": 0,
+      "minus_selected_is_parent": 0,
+      "plus_bary_min_selected": -0.014009568772420766,
+      "minus_bary_min_selected": -0.44159628989587585
+    },
+    {
+      "node": 20,
+      "s_true": 0.9064388598527024,
+      "abs_err": 0.0002709049589728089,
+      "class": "sliding",
+      "delta_over_h": 0.035456996873886475,
+      "plus_selected_is_parent": 0,
+      "minus_selected_is_parent": 0,
+      "plus_bary_min_selected": -0.01011282028240386,
+      "minus_bary_min_selected": -0.054269063872765866
+    },
+    {
+      "node": 5,
+      "s_true": 0.3527603609922223,
+      "abs_err": 0.0002685274466200059,
+      "class": "sliding",
+      "delta_over_h": 0.16652122082063087,
+      "plus_selected_is_parent": 1,
+      "minus_selected_is_parent": 1,
+      "plus_bary_min_selected": -0.16931259487561912,
+      "minus_bary_min_selected": 0.05254413394142242
+    },
+    {
+      "node": 3,
+      "s_true": 0.21328690299384445,
+      "abs_err": 0.0002584192129339146,
+      "class": "sliding",
+      "delta_over_h": 0.02877619102659405,
+      "plus_selected_is_parent": 1,
+      "minus_selected_is_parent": 1,
+      "plus_bary_min_selected": -0.03637948124074698,
+      "minus_bary_min_selected": 0.0043775225031091195
+    }
+  ]
+}

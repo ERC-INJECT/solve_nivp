@@ -1,0 +1,302 @@
+[
+  {
+    "N": 40,
+    "n_c": 15,
+    "h_mesh": 0.5,
+    "max_delta": 0.26026668533952513,
+    "max_delta_over_h": 0.5205333706790503,
+    "max_tangential_delta_frac": 0.3744141004944588,
+    "plus_selected_parent_fraction": 0.6,
+    "minus_selected_parent_fraction": 0.3333333333333333,
+    "plus_inside_selected_fraction": 0.3333333333333333,
+    "minus_inside_selected_fraction": 0.13333333333333333,
+    "plus_inside_parent_fraction": 0.26666666666666666,
+    "minus_inside_parent_fraction": 0.2,
+    "min_plus_bary_selected": -0.3961691028157449,
+    "min_minus_bary_selected": -0.40088279419211686,
+    "min_plus_bary_parent": -0.3961691028157449,
+    "min_minus_bary_parent": -0.39616910281573725,
+    "top_error_nodes": [
+      {
+        "node": 8,
+        "s_true": 0.9315561846791292,
+        "abs_err": 0.0004189541972796127,
+        "class": "sliding",
+        "delta_over_h": 0.20889252082244794,
+        "plus_selected_is_parent": 1,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": 0.09435671490350084,
+        "minus_bary_min_selected": -0.3318593533736858
+      },
+      {
+        "node": 1,
+        "s_true": -1.0,
+        "abs_err": 0.00038670920301116344,
+        "class": "sliding",
+        "delta_over_h": 0.5205333706790503,
+        "plus_selected_is_parent": 1,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": -0.11780344043348291,
+        "minus_bary_min_selected": -0.40088279419211686
+      },
+      {
+        "node": 13,
+        "s_true": 0.7599073888224384,
+        "abs_err": 0.0003531169672859691,
+        "class": "sliding",
+        "delta_over_h": 0.0049328666677152955,
+        "plus_selected_is_parent": 0,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": -0.006137858580229305,
+        "minus_bary_min_selected": -0.002987234228585491
+      },
+      {
+        "node": 3,
+        "s_true": 0.578223195467855,
+        "abs_err": 0.00027413163144659764,
+        "class": "sliding",
+        "delta_over_h": 0.012176376354325943,
+        "plus_selected_is_parent": 0,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": -0.009413228773671766,
+        "minus_bary_min_selected": -0.00794981882744269
+      },
+      {
+        "node": 10,
+        "s_true": -0.8961560622522871,
+        "abs_err": 0.0002593632115528875,
+        "class": "sliding",
+        "delta_over_h": 0.16540602609989474,
+        "plus_selected_is_parent": 0,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": 0.07219273536889564,
+        "minus_bary_min_selected": -0.12745617548273125
+      }
+    ]
+  },
+  {
+    "N": 50,
+    "n_c": 19,
+    "h_mesh": 0.4,
+    "max_delta": 0.21239429813404762,
+    "max_delta_over_h": 0.530985745335119,
+    "max_tangential_delta_frac": 0.6464609486166731,
+    "plus_selected_parent_fraction": 0.5263157894736842,
+    "minus_selected_parent_fraction": 0.47368421052631576,
+    "plus_inside_selected_fraction": 0.3684210526315789,
+    "minus_inside_selected_fraction": 0.2631578947368421,
+    "plus_inside_parent_fraction": 0.3157894736842105,
+    "minus_inside_parent_fraction": 0.2631578947368421,
+    "min_plus_bary_selected": -0.5087855424159662,
+    "min_minus_bary_selected": -0.4847115451346048,
+    "min_plus_bary_parent": -0.3469062511909736,
+    "min_minus_bary_parent": -0.34690625119097324,
+    "top_error_nodes": [
+      {
+        "node": 1,
+        "s_true": -1.0,
+        "abs_err": 0.0009370356614594712,
+        "class": "sliding",
+        "delta_over_h": 0.3943982289349171,
+        "plus_selected_is_parent": 0,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": -0.06414871910630549,
+        "minus_bary_min_selected": -0.4847115451346048
+      },
+      {
+        "node": 8,
+        "s_true": 0.9431875737920266,
+        "abs_err": 0.000766565303121013,
+        "class": "open",
+        "delta_over_h": 0.530985745335119,
+        "plus_selected_is_parent": 1,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": 0.17049416686771884,
+        "minus_bary_min_selected": -0.17378684417156065
+      },
+      {
+        "node": 14,
+        "s_true": 0.9022649742910398,
+        "abs_err": 0.0007129644347334937,
+        "class": "sliding",
+        "delta_over_h": 0.3589088063389941,
+        "plus_selected_is_parent": 0,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": -0.5087855424159662,
+        "minus_bary_min_selected": -0.2420860601745813
+      },
+      {
+        "node": 12,
+        "s_true": 0.7602669269733806,
+        "abs_err": 0.0005403380849700659,
+        "class": "sliding",
+        "delta_over_h": 0.11199569581420483,
+        "plus_selected_is_parent": 1,
+        "minus_selected_is_parent": 1,
+        "plus_bary_min_selected": -0.15876398081261772,
+        "minus_bary_min_selected": -0.043562823515993485
+      },
+      {
+        "node": 11,
+        "s_true": -0.884654713070327,
+        "abs_err": 0.000504552781799664,
+        "class": "sliding",
+        "delta_over_h": 0.18516104013221854,
+        "plus_selected_is_parent": 1,
+        "minus_selected_is_parent": 1,
+        "plus_bary_min_selected": -0.08662128605537411,
+        "minus_bary_min_selected": -0.20249402074079845
+      }
+    ]
+  },
+  {
+    "N": 60,
+    "n_c": 22,
+    "h_mesh": 0.3333333333333333,
+    "max_delta": 0.16417738502685247,
+    "max_delta_over_h": 0.4925321550805574,
+    "max_tangential_delta_frac": 1.1344911356568081e-13,
+    "plus_selected_parent_fraction": 0.45454545454545453,
+    "minus_selected_parent_fraction": 0.45454545454545453,
+    "plus_inside_selected_fraction": 0.22727272727272727,
+    "minus_inside_selected_fraction": 0.2727272727272727,
+    "plus_inside_parent_fraction": 0.13636363636363635,
+    "minus_inside_parent_fraction": 0.18181818181818182,
+    "min_plus_bary_selected": -0.47482143866435095,
+    "min_minus_bary_selected": -0.4474719004098364,
+    "min_plus_bary_parent": -0.47482143866435095,
+    "min_minus_bary_parent": -0.5069691921376639,
+    "top_error_nodes": [
+      {
+        "node": 20,
+        "s_true": -0.9880997194035612,
+        "abs_err": 0.00030041089648034263,
+        "class": "sliding",
+        "delta_over_h": 0.1662887433644353,
+        "plus_selected_is_parent": 1,
+        "minus_selected_is_parent": 1,
+        "plus_bary_min_selected": -0.0017604100363510984,
+        "minus_bary_min_selected": -0.16319607497706656
+      },
+      {
+        "node": 18,
+        "s_true": -0.2470463466846058,
+        "abs_err": 0.0002590905362025082,
+        "class": "sliding",
+        "delta_over_h": 0.1955245285492102,
+        "plus_selected_is_parent": 0,
+        "minus_selected_is_parent": 1,
+        "plus_bary_min_selected": -0.21846818463969986,
+        "minus_bary_min_selected": 0.0858566131713604
+      },
+      {
+        "node": 0,
+        "s_true": 0.002640105494514433,
+        "abs_err": 0.0002566063772367769,
+        "class": "sliding",
+        "delta_over_h": 0.014199243696729216,
+        "plus_selected_is_parent": 0,
+        "minus_selected_is_parent": 1,
+        "plus_bary_min_selected": 0.000936789722109562,
+        "minus_bary_min_selected": -0.01485348642044191
+      },
+      {
+        "node": 4,
+        "s_true": 0.39951401164544453,
+        "abs_err": 0.00025199097646212525,
+        "class": "sliding",
+        "delta_over_h": 0.0702195971304594,
+        "plus_selected_is_parent": 1,
+        "minus_selected_is_parent": 1,
+        "plus_bary_min_selected": -0.06939729418740923,
+        "minus_bary_min_selected": -0.0005687794912216841
+      },
+      {
+        "node": 16,
+        "s_true": -0.0916157601400398,
+        "abs_err": 0.00025144843508352653,
+        "class": "sliding",
+        "delta_over_h": 0.31344785569483163,
+        "plus_selected_is_parent": 0,
+        "minus_selected_is_parent": 1,
+        "plus_bary_min_selected": -0.3065868719924103,
+        "minus_bary_min_selected": 0.011591835053701205
+      }
+    ]
+  },
+  {
+    "N": 70,
+    "n_c": 25,
+    "h_mesh": 0.2857142857142857,
+    "max_delta": 0.16441003698824494,
+    "max_delta_over_h": 0.5754351294588573,
+    "max_tangential_delta_frac": 1.0305085582892203e-13,
+    "plus_selected_parent_fraction": 0.52,
+    "minus_selected_parent_fraction": 0.48,
+    "plus_inside_selected_fraction": 0.28,
+    "minus_inside_selected_fraction": 0.12,
+    "plus_inside_parent_fraction": 0.24,
+    "minus_inside_parent_fraction": 0.12,
+    "min_plus_bary_selected": -0.7397761554361826,
+    "min_minus_bary_selected": -0.4422751217291631,
+    "min_plus_bary_parent": -0.4135851754833656,
+    "min_minus_bary_parent": -0.6321138074670177,
+    "top_error_nodes": [
+      {
+        "node": 7,
+        "s_true": 0.9862583020047722,
+        "abs_err": 0.00043141210882606355,
+        "class": "sliding",
+        "delta_over_h": 0.17682462450655012,
+        "plus_selected_is_parent": 1,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": -0.08919951340688588,
+        "minus_bary_min_selected": -0.163998933570791
+      },
+      {
+        "node": 15,
+        "s_true": 0.4290607099798769,
+        "abs_err": 0.0002712819397787613,
+        "class": "sliding",
+        "delta_over_h": 0.5754351294588573,
+        "plus_selected_is_parent": 0,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": -0.014009568772420766,
+        "minus_bary_min_selected": -0.44159628989587585
+      },
+      {
+        "node": 20,
+        "s_true": 0.9064388598527024,
+        "abs_err": 0.0002709049589728089,
+        "class": "sliding",
+        "delta_over_h": 0.035456996873886475,
+        "plus_selected_is_parent": 0,
+        "minus_selected_is_parent": 0,
+        "plus_bary_min_selected": -0.01011282028240386,
+        "minus_bary_min_selected": -0.054269063872765866
+      },
+      {
+        "node": 5,
+        "s_true": 0.3527603609922223,
+        "abs_err": 0.0002685274466200059,
+        "class": "sliding",
+        "delta_over_h": 0.16652122082063087,
+        "plus_selected_is_parent": 1,
+        "minus_selected_is_parent": 1,
+        "plus_bary_min_selected": -0.16931259487561912,
+        "minus_bary_min_selected": 0.05254413394142242
+      },
+      {
+        "node": 3,
+        "s_true": 0.21328690299384445,
+        "abs_err": 0.0002584192129339146,
+        "class": "sliding",
+        "delta_over_h": 0.02877619102659405,
+        "plus_selected_is_parent": 1,
+        "minus_selected_is_parent": 1,
+        "plus_bary_min_selected": -0.03637948124074698,
+        "minus_bary_min_selected": 0.0043775225031091195
+      }
+    ]
+  }
+]

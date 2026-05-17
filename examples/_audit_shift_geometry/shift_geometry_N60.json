@@ -1,0 +1,75 @@
+{
+  "N": 60,
+  "n_c": 22,
+  "h_mesh": 0.3333333333333333,
+  "max_delta": 0.16417738502685247,
+  "max_delta_over_h": 0.4925321550805574,
+  "max_tangential_delta_frac": 1.1344911356568081e-13,
+  "plus_selected_parent_fraction": 0.45454545454545453,
+  "minus_selected_parent_fraction": 0.45454545454545453,
+  "plus_inside_selected_fraction": 0.22727272727272727,
+  "minus_inside_selected_fraction": 0.2727272727272727,
+  "plus_inside_parent_fraction": 0.13636363636363635,
+  "minus_inside_parent_fraction": 0.18181818181818182,
+  "min_plus_bary_selected": -0.47482143866435095,
+  "min_minus_bary_selected": -0.4474719004098364,
+  "min_plus_bary_parent": -0.47482143866435095,
+  "min_minus_bary_parent": -0.5069691921376639,
+  "top_error_nodes": [
+    {
+      "node": 20,
+      "s_true": -0.9880997194035612,
+      "abs_err": 0.00030041089648034263,
+      "class": "sliding",
+      "delta_over_h": 0.1662887433644353,
+      "plus_selected_is_parent": 1,
+      "minus_selected_is_parent": 1,
+      "plus_bary_min_selected": -0.0017604100363510984,
+      "minus_bary_min_selected": -0.16319607497706656
+    },
+    {
+      "node": 18,
+      "s_true": -0.2470463466846058,
+      "abs_err": 0.0002590905362025082,
+      "class": "sliding",
+      "delta_over_h": 0.1955245285492102,
+      "plus_selected_is_parent": 0,
+      "minus_selected_is_parent": 1,
+      "plus_bary_min_selected": -0.21846818463969986,
+      "minus_bary_min_selected": 0.0858566131713604
+    },
+    {
+      "node": 0,
+      "s_true": 0.002640105494514433,
+      "abs_err": 0.0002566063772367769,
+      "class": "sliding",
+      "delta_over_h": 0.014199243696729216,
+      "plus_selected_is_parent": 0,
+      "minus_selected_is_parent": 1,
+      "plus_bary_min_selected": 0.000936789722109562,
+      "minus_bary_min_selected": -0.01485348642044191
+    },
+    {
+      "node": 4,
+      "s_true": 0.39951401164544453,
+      "abs_err": 0.00025199097646212525,
+      "class": "sliding",
+      "delta_over_h": 0.0702195971304594,
+      "plus_selected_is_parent": 1,
+      "minus_selected_is_parent": 1,
+      "plus_bary_min_selected": -0.06939729418740923,
+      "minus_bary_min_selected": -0.0005687794912216841
+    },
+    {
+      "node": 16,
+      "s_true": -0.0916157601400398,
+      "abs_err": 0.00025144843508352653,
+      "class": "sliding",
+      "delta_over_h": 0.31344785569483163,
+      "plus_selected_is_parent": 0,
+      "minus_selected_is_parent": 1,
+      "plus_bary_min_selected": -0.3065868719924103,
+      "minus_bary_min_selected": 0.011591835053701205
+    }
+  ]
+}
