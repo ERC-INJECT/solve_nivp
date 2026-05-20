@@ -3,23 +3,27 @@ import inspect
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 if str(EXAMPLES) not in sys.path:
     sys.path.insert(0, str(EXAMPLES))
 
-import sliding_block_one_step_patch_test_alart_curnier as helper_mod
-from sliding_block_one_step_patch_test_alart_curnier import (  # noqa: E402
-    _trim_failed_fixed_step_history,
-    build_demo_contact_system,
-    build_prestressed_fault_dynamic_context,
-    make_fault_mu_patch_callback,
-    make_fault_prestress_patch_callbacks,
-    make_minimal_dynamic_fault_bc,
-    run_one_step_case,
-    run_prestressed_fault_dynamic_history_case,
-    run_time_history_case,
+pytestmark = (pytest.mark.examples, pytest.mark.external)
+
+helper_mod = pytest.importorskip(
+    "sliding_block_one_step_patch_test_alart_curnier",
+    reason="requires the prestressed fault example helper module",
 )
+_trim_failed_fixed_step_history = helper_mod._trim_failed_fixed_step_history
+build_demo_contact_system = helper_mod.build_demo_contact_system
+build_prestressed_fault_dynamic_context = helper_mod.build_prestressed_fault_dynamic_context
+make_fault_mu_patch_callback = helper_mod.make_fault_mu_patch_callback
+make_fault_prestress_patch_callbacks = helper_mod.make_fault_prestress_patch_callbacks
+make_minimal_dynamic_fault_bc = helper_mod.make_minimal_dynamic_fault_bc
+run_one_step_case = helper_mod.run_one_step_case
+run_prestressed_fault_dynamic_history_case = helper_mod.run_prestressed_fault_dynamic_history_case
+run_time_history_case = helper_mod.run_time_history_case
 
 
 def test_fault_prestress_patch_callbacks_force_one_patch_contact():

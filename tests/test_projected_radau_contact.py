@@ -5,6 +5,7 @@ from solve_nivp.integrations import RadauIIA
 from solve_nivp.nonlinear_solvers import ImplicitEquationSolver
 from solve_nivp.projected_radau_contact import (
     DeSaxceProjectedConeLaw,
+    SOCFischerBurmeisterLaw,
     build_projected_radau_contact,
 )
 from solve_nivp.projections import IdentityProjection
@@ -43,7 +44,7 @@ def test_projected_radau_constraints_patch_stage_rhs_and_jacobian():
             {"g": g, "dg_dy": dg, "y_slice": slice(0, 1), "q_slice": slice(1, 2)}
         ],
         rhs_jac=jac,
-        contact_law="minimum_map",
+        contact_law="soc_fb",
         normal_r=1.0,
         friction_r=1.0,
         reported_reaction_units="impulse",
@@ -76,6 +77,136 @@ def test_projected_radau_constraints_patch_stage_rhs_and_jacobian():
 
     J = model.jacobian(Z, 0.0, np.zeros(2), 1.0, rk_A, rk_b, rk_c).toarray()
     np.testing.assert_allclose(J[[1, 3], 4:6], 0.0)
+
+
+def test_projected_radau_can_reuse_existing_reaction_state_block():
+    A = np.diag([1.0, 1.0, 0.0])
+
+    def rhs(t, y, *extra):
+        return np.array([10.0 * y[2], 0.0, 0.0], dtype=float)
+
+    def jac(t, y, *extra):
+        J = np.zeros((3, 3), dtype=float)
+        J[0, 2] = 10.0
+        return J
+
+    cs = build_projected_radau_contact(
+        A,
+        rhs,
+        np.zeros(3),
+        [{"vel_normal_idx": 0, "mu": 0.0}],
+        C_extract=np.eye(3),
+        D_extract=np.eye(3),
+        B=np.array([[1.0], [0.0], [0.0]]),
+        rhs_jac=jac,
+        contact_law="soc_fb",
+        normal_r=1.0,
+        friction_r=1.0,
+        reported_reaction_units="force",
+        reaction_state_indices=np.array([2]),
+        reaction_state_to_reported_scale=0.5,
+        mask_reaction_state_in_smooth_rhs=True,
+    )
+    model = cs.projected_radau_contact
+
+    assert cs.y0.size == 3
+    np.testing.assert_allclose(cs.reaction_history(np.array([[0.0, 0.0, 4.0]])), [[2.0]])
+    np.testing.assert_allclose(model._smooth_rhs(0.0, np.array([0.0, 0.0, 4.0])), [0.0, 0.0, 0.0])
+    J_smooth = model._smooth_jac(0.0, np.array([0.0, 0.0, 4.0]))
+    if hasattr(J_smooth, "toarray"):
+        J_smooth = J_smooth.toarray()
+    np.testing.assert_allclose(np.asarray(J_smooth)[:, 2], [0.0, 0.0, 0.0])
+
+    F_contact = model._contact_residual(
+        np.array([1.0, 0.0, 4.0]), 0.0, np.array([4.0]), np.array([0.0]), 0.25,
+        endpoint=False,
+    )
+    expected_phi = 2.0 + 1.0 - np.hypot(2.0, 1.0)
+    np.testing.assert_allclose(F_contact, [expected_phi])
+    _Jy, Jr = model._contact_jacobian(
+        np.array([1.0, 0.0, 4.0]), 0.0, np.array([4.0]), np.array([0.0]), 0.25,
+        endpoint=False,
+    )
+    np.testing.assert_allclose(Jr.toarray(), [[0.5 * (1.0 - 2.0 / np.hypot(2.0, 1.0))]])
+
+    rk_A = np.array([[5.0 / 12.0, -1.0 / 12.0], [3.0 / 4.0, 1.0 / 4.0]])
+    rk_b = np.array([3.0 / 4.0, 1.0 / 4.0])
+    rk_c = np.array([1.0 / 3.0, 1.0])
+    h = 0.25
+    Z = model.pack(
+        [np.array([0.0, 0.0, 4.0]), np.array([0.0, 0.0, 6.0])],
+        [np.array([1.0]), np.array([1.5])],
+    )
+    F = model.residual(Z, 0.0, np.zeros(3), h, rk_A, rk_b, rk_c)
+    np.testing.assert_allclose(F[[2, 5]], [0.0, 0.0])
+
+    J = model.jacobian(Z, 0.0, np.zeros(3), h, rk_A, rk_b, rk_c).toarray()
+    np.testing.assert_allclose(J[2, [2, 6]], [1.0, -4.0])
+    np.testing.assert_allclose(J[5, [5, 7]], [1.0, -4.0])
+
+
+def test_projected_radau_inplace_reaction_step_writes_existing_state():
+    mass = 1.0
+    gravity = 9.81
+    A = np.diag([mass, mass, 0.0])
+
+    def rhs(t, y, *extra):
+        return np.array([-mass * gravity, y[0], 0.0], dtype=float)
+
+    def jac(t, y, *extra):
+        J = np.zeros((3, 3), dtype=float)
+        J[1, 0] = 1.0
+        return J
+
+    C = np.zeros((1, 3))
+    C[0, 1] = 1.0
+    D = np.zeros((1, 3))
+    D[0, 0] = 1.0
+
+    cs = build_projected_radau_contact(
+        A,
+        rhs,
+        np.array([-1.0, 0.0, 0.0]),
+        [{"vel_normal_idx": 0, "mu": 0.0}],
+        C_extract=csr_matrix(C),
+        D_extract=csr_matrix(D),
+        B=np.array([[1.0], [0.0], [0.0]]),
+        rhs_jac=jac,
+        # The setup uses C_extract to select the position-level gap and
+        # D_extract to select the velocity; the impact-from-below physics
+        # of this regression test relies on velocity-level Signorini
+        # enforcement at internal stages.  The legacy single-law SOC-FB
+        # ("soc_fb_uniform") provides that dispatch; the post-2026-05-11
+        # split "soc_fb" routes Stage 1 to position-level NCP, which is
+        # admissible for this state and correctly does not generate a
+        # contact reaction.
+        contact_law="soc_fb_uniform",
+        normal_r=1.0,
+        friction_r=1.0,
+        reported_reaction_units="force",
+        reaction_state_indices=np.array([2]),
+        reaction_state_to_reported_scale=1.0,
+        mask_reaction_state_in_smooth_rhs=True,
+    )
+    solver = ImplicitEquationSolver(
+        method="semismooth_newton",
+        proj=cs.projection,
+        component_slices=cs.component_slices,
+        tol=1.0e-11,
+        max_iter=80,
+        linear_solver="splu",
+    )
+    solver.rhs_jacobian = cs.rhs_jac
+    integrator = RadauIIA(solver=solver, A=cs.A, **cs.integrator_opts)
+
+    y, _Fk, _err, ok, _iters = integrator.step(cs.rhs, 0.0, cs.y0, 0.01)
+
+    assert ok
+    assert y.size == 3
+    expected_reaction = mass * (1.0 / 0.01 + gravity)
+    np.testing.assert_allclose(y[0], 0.0, atol=1.0e-9)
+    np.testing.assert_allclose(cs.reaction_history(y), [expected_reaction], rtol=1.0e-11)
+    np.testing.assert_allclose(y[2], expected_reaction, rtol=1.0e-11)
 
 
 def test_auto_scaling_uses_actual_traction_coupling():
@@ -191,6 +322,33 @@ def test_desaxce_projected_law_keeps_separated_contact_inactive_with_unequal_sca
     np.testing.assert_allclose(df_dnormal, [0.0, 0.0], atol=1.0e-14)
     np.testing.assert_allclose(df_du, np.zeros((2, 2)), atol=1.0e-14)
     np.testing.assert_allclose(df_dr, np.eye(2), atol=1.0e-14)
+
+
+def test_soc_fischer_burmeister_residual_fast_path_matches_full_jacobian_path():
+    law = SOCFischerBurmeisterLaw()
+    cases = [
+        (0.0, np.array([0.0, 0.3]), np.array([0.5, -0.2]), 0.6),
+        (0.1, np.array([0.0, 0.0]), np.array([0.4, 0.0]), 0.6),
+        (0.2, np.array([0.0]), np.array([0.3]), 0.0),
+    ]
+    for normal_quantity, velocity, percussion, mu in cases:
+        f_fast = law.residual(
+            normal_quantity,
+            velocity,
+            percussion,
+            mu,
+            normal_scale=1.0,
+            friction_scale=1.0,
+        )
+        f_full = law.residual_and_jac(
+            normal_quantity,
+            velocity,
+            percussion,
+            mu,
+            normal_scale=1.0,
+            friction_scale=1.0,
+        )[0]
+        np.testing.assert_allclose(f_fast, f_full, rtol=1.0e-13, atol=1.0e-13)
 
 
 def test_projected_radau_contact_jacobian_includes_dmu_dy():

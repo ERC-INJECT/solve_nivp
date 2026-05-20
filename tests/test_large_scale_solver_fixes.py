@@ -276,6 +276,45 @@ def test_petsc_iterative_updates_operator_each_solve(monkeypatch):
     np.testing.assert_allclose(solver._petsc_mat.last_values, J2.data)
 
 
+def test_petsc_direct_updates_same_pattern_without_recreating_ksp(monkeypatch):
+    monkeypatch.setattr(ns, 'PETSC_AVAILABLE', True)
+    monkeypatch.setattr(ns, 'PETSc', _FakePETSc)
+
+    solver = ImplicitEquationSolver(
+        method='semismooth_newton',
+        proj=IdentityProjection(),
+        linear_solver='petsc',
+        petsc_options={
+            'ksp_type': 'preonly',
+            'pc_type': 'lu',
+            'pc_factor_mat_solver_type': 'mumps',
+        },
+        petsc_reuse_steps=50,
+    )
+
+    J1 = sp.diags([1.0, 1.0, 1.0], format='csr')
+    J2 = sp.diags([2.0, 3.0, 4.0], format='csr')
+    b = np.array([1.0, 2.0, 3.0])
+
+    x1, ok1 = solver._solve_with_petsc(J1, b)
+    assert ok1
+    np.testing.assert_allclose(x1, b)
+    mat0 = solver._petsc_mat
+    ksp0 = solver._petsc_ksp
+
+    solver._petsc_needs_matrix_update = True
+    x2, ok2 = solver._solve_with_petsc(J2, b)
+
+    assert ok2
+    np.testing.assert_allclose(x2, b)
+    assert solver._petsc_mat is mat0
+    assert solver._petsc_ksp is ksp0
+    assert solver._petsc_mat.set_values_calls == 1
+    np.testing.assert_allclose(solver._petsc_mat.last_values, J2.data)
+    assert solver._petsc_ksp.getPC().setup_calls == 1
+    assert solver._petsc_ksp.getPC().reuse_preconditioner is True
+
+
 def test_fieldsplit_accepts_array_component_slices(monkeypatch):
     monkeypatch.setattr(ns, 'PETSC_AVAILABLE', True)
     monkeypatch.setattr(ns, 'PETSc', _FakePETSc)
