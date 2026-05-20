@@ -124,7 +124,7 @@ class ODESystem:
         Returns:
             An instance of the selected integration method.
         """
-        from .nonlinear_solvers import ImplicitEquationSolver
+        from .solvers.nonlinear_solvers import ImplicitEquationSolver
         from .projections import IdentityProjection
 
         default_solver = ImplicitEquationSolver(

@@ -845,15 +845,19 @@ class AlgebraicConstraintProjection(Projection):
 # SignProjection
 ##############################################################################
 class SignProjection(Projection):
-    """
-    Enforce s ∈ N_{[-1,1]}(w) via the resolvent:
-        w := Proj_{[-1,1]}( w + tau * s ).
-    At a fixed point this is equivalent to w ∈ sign(s).
+    """Projection for the graph of the sign relation.
 
-    Jacobian (Clarke selection) for z = w + tau*s:
-      if |z| < 1:  ∂w/∂w = 1,  ∂w/∂s = tau
-      if |z| > 1:  ∂w/∂w = 0,  ∂w/∂s = 0
-      if |z| ≈ 1:  use 0.5 and 0.5*tau (tie-break)
+    Enforces ``s in N_[-1,1](w)`` via the resolvent::
+
+        w := Proj_[-1,1](w + tau * s)
+
+    At a fixed point this is equivalent to ``w in sign(s)``.
+
+    For ``z = w + tau * s``, the Clarke-selection Jacobian uses:
+
+    * ``abs(z) < 1``: ``dw/dw = 1`` and ``dw/ds = tau``.
+    * ``abs(z) > 1``: ``dw/dw = 0`` and ``dw/ds = 0``.
+    * ``abs(z) ~= 1``: ``0.5`` and ``0.5 * tau`` as the tie-break.
     """
     def __init__(self, y_indices, w_indices, tau=1.0, component_slices=None):
         super().__init__(component_slices=component_slices)
@@ -1228,7 +1232,8 @@ class CoulombProjection(Projection):
         """
         Generalized derivative (Clarke selection) of the projection (exact region tests).
 
-        For each constrained index i, define z_tilde = |current_state[i]| - rhok[i] * conf_i(current_state).
+        For each constrained index ``i``, define
+        ``z_tilde = abs(current_state[i]) - rhok[i] * conf_i(current_state)``.
         The projection of (v, z_tilde) onto the monotone cone uses regions with projector blocks P.
         Chain rule accounts for dependence of z_tilde on the full state.
         """

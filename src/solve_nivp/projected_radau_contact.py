@@ -36,8 +36,86 @@ from .projections import (
 )
 
 
+def _sparse_index_array(indexer, n: int) -> np.ndarray:
+    """Return integer indices for a row/column indexer without touching data."""
+    if isinstance(indexer, slice):
+        start, stop, step = indexer.indices(n)
+        return np.arange(start, stop, step, dtype=int)
+    arr = np.asarray(indexer, dtype=int).ravel()
+    if arr.size and np.any(arr < 0):
+        arr = arr.copy()
+        arr[arr < 0] += n
+    return arr
+
+
+def _zero_sparse_columns(M, cols) -> sp.csr_matrix:
+    """Zero selected sparse columns without converting the whole matrix to LIL."""
+    M_csc = M.tocsc(copy=True)
+    cols = np.asarray(cols, dtype=int).ravel()
+    if cols.size == 0:
+        return M_csc.tocsr()
+    for col in cols:
+        start, stop = M_csc.indptr[int(col)], M_csc.indptr[int(col) + 1]
+        M_csc.data[start:stop] = 0.0
+    M_csc.eliminate_zeros()
+    return M_csc.tocsr()
+
+
+def _replace_sparse_rows(M, rows, replacement) -> sp.csr_matrix:
+    """Return M with selected rows replaced by rows from replacement.
+
+    This avoids CSR->LIL conversion for the common case where only a few
+    algebraic/contact rows must be overwritten in a large sparse Jacobian.
+    """
+    M_csr = M.tocsr(copy=True)
+    repl = replacement.tocsr() if sp.issparse(replacement) else sp.csr_matrix(replacement)
+    if M_csr.shape != repl.shape:
+        raise ValueError(
+            f"replacement shape {repl.shape} does not match matrix shape {M_csr.shape}"
+        )
+
+    row_arrays = []
+    for item in rows:
+        row_idx = _sparse_index_array(item, M_csr.shape[0])
+        if row_idx.size:
+            row_arrays.append(row_idx)
+    if not row_arrays:
+        return M_csr
+    row_idx = np.unique(np.concatenate(row_arrays))
+
+    indptr = M_csr.indptr
+    for row in row_idx:
+        M_csr.data[indptr[row]:indptr[row + 1]] = 0.0
+    M_csr.eliminate_zeros()
+
+    repl_sel = repl[row_idx, :].tocoo(copy=False)
+    if repl_sel.nnz:
+        patch = sp.csr_matrix(
+            (repl_sel.data, (row_idx[repl_sel.row], repl_sel.col)),
+            shape=M_csr.shape,
+        )
+        M_csr = M_csr + patch
+        M_csr.eliminate_zeros()
+    return M_csr.tocsr()
+
+
 class ProjectedRadauContactLaw:
-    """Small interface for normal-cone contact laws used by projected Radau."""
+    """Small interface for normal-cone contact laws used by projected Radau.
+
+    Attributes
+    ----------
+    expects_velocity_normal : bool
+        If True, the law is a coupled Lorentz-cone formulation that requires
+        the normal kinematic input to share units with the tangential block
+        (both velocities).  The stage residual then uses a Moreau viability
+        gate (Acary-Brogliato sec. 5.2 / 11): if ``gap > gap_tol`` the contact
+        is treated as inactive and the law is bypassed; otherwise the law is
+        evaluated with ``normal_quantity`` set to the velocity-level normal
+        component of ``contact_velocity``.  Default ``False`` preserves the
+        Breuling product-cone stage formulation used by NCP scalar laws.
+    """
+
+    expects_velocity_normal: bool = False
 
     def residual_and_jac(
         self,
@@ -49,6 +127,24 @@ class ProjectedRadauContactLaw:
         friction_scale: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         raise NotImplementedError
+
+    def residual(
+        self,
+        normal_quantity: float,
+        contact_velocity: np.ndarray,
+        percussion: np.ndarray,
+        mu: float,
+        normal_scale: float,
+        friction_scale: float,
+    ) -> np.ndarray:
+        return self.residual_and_jac(
+            normal_quantity,
+            contact_velocity,
+            percussion,
+            mu,
+            normal_scale,
+            friction_scale,
+        )[0]
 
 
 class NCPNormalConeLaw(ProjectedRadauContactLaw):
@@ -247,7 +343,15 @@ class SOCFischerBurmeisterLaw(ProjectedRadauContactLaw):
     natural map  R = P_K(R − ρ·û)  used by ``DeSaxceProjectedConeLaw``,
     Φ_FB is ρ-free and smooth on its domain (sharp only at x = y = 0),
     so Newton iterates do not stall on the set-valued kink at u_T = 0.
+
+    The Jordan-algebra products in Φ_FB require ``û`` to be a homogeneous
+    kinematic vector, so the stage and endpoint residuals are evaluated at
+    velocity level (``expects_velocity_normal = True``).  Position-level
+    feasibility is recovered between steps via Moreau viability: when
+    ``gap > gap_tol`` the contact is inactive and the law is not invoked.
     """
+
+    expects_velocity_normal = True
 
     def __init__(
         self,
@@ -363,16 +467,71 @@ class SOCFischerBurmeisterLaw(ProjectedRadauContactLaw):
         f_blk = T_y_inv @ phi_sd
         return f_blk, df_dnormal, df_du, df_dr
 
+    def residual(
+        self,
+        normal_quantity: float,
+        contact_velocity: np.ndarray,
+        percussion: np.ndarray,
+        mu: float,
+        normal_scale: float,
+        friction_scale: float,
+    ) -> np.ndarray:
+        u_contact = np.asarray(contact_velocity, dtype=float).ravel()
+        r_blk = np.asarray(percussion, dtype=float).ravel()
+        d = r_blk.size
+        if d == 0:
+            raise ValueError("contact block must contain at least one normal row")
+        if u_contact.size != d:
+            raise ValueError(
+                "contact_velocity and percussion must have the same block size "
+                f"(got {u_contact.size} and {d})"
+            )
+
+        mu = float(mu)
+        if mu < 0.0:
+            raise ValueError(f"mu must be nonnegative for SOC FB contact (got {mu})")
+        alpha = mu if self.alpha is None else float(self.alpha)
+        if alpha < 0.0:
+            raise ValueError(
+                f"alpha must be nonnegative for SOC FB contact (got {alpha})"
+            )
+
+        u_hat = np.zeros(d, dtype=float)
+        u_hat[0] = float(normal_quantity)
+        if d > 1:
+            u_hat[1:] = u_contact[1:]
+            if alpha > self.tie_tol:
+                u_hat[0] += alpha * float(np.linalg.norm(u_hat[1:]))
+
+        if d == 1 or mu <= self.tie_tol:
+            a = float(r_blk[0])
+            b = float(u_hat[0])
+            f_blk = r_blk.copy()
+            f_blk[0] = a + b - float(np.hypot(a, b))
+            return f_blk
+
+        x_sd = u_hat.copy()
+        x_sd[1:] *= mu
+        y_sd = r_blk.copy()
+        y_sd[0] *= mu
+        phi_sd = _soc_fb_phi(x_sd, y_sd, tie_tol=self.tie_tol)
+        phi_sd[0] /= mu
+        return phi_sd
+
 
 class DeSaxceProjectedConeLaw(ProjectedRadauContactLaw):
     """Self-dual De Saxce natural-map realization of the cone law.
 
-    The Breuling variables are unchanged: stages use the normal gap and
-    endpoint projection uses the normal impact velocity.  Only the algebraic
-    realization of the cone inclusion changes from split NCP rows to the
-    self-dual variables ``x = (u_hat_N, mu*u_hat_T)`` and
-    ``y = (mu*r_N, r_T)`` used by the SOCCP formulation.
+    Algebraic form:  R = P_{K_μ}(R − ρ · û)  on the rescaled self-dual
+    variables ``x = (u_hat_N, mu*u_hat_T)`` and ``y = (mu*r_N, r_T)``.
+    The natural-map projection couples normal and tangential components
+    through the Coulomb cone, so ``û`` must be a homogeneous kinematic
+    vector — the stage and endpoint residuals are evaluated at velocity
+    level (``expects_velocity_normal = True``) and Moreau viability gates
+    inactive contacts (``gap > gap_tol``) before the law is invoked.
     """
+
+    expects_velocity_normal = True
 
     def __init__(
         self,
@@ -535,9 +694,13 @@ class ProjectedRadauContactModel:
     friction_r: Any
     gap_tol: float
     endpoint_inactive_handling: str
+    reaction_state_indices: Optional[np.ndarray] = None
+    reaction_state_to_reported_scale: Any = 1.0
+    mask_reaction_state_in_smooth_rhs: bool = False
     auto_rho_strategy: str = "h_scaled"
     effective_jacobian_fn: Optional[Callable] = None
     delassus_cache_log_tol: float = 0.5
+    endpoint_law: Optional[ProjectedRadauContactLaw] = None
 
     def __post_init__(self) -> None:
         self.y0_phys = np.asarray(self.y0_phys, dtype=float).ravel()
@@ -577,6 +740,39 @@ class ProjectedRadauContactModel:
         self.reported_reaction_units = str(self.reported_reaction_units).strip().lower()
         if self.reported_reaction_units not in {"force", "impulse"}:
             raise ValueError("reported_reaction_units must be 'force' or 'impulse'")
+        if self.reaction_state_indices is not None:
+            idx = np.asarray(self.reaction_state_indices, dtype=int).ravel()
+            if idx.size != self.n_react:
+                raise ValueError(
+                    "reaction_state_indices must contain one state entry per "
+                    f"reaction DOF (got {idx.size}, expected {self.n_react})"
+                )
+            if np.any(idx < 0) or np.any(idx >= self.n_phys):
+                raise ValueError("reaction_state_indices contains out-of-range entries")
+            scale = np.asarray(self.reaction_state_to_reported_scale, dtype=float)
+            if scale.ndim == 0:
+                scale = np.full(self.n_react, float(scale), dtype=float)
+            else:
+                scale = scale.ravel()
+            if scale.size != self.n_react:
+                raise ValueError(
+                    "reaction_state_to_reported_scale must be scalar or have one "
+                    f"entry per reaction DOF (got {scale.size}, expected {self.n_react})"
+                )
+            if np.any(scale == 0.0):
+                raise ValueError("reaction_state_to_reported_scale entries must be nonzero")
+            self.reaction_state_indices = idx
+            self.reaction_state_to_reported_scale = scale
+            self._reaction_storage_to_reported_scale = scale
+            self.mask_reaction_state_in_smooth_rhs = bool(
+                self.mask_reaction_state_in_smooth_rhs
+            )
+        else:
+            self.reaction_state_to_reported_scale = None
+            self._reaction_storage_to_reported_scale = np.ones(
+                self.n_react, dtype=float
+            )
+            self.mask_reaction_state_in_smooth_rhs = False
         self.endpoint_inactive_handling = (
             str(self.endpoint_inactive_handling).strip().lower().replace("-", "_")
         )
@@ -613,6 +809,14 @@ class ProjectedRadauContactModel:
         self.last_total_pi = None
         self.last_total_effective_pi = None
         self.last_reported_reaction = None
+        self.last_reported_storage_reaction = None
+        self._projection_map_cache = None
+        self._last_stage_delta_y = None
+        self._last_stage_dpi_guess = None
+        self._last_stage_guess_h = None
+
+        if self.endpoint_law is None:
+            self.endpoint_law = self.contact_law
 
     def _reported_from_impulse(self, impulse, h):
         out = np.asarray(impulse, dtype=float).copy()
@@ -620,8 +824,78 @@ class ProjectedRadauContactModel:
             out = out / float(h)
         return out
 
+    def _reported_derivative_from_impulse(self, h):
+        if self.reported_reaction_units == "force":
+            return 1.0 / float(h)
+        return 1.0
+
+    def _reaction_state_to_reported(self, y):
+        if self.reaction_state_indices is None:
+            return np.zeros(self.n_react, dtype=float)
+        vals = np.asarray(y, dtype=float).ravel()[self.reaction_state_indices]
+        return vals * self.reaction_state_to_reported_scale
+
+    def _storage_to_reported(self, reaction, sl=None):
+        scale = self._reaction_storage_to_reported_scale
+        if sl is not None:
+            scale = scale[sl]
+        reaction = np.asarray(reaction, dtype=float).ravel()
+        if reaction.size != np.asarray(scale).size:
+            raise ValueError(
+                "reaction storage block has incompatible size "
+                f"{reaction.size}; expected {np.asarray(scale).size}"
+            )
+        return (
+            reaction
+            * scale
+        )
+
+    def _storage_jacobian_scale(self, sl):
+        return self._reaction_storage_to_reported_scale[sl]
+
+    def _write_storage_to_reaction_state(self, y, reaction_storage):
+        if self.reaction_state_indices is None:
+            return
+        y[self.reaction_state_indices] = np.asarray(
+            reaction_storage, dtype=float
+        ).ravel()
+
+    def reaction_state_history(self, y_hist):
+        if self.reaction_state_indices is None:
+            raise RuntimeError("reaction_state_indices are not configured")
+        y_hist = np.asarray(y_hist, dtype=float)
+        if y_hist.ndim == 1:
+            return self._reaction_state_to_reported(y_hist)
+        return (
+            y_hist[:, self.reaction_state_indices]
+            * self.reaction_state_to_reported_scale[None, :]
+        )
+
+    def _callback_augmented_state(self, y):
+        y_aug = np.zeros(self.n_phys + self.n_react, dtype=float)
+        y_aug[: self.n_phys] = np.asarray(y, dtype=float).ravel()
+        if self.reaction_state_indices is not None:
+            y_aug[self.n_phys:] = self._reaction_state_to_reported(y)
+        return y_aug
+
+    def _smooth_state(self, y):
+        y = np.asarray(y, dtype=float).ravel()
+        if (
+            self.reaction_state_indices is None
+            or not self.mask_reaction_state_in_smooth_rhs
+        ):
+            return y
+        out = y.copy()
+        out[self.reaction_state_indices] = 0.0
+        return out
+
     def _compress_stage_residual(self, F_stacked):
-        out = np.zeros(self.n_phys + self.n_react, dtype=float)
+        out_size = (
+            self.n_phys
+            if self.reaction_state_indices is not None
+            else self.n_phys + self.n_react
+        )
+        out = np.zeros(out_size, dtype=float)
         if F_stacked is None:
             return out
         F_stacked = np.asarray(F_stacked, dtype=float).ravel()
@@ -629,7 +903,12 @@ class ProjectedRadauContactModel:
         r = self.n_react
         if F_stacked.size >= 2 * n + 2 * r:
             out[:n] = F_stacked[n:2 * n]
-            out[n:] = F_stacked[2 * n + r:2 * n + 2 * r]
+            if self.reaction_state_indices is None:
+                out[n:] = F_stacked[2 * n + r:2 * n + 2 * r]
+            else:
+                out[self.reaction_state_indices] = F_stacked[
+                    2 * n + r:2 * n + 2 * r
+                ]
         else:
             m = min(out.size, F_stacked.size)
             out[:m] = F_stacked[:m]
@@ -655,8 +934,9 @@ class ProjectedRadauContactModel:
         return out
 
     def _smooth_rhs(self, t, y, *, h=None, prev_state=None):
+        y_eval = self._smooth_state(y)
         out = np.asarray(
-            _call_with_time_state_fk(self.rhs_smooth, t, y, None), dtype=float
+            _call_with_time_state_fk(self.rhs_smooth, t, y_eval, None), dtype=float
         ).ravel().copy()
         if self.algebraic_projection is None:
             return out
@@ -669,16 +949,30 @@ class ProjectedRadauContactModel:
 
     def _smooth_jac(self, t, y, *, h=None, prev_state=None):
         if self.rhs_jac is not None:
-            J = _dense_or_sparse(_call_with_time_state_fk(self.rhs_jac, t, y, None))
+            J = _dense_or_sparse(
+                _call_with_time_state_fk(self.rhs_jac, t, self._smooth_state(y), None)
+            )
+            if (
+                self.reaction_state_indices is not None
+                and self.mask_reaction_state_in_smooth_rhs
+            ):
+                if sp.issparse(J):
+                    J = _zero_sparse_columns(J, self.reaction_state_indices)
+                else:
+                    J = np.asarray(J, dtype=float).copy()
+                    J[:, self.reaction_state_indices] = 0.0
             if self.algebraic_projection is None:
                 return J
             patch = self.algebraic_projection.build_constraint_patch(
                 y, self.n_phys, t=t, Fk_val=None, step_size=h, prev_state=prev_state
             ).tocsr()
-            J_lil = J.tolil(copy=True) if sp.issparse(J) else sp.csr_matrix(J).tolil()
+            if sp.issparse(J):
+                return _replace_sparse_rows(J, self.constraint_q_slices, -patch)
+            J_arr = np.asarray(J, dtype=float).copy()
+            patch_arr = patch.toarray()
             for qs in self.constraint_q_slices:
-                J_lil[qs, :] = (-patch[qs, :]).tolil()
-            return J_lil.tocsr()
+                J_arr[qs, :] = -patch_arr[qs, :]
+            return sp.csr_matrix(J_arr)
         f0 = self._smooth_rhs(t, y, h=h, prev_state=prev_state)
         n = self.n_phys
         eps = np.sqrt(np.finfo(float).eps)
@@ -724,8 +1018,7 @@ class ProjectedRadauContactModel:
         out = np.zeros(self.n_react, dtype=float)
         if self.get_s0 is None and self.get_w0 is None:
             return out
-        y_aug = np.zeros(self.n_phys + self.n_react, dtype=float)
-        y_aug[: self.n_phys] = y
+        y_aug = self._callback_augmented_state(y)
         s0 = _eval_s0(self.get_s0, self._s0_nargs, len(self.contacts), y_aug, t=t, Fk_val=None)
         for k, ci in enumerate(self.contacts):
             sl = ci["block_slice"]
@@ -754,14 +1047,14 @@ class ProjectedRadauContactModel:
                 else:
                     normal = _eval_contact_scalar_field(
                         self.normal_r, self._normal_r_nargs, n_blocks, "normal_r",
-                        np.concatenate([y, np.zeros(self.n_react)]), t=t, Fk_val=None,
+                        self._callback_augmented_state(y), t=t, Fk_val=None,
                     )
                 if self._use_auto_friction_r:
                     friction = rho_T
                 else:
                     friction = _eval_contact_scalar_field(
                         self.friction_r, self._friction_r_nargs, n_blocks, "friction_r",
-                        np.concatenate([y, np.zeros(self.n_react)]), t=t, Fk_val=None,
+                        self._callback_augmented_state(y), t=t, Fk_val=None,
                     )
                 return normal, friction
 
@@ -770,14 +1063,14 @@ class ProjectedRadauContactModel:
         else:
             normal = _eval_contact_scalar_field(
                 self.normal_r, self._normal_r_nargs, n_blocks, "normal_r",
-                np.concatenate([y, np.zeros(self.n_react)]), t=t, Fk_val=None,
+                self._callback_augmented_state(y), t=t, Fk_val=None,
             )
         if self._use_auto_friction_r:
             friction = self._auto_friction_r_base.copy()
         else:
             friction = _eval_contact_scalar_field(
                 self.friction_r, self._friction_r_nargs, n_blocks, "friction_r",
-                np.concatenate([y, np.zeros(self.n_react)]), t=t, Fk_val=None,
+                self._callback_augmented_state(y), t=t, Fk_val=None,
             )
         return normal, friction
 
@@ -800,7 +1093,7 @@ class ProjectedRadauContactModel:
             raise RuntimeError(
                 "Delassus ρ needs rhs_jac or effective_jacobian_fn to build M_eff."
             )
-        J = _call_with_time_state_fk(self.rhs_jac, t, np.asarray(y, dtype=float), None)
+        J = self._smooth_jac(t, np.asarray(y, dtype=float), h=h, prev_state=y)
         A = self.A_phys
         if sp.issparse(A) or sp.issparse(J):
             A_csc = A.tocsc() if sp.issparse(A) else sp.csc_matrix(A)
@@ -1010,8 +1303,11 @@ class ProjectedRadauContactModel:
         friction_scale,
         *,
         need_mu_derivative=False,
+        law=None,
     ):
-        f_blk, df_dnormal, df_du, df_dr = self.contact_law.residual_and_jac(
+        if law is None:
+            law = self.contact_law
+        f_blk, df_dnormal, df_du, df_dr = law.residual_and_jac(
             normal_quantity,
             contact_velocity,
             percussion,
@@ -1023,7 +1319,7 @@ class ProjectedRadauContactModel:
         if need_mu_derivative:
             eps = np.sqrt(np.finfo(float).eps) * max(1.0, abs(float(mu)))
             if float(mu) > eps:
-                fp = self.contact_law.residual_and_jac(
+                fp = law.residual_and_jac(
                     normal_quantity,
                     contact_velocity,
                     percussion,
@@ -1031,7 +1327,7 @@ class ProjectedRadauContactModel:
                     normal_scale,
                     friction_scale,
                 )[0]
-                fm = self.contact_law.residual_and_jac(
+                fm = law.residual_and_jac(
                     normal_quantity,
                     contact_velocity,
                     percussion,
@@ -1041,7 +1337,7 @@ class ProjectedRadauContactModel:
                 )[0]
                 df_dmu = (fp - fm) / (2.0 * eps)
             else:
-                fp = self.contact_law.residual_and_jac(
+                fp = law.residual_and_jac(
                     normal_quantity,
                     contact_velocity,
                     percussion,
@@ -1066,6 +1362,78 @@ class ProjectedRadauContactModel:
 
     def pack(self, Y, dPi):
         return np.concatenate([Y[0], Y[1], dPi[0], dPi[1]])
+
+    def _reaction_storage_from_state(self, y_aug, y_prev):
+        if self.n_react == 0:
+            return np.zeros(0, dtype=float)
+        if self.reaction_state_indices is not None:
+            return np.asarray(y_prev, dtype=float).ravel()[
+                self.reaction_state_indices
+            ].copy()
+        if y_aug.size >= self.n_phys + self.n_react:
+            return np.asarray(
+                y_aug[self.n_phys:self.n_phys + self.n_react],
+                dtype=float,
+            ).copy()
+        return np.zeros(self.n_react, dtype=float)
+
+    def _stage_initial_guess(self, y_aug, y_prev, h):
+        prev_storage = self._reaction_storage_from_state(y_aug, y_prev)
+        if self.reported_reaction_units == "force":
+            warm_pi = float(h) * prev_storage
+        else:
+            warm_pi = prev_storage.copy()
+
+        Y0 = [y_prev.copy(), y_prev.copy()]
+        dPi0 = [warm_pi.copy(), warm_pi.copy()]
+
+        last_delta = self._last_stage_delta_y
+        last_dpi = self._last_stage_dpi_guess
+        last_h = self._last_stage_guess_h
+        if (
+            self.reaction_state_indices is not None
+            and last_delta is not None
+            and last_dpi is not None
+            and last_h is not None
+            and float(last_h) > 0.0
+        ):
+            scale = float(h) / float(last_h)
+            if np.isfinite(scale) and 0.05 <= scale <= 20.0:
+                try:
+                    Y_trial = [
+                        y_prev + scale * np.asarray(last_delta[i], dtype=float)
+                        for i in range(2)
+                    ]
+                    dPi_trial = [
+                        scale * np.asarray(last_dpi[i], dtype=float)
+                        for i in range(2)
+                    ]
+                    if (
+                        Y_trial[0].shape == y_prev.shape
+                        and Y_trial[1].shape == y_prev.shape
+                        and dPi_trial[0].shape == (self.n_react,)
+                        and dPi_trial[1].shape == (self.n_react,)
+                    ):
+                        Y0 = [Y_trial[0].copy(), Y_trial[1].copy()]
+                        dPi0 = [dPi_trial[0].copy(), dPi_trial[1].copy()]
+                except (TypeError, ValueError, FloatingPointError):
+                    pass
+
+        if self.reaction_state_indices is not None:
+            idx = self.reaction_state_indices
+            for i in range(2):
+                Y0[i] = np.asarray(Y0[i], dtype=float).copy()
+                Y0[i][idx] = self._reported_from_impulse(dPi0[i], h)
+        return self.pack(Y0, dPi0)
+
+    def _remember_stage_guess(self, Y, dPi, y_prev, h):
+        self._last_stage_delta_y = [
+            np.asarray(Y[i], dtype=float).copy() - y_prev for i in range(2)
+        ]
+        self._last_stage_dpi_guess = [
+            np.asarray(dPi[i], dtype=float).copy() for i in range(2)
+        ]
+        self._last_stage_guess_h = float(h)
 
     def stage_quantities(self, Z, t, h, rk_A, rk_c):
         Y, dPi = self.unpack(Z)
@@ -1094,6 +1462,9 @@ class ProjectedRadauContactModel:
                     h * f[j] + self._matvec(self._B_coupling, dPi[j])
                 )
             F[i * n:(i + 1) * n] = phys
+            if self.reaction_state_indices is not None:
+                idx = self.reaction_state_indices
+                F[i * n + idx] = Y[i][idx] - self._reported_from_impulse(dPi[i], h)
 
         for i in range(2):
             F[2 * n + i * r:2 * n + (i + 1) * r] = self._contact_residual(
@@ -1142,7 +1513,30 @@ class ProjectedRadauContactModel:
             for j in range(2):
                 row.append((float(rk_A[i, j]) * Jr).tocsr())
             rows.append(sp.hstack(row, format="csr"))
-        return sp.vstack(rows, format="csr")
+        J_full = sp.vstack(rows, format="csr")
+        if self.reaction_state_indices is not None:
+            idx = self.reaction_state_indices
+            d_reported = self._reported_derivative_from_impulse(h)
+            repl_rows = []
+            repl_cols = []
+            repl_data = []
+            for i in range(2):
+                row_base = i * n
+                y_col_base = i * n
+                dpi_col_base = 2 * n + i * r
+                for local_col, state_idx in enumerate(idx):
+                    row_idx = row_base + int(state_idx)
+                    repl_rows.extend([row_idx, row_idx])
+                    repl_cols.extend([
+                        y_col_base + int(state_idx),
+                        dpi_col_base + local_col,
+                    ])
+                    repl_data.extend([1.0, -d_reported])
+            replacement = sp.csr_matrix(
+                (repl_data, (repl_rows, repl_cols)), shape=J_full.shape
+            )
+            J_full = _replace_sparse_rows(J_full, [np.asarray(repl_rows, dtype=int)], replacement)
+        return J_full.tocsr()
 
     def _contact_residual(self, y, t, percussion, offset_measure, h, *, endpoint):
         gaps = self.gap(y, t)
@@ -1151,13 +1545,20 @@ class ProjectedRadauContactModel:
         normal_r, friction_r = self._scale_arrays(y, t, h)
         out = np.zeros(self.n_react, dtype=float)
         effective = percussion + offset_measure
+        velocity_normal = bool(
+            getattr(self.contact_law, "expects_velocity_normal", False)
+        )
         for k, ci in enumerate(self.contacts):
             sl = ci["block_slice"]
-            gap_or_xi = float(gaps[k] - (0.0 if endpoint else self.gap_tol))
-            f_blk, _, _, _ = self.contact_law.residual_and_jac(
+            effective_blk = self._storage_to_reported(percussion[sl], sl) + offset_measure[sl]
+            if velocity_normal:
+                gap_or_xi = float(u_contact[sl.start])
+            else:
+                gap_or_xi = float(gaps[k] - (0.0 if endpoint else self.gap_tol))
+            f_blk = self.contact_law.residual(
                 gap_or_xi,
                 u_contact[sl],
-                effective[sl],
+                effective_blk,
                 mu[k],
                 normal_r[k],
                 friction_r[k],
@@ -1183,35 +1584,47 @@ class ProjectedRadauContactModel:
         effective = percussion + offset_measure
         Jy = np.zeros((self.n_react, self.n_phys), dtype=float)
         Jr = np.zeros((self.n_react, self.n_react), dtype=float)
+        velocity_normal = bool(
+            getattr(self.contact_law, "expects_velocity_normal", False)
+        )
         for k, ci in enumerate(self.contacts):
             sl = ci["block_slice"]
-            gap_or_xi = float(gaps[k] - (0.0 if endpoint else self.gap_tol))
+            effective_blk = self._storage_to_reported(percussion[sl], sl) + offset_measure[sl]
+            if velocity_normal:
+                gap_or_xi = float(u_contact[sl.start])
+                normal_row = U_dense[sl.start, :]
+            else:
+                gap_or_xi = float(gaps[k] - (0.0 if endpoint else self.gap_tol))
+                normal_row = gap_dense[k, :]
             need_mu = bool(np.any(np.abs(mu_y[k, :]) > 0.0))
             _, df_dgap, df_du, df_dr, df_dmu = self._law_residual_and_jac(
                 gap_or_xi,
                 u_contact[sl],
-                effective[sl],
+                effective_blk,
                 mu[k],
                 normal_r[k],
                 friction_r[k],
                 need_mu_derivative=need_mu,
             )
             D_blk = U_dense[sl, :]
-            Jy[sl, :] = np.outer(df_dgap, gap_dense[k, :]) + df_du @ D_blk
+            Jy[sl, :] = np.outer(df_dgap, normal_row) + df_du @ D_blk
             if need_mu:
                 Jy[sl, :] += np.outer(df_dmu, mu_y[k, :])
-            Jr[sl, sl] = df_dr
+            Jr[sl, sl] = df_dr @ np.diag(self._storage_jacobian_scale(sl))
         return sp.csr_matrix(Jy), sp.csr_matrix(Jr)
 
     # ------------------------------------------------------------------
     # Endpoint projection
     # ------------------------------------------------------------------
     def _projection_map(self):
+        if self._projection_map_cache is not None:
+            return self._projection_map_cache
         if self.n_react == 0:
-            return (
+            self._projection_map_cache = (
                 np.array([], dtype=int),
                 np.zeros((self.n_phys, self.n_react), dtype=float),
             )
+            return self._projection_map_cache
 
         idx = None
         if self.projection_indices is None:
@@ -1242,10 +1655,15 @@ class ProjectedRadauContactModel:
             P = np.asarray(P, dtype=float)
             if P.ndim == 1:
                 P = P.reshape(-1, 1)
-            return np.arange(self.n_phys, dtype=int), P
+            self._projection_map_cache = (np.arange(self.n_phys, dtype=int), P)
+            return self._projection_map_cache
 
         if idx.size == 0:
-            return idx, np.zeros((self.n_phys, self.n_react), dtype=float)
+            self._projection_map_cache = (
+                idx,
+                np.zeros((self.n_phys, self.n_react), dtype=float),
+            )
+            return self._projection_map_cache
 
         if sp.issparse(self.A_phys):
             A_red = self.A_phys[idx, :][:, idx].tocsc()
@@ -1261,23 +1679,24 @@ class ProjectedRadauContactModel:
             P_red = np.linalg.solve(A_red, B_red)
         P = np.zeros((self.n_phys, self.n_react), dtype=float)
         P[idx, :] = np.asarray(P_red, dtype=float)
-        return idx, P
+        self._projection_map_cache = (idx, P)
+        return self._projection_map_cache
 
     def project_endpoint(self, y_stage, y_prev_phys, stage_pi, t_new, h):
         _, P = self._projection_map()
         offset = float(h) * self._offset_force(y_stage, t_new)
-        total_stage_eff = stage_pi + offset
+        total_stage_eff = self._storage_to_reported(stage_pi) + offset
 
         def residual(delta_pi):
             y_plus = y_stage + P @ delta_pi
-            total_eff = total_stage_eff + delta_pi
+            total_eff = total_stage_eff + self._storage_to_reported(delta_pi)
             return self._endpoint_contact_residual(
                 y_plus, y_prev_phys, total_eff, t_new, h,
             )
 
         def jac(delta_pi):
             y_plus = y_stage + P @ delta_pi
-            total_eff = total_stage_eff + delta_pi
+            total_eff = total_stage_eff + self._storage_to_reported(delta_pi)
             return self._endpoint_contact_jacobian(
                 y_plus, y_prev_phys, total_eff, t_new, h, P,
             )
@@ -1285,10 +1704,17 @@ class ProjectedRadauContactModel:
         delta = np.zeros(self.n_react, dtype=float)
         ok = True
         err = np.inf
+        # Scale the endpoint Newton tolerance by the natural problem magnitude
+        # (||total_stage_eff||): a fixed 1e-10 absolute floor sits below the
+        # double-precision round-off floor cond(J)*eps*||r|| once accumulated
+        # impulses grow with h, so Newton stalls at machine precision and
+        # exhausts its iteration budget.
+        ref_scale = max(1.0, float(np.linalg.norm(total_stage_eff)))
+        endpoint_tol = 1.0e-10 * ref_scale
         for _ in range(20):
             F = residual(delta)
             err = float(np.linalg.norm(F))
-            if err < 1.0e-10:
+            if err < endpoint_tol:
                 break
             J = jac(delta)
             try:
@@ -1313,17 +1739,25 @@ class ProjectedRadauContactModel:
 
         y_plus = y_stage + P @ delta
         total_pert = stage_pi + delta
-        total_eff = total_pert + offset
-        reported = self._reported_from_impulse(total_pert, h)
+        total_eff = self._storage_to_reported(total_pert) + offset
+        reported_storage = self._reported_from_impulse(total_pert, h)
+        reported = self._storage_to_reported(reported_storage)
+        self.last_reported_storage_reaction = reported_storage.copy()
         return y_plus, delta, total_pert, total_eff, reported, ok, err
 
     def _endpoint_contact_residual(self, y_plus, y_prev_phys, total_eff, t_new, h):
+        # Endpoint dispatch is always velocity-level (Breuling Stage 2): xi[0] is
+        # the restitution-shifted normal velocity, used both as the De Saxce /
+        # SOC-FB kinematic input and as the velocity-level Signorini argument
+        # for scalar NCP laws.  The position-level admissibility check happens
+        # earlier via the endpoint_inactive_handling=='gap' gate.
         gaps = self.gap(y_plus, t_new)
         u_new = self.contact_velocity(y_plus)
         u_old = self.contact_velocity(y_prev_phys)
         mu = _vectorize_mu(self.contacts, y_plus, t=t_new, Fk_val=None)
         normal_r, friction_r = self._scale_arrays(y_plus, t_new, h)
         out = np.zeros(self.n_react, dtype=float)
+        endpoint_law = self.endpoint_law
         for k, ci in enumerate(self.contacts):
             sl = ci["block_slice"]
             if (
@@ -1336,7 +1770,7 @@ class ProjectedRadauContactModel:
             xi[0] += self.restitution_normal * u_old[sl.start]
             if sl.stop - sl.start > 1:
                 xi[1:] += self.restitution_tangential * u_old[sl.start + 1:sl.stop]
-            f_blk, _, _, _ = self.contact_law.residual_and_jac(
+            f_blk = endpoint_law.residual(
                 float(xi[0]), xi, total_eff[sl], mu[k], normal_r[k], friction_r[k]
             )
             out[sl] = f_blk
@@ -1363,7 +1797,7 @@ class ProjectedRadauContactModel:
                 self.endpoint_inactive_handling == "gap"
                 and gaps[k] > self.gap_tol
             ):
-                J[sl, sl] = np.eye(sl.stop - sl.start)
+                J[sl, sl] = np.diag(self._storage_jacobian_scale(sl))
                 continue
             xi = u_new[sl].copy()
             xi[0] += self.restitution_normal * u_old[sl.start]
@@ -1378,12 +1812,14 @@ class ProjectedRadauContactModel:
                 normal_r[k],
                 friction_r[k],
                 need_mu_derivative=need_mu,
+                law=self.endpoint_law,
             )
             DPi_blk = DP[sl, :]
+            storage_scale = np.diag(self._storage_jacobian_scale(sl))
             J[sl, :] = np.outer(df_dgap, DPi_blk[0, :]) + df_du @ DPi_blk
             if need_mu:
                 J[sl, :] += np.outer(df_dmu, mu_y[k, :] @ P)
-            J[sl, sl] += df_dr
+            J[sl, :] += (df_dr @ storage_scale) @ np.eye(self.n_react)[sl, :]
         return J
 
     # ------------------------------------------------------------------
@@ -1394,15 +1830,7 @@ class ProjectedRadauContactModel:
             raise ValueError("Projected Radau contact requires positive h")
         y_aug = np.asarray(y_aug, dtype=float).ravel()
         y_prev = y_aug[: self.n_phys]
-        prev_reported = (
-            y_aug[self.n_phys:self.n_phys + self.n_react]
-            if y_aug.size >= self.n_phys + self.n_react else np.zeros(self.n_react)
-        )
-        if self.reported_reaction_units == "force":
-            warm_pi = float(h) * prev_reported
-        else:
-            warm_pi = prev_reported.copy()
-        Z0 = self.pack([y_prev.copy(), y_prev.copy()], [warm_pi.copy(), warm_pi.copy()])
+        Z0 = self._stage_initial_guess(y_aug, y_prev, h)
 
         rk_A = integrator._rk_A
         rk_b = integrator._rk_b
@@ -1427,8 +1855,17 @@ class ProjectedRadauContactModel:
                 base_atol, base_rtol = solver._ensure_nl_tol_vectors(y_aug.size)
                 atol_phys = base_atol[: self.n_phys]
                 rtol_phys = base_rtol[: self.n_phys]
-                atol_react = base_atol[self.n_phys:self.n_phys + self.n_react]
-                rtol_react = base_rtol[self.n_phys:self.n_phys + self.n_react]
+                if self.reaction_state_indices is not None:
+                    idx = self.reaction_state_indices
+                    # dPi has units of (storage state) * h, while base_atol[idx]
+                    # is supplied for the storage block; scale by h so the
+                    # absolute tolerance lives in the same units as the dPi
+                    # unknown. rtol multiplies |dPi| and self-scales already.
+                    atol_react = base_atol[idx] * float(h)
+                    rtol_react = base_rtol[idx]
+                else:
+                    atol_react = base_atol[self.n_phys:self.n_phys + self.n_react] * float(h)
+                    rtol_react = base_rtol[self.n_phys:self.n_phys + self.n_react]
                 solver._nl_atol_vec = np.concatenate([atol_phys, atol_phys, atol_react, atol_react])
                 solver._nl_rtol_vec = np.concatenate([rtol_phys, rtol_phys, rtol_react, rtol_react])
             solver.lam = np.ones_like(Z0)
@@ -1442,22 +1879,76 @@ class ProjectedRadauContactModel:
 
         F_aug = self._compress_stage_residual(F_sol)
         if not ok:
+            try:
+                import os as _os
+                _diag_path = _os.environ.get(
+                    "PR_CONTACT_FAILDIAG", "/tmp/sw_step_diag.log"
+                )
+                n = self.n_phys
+                r = self.n_react
+                F1 = np.asarray(F_sol[:n], dtype=float)
+                F2 = np.asarray(F_sol[n:2 * n], dtype=float)
+                F3 = np.asarray(F_sol[2 * n:2 * n + r], dtype=float)
+                F4 = np.asarray(F_sol[2 * n + r:2 * n + 2 * r], dtype=float)
+                Z1 = np.asarray(Z_sol[:n], dtype=float)
+                Z3 = np.asarray(Z_sol[2 * n:2 * n + r], dtype=float)
+                with open(_diag_path, "a") as _fh:
+                    _fh.write(
+                        f"FAIL t={float(t):.6f} h={float(h):.6e} iters={int(iters)}\n"
+                    )
+                    _fh.write(
+                        f"  ||F||  Y1={np.linalg.norm(F1):.3e} Y2={np.linalg.norm(F2):.3e} "
+                        f"dPi1={np.linalg.norm(F3):.3e} dPi2={np.linalg.norm(F4):.3e}\n"
+                    )
+                    _fh.write(
+                        f"  max|F| Y1={np.max(np.abs(F1)):.3e}@{int(np.argmax(np.abs(F1)))} "
+                        f"Y2={np.max(np.abs(F2)):.3e}@{int(np.argmax(np.abs(F2)))} "
+                        f"dPi1={np.max(np.abs(F3)):.3e}@{int(np.argmax(np.abs(F3)))} "
+                        f"dPi2={np.max(np.abs(F4)):.3e}@{int(np.argmax(np.abs(F4)))}\n"
+                    )
+                    _fh.write(
+                        f"  ||Z||  Y1={np.linalg.norm(Z1):.3e} dPi1={np.linalg.norm(Z3):.3e}\n"
+                    )
+                    if self.reaction_state_indices is not None:
+                        idx = self.reaction_state_indices
+                        F1_react = F1[idx]
+                        F1_phys = F1.copy()
+                        F1_phys[idx] = 0.0
+                        _fh.write(
+                            f"  |F1@react_idx|={np.linalg.norm(F1_react):.3e} "
+                            f"|F1@non_react|={np.linalg.norm(F1_phys):.3e}\n"
+                        )
+                    if self.constraint_q_slices:
+                        for k_q, qs in enumerate(self.constraint_q_slices):
+                            _fh.write(
+                                f"  |F1@constr{k_q}|={np.linalg.norm(F1[qs]):.3e}\n"
+                            )
+            except Exception as _e:
+                pass
             return y_aug, F_aug, np.zeros_like(y_aug), False, iters
 
         Y, dPi, dmu, _offsets = self.stage_quantities(Z_sol, t, h, rk_A, rk_c)
+        self._remember_stage_guess(Y, dPi, y_prev, h)
         stage_pi = rk_b[0] * dPi[0] + rk_b[1] * dPi[1]
         y_plus, delta_pi, total_pi, total_eff, reported, proj_ok, proj_err = self.project_endpoint(
             Y[-1], y_prev, stage_pi, t + h, h
         )
+        reported_storage = self._reported_from_impulse(total_pi, h)
 
-        y_new = np.zeros(self.n_phys + self.n_react, dtype=float)
-        y_new[: self.n_phys] = y_plus
-        y_new[self.n_phys:] = reported
+        if self.reaction_state_indices is not None:
+            y_new = np.asarray(y_plus, dtype=float).copy()
+            self._write_storage_to_reaction_state(y_new, reported_storage)
+        else:
+            y_new = np.zeros(self.n_phys + self.n_react, dtype=float)
+            y_new[: self.n_phys] = y_plus
+            y_new[self.n_phys:] = reported
 
         err_embed = np.zeros_like(y_new)
         coeffs = getattr(integrator, "_err_coeffs", np.zeros(2))
         if len(coeffs) >= 2:
             err_embed[: self.n_phys] = coeffs[0] * (Y[0] - y_prev) + coeffs[1] * (Y[1] - y_prev)
+            if self.reaction_state_indices is not None:
+                err_embed[self.reaction_state_indices] = 0.0
 
         self.last_stage_dpi = np.vstack(dPi)
         self.last_stage_dmu = np.vstack(dmu)
@@ -1466,11 +1957,59 @@ class ProjectedRadauContactModel:
         self.last_total_effective_pi = total_eff.copy()
         self.last_reported_reaction = reported.copy()
         stage_reported = self._reported_from_impulse(stage_pi, h)
-        integrator.last_post_step_delta = y_new - np.concatenate([Y[-1], stage_reported])
+        if self.reaction_state_indices is not None:
+            stage_state = np.asarray(Y[-1], dtype=float).copy()
+            self._write_storage_to_reaction_state(stage_state, stage_reported)
+            integrator.last_post_step_delta = y_new - stage_state
+        else:
+            integrator.last_post_step_delta = y_new - np.concatenate([Y[-1], stage_reported])
 
-        F_aug[self.n_phys:] = self._endpoint_contact_residual(
+        endpoint_residual = self._endpoint_contact_residual(
             y_plus, y_prev, total_eff, t + h, h
         )
+        if self.reaction_state_indices is not None:
+            F_aug[self.reaction_state_indices] = endpoint_residual
+        else:
+            F_aug[self.n_phys:] = endpoint_residual
+        if not proj_ok:
+            try:
+                import os as _os
+                _diag_path = _os.environ.get(
+                    "PR_CONTACT_FAILDIAG", "/tmp/sw_step_diag.log"
+                )
+                ep_res = np.asarray(endpoint_residual, dtype=float)
+                d_pi = np.asarray(delta_pi, dtype=float)
+                t_pi = np.asarray(total_pi, dtype=float)
+                t_eff = np.asarray(total_eff, dtype=float)
+                gaps_at_end = np.asarray(self.gap(y_plus, t + h), dtype=float)
+                u_end = np.asarray(self.contact_velocity(y_plus), dtype=float)
+                with open(_diag_path, "a") as _fh:
+                    _fh.write(
+                        f"PROJ_FAIL t={float(t):.6f} h={float(h):.6e} proj_err={float(proj_err):.3e}\n"
+                    )
+                    _fh.write(
+                        f"  ||ep_res||={np.linalg.norm(ep_res):.3e} max={np.max(np.abs(ep_res)):.3e}@{int(np.argmax(np.abs(ep_res)))}\n"
+                    )
+                    _fh.write(
+                        f"  ||delta_pi||={np.linalg.norm(d_pi):.3e} ||total_pi||={np.linalg.norm(t_pi):.3e} ||total_eff||={np.linalg.norm(t_eff):.3e}\n"
+                    )
+                    _fh.write(
+                        f"  gap min={float(np.min(gaps_at_end)):.3e} max={float(np.max(gaps_at_end)):.3e}\n"
+                    )
+                    _fh.write(
+                        f"  |u_contact| max={float(np.max(np.abs(u_end))):.3e}\n"
+                    )
+                    for k_c, ci in enumerate(self.contacts):
+                        sl = ci["block_slice"]
+                        _fh.write(
+                            f"  c{k_c}: ep_res[sl]={np.linalg.norm(ep_res[sl]):.3e} "
+                            f"r_eff_N={float(t_eff[sl.start]):.3e} "
+                            f"r_eff_T_norm={float(np.linalg.norm(t_eff[sl.start+1:sl.stop])):.3e} "
+                            f"u_N={float(u_end[sl.start]):.3e} "
+                            f"u_T_norm={float(np.linalg.norm(u_end[sl.start+1:sl.stop])):.3e}\n"
+                        )
+            except Exception:
+                pass
         return y_new, F_aug, err_embed, bool(proj_ok), int(iters)
 
 
@@ -1488,6 +2027,7 @@ def build_projected_radau_contact(
     rhs_jac=None,
     gap_tol=0.0,
     contact_law="fischer_burmeister",
+    endpoint_law=None,
     normal_ncp_type=None,
     friction_ncp_type=None,
     friction_law="compliance",
@@ -1508,6 +2048,9 @@ def build_projected_radau_contact(
     restitution_normal=0.0,
     restitution_tangential=0.0,
     reported_reaction_units="force",
+    reaction_state_indices=None,
+    reaction_state_to_reported_scale=1.0,
+    mask_reaction_state_in_smooth_rhs=True,
     endpoint_inactive_handling="gap",
 ):
     """Build an opt-in Breuling projected-Radau contact system."""
@@ -1559,7 +2102,6 @@ def build_projected_radau_contact(
         reaction_idx += len(rows)
 
     n_react = reaction_idx
-    n_aug = n_phys + n_react
     if B is None and D_extract is not None:
         B_mat = D_extract[reaction_extract_rows, :].T.tocsr() if sp.issparse(D_extract) else np.asarray(D_extract[reaction_extract_rows, :].T, dtype=float)
     elif B is None and C_extract is not None:
@@ -1573,12 +2115,26 @@ def build_projected_radau_contact(
         if B_mat.shape != (n_phys, n_react):
             raise ValueError(f"B shape {B_mat.shape} doesn't match {(n_phys, n_react)}")
 
+    reaction_state_indices_arr = None
+    if reaction_state_indices is not None:
+        reaction_state_indices_arr = np.asarray(reaction_state_indices, dtype=int).ravel()
+        if reaction_state_indices_arr.size != n_react:
+            raise ValueError(
+                "reaction_state_indices must have one entry per reaction "
+                f"DOF (got {reaction_state_indices_arr.size}, expected {n_react})"
+            )
+        if np.any(reaction_state_indices_arr < 0) or np.any(reaction_state_indices_arr >= n_phys):
+            raise ValueError("reaction_state_indices contains out-of-range entries")
+    use_inplace_reaction_state = reaction_state_indices_arr is not None
+    n_aug = n_phys if use_inplace_reaction_state else n_phys + n_react
+
     if D_extract is not None:
         U_contact = D_extract[reaction_extract_rows, :].tocsr() if sp.issparse(D_extract) else np.asarray(D_extract[reaction_extract_rows, :], dtype=float)
     else:
         U_contact = None
 
     law_obj = contact_law
+    endpoint_law_obj = endpoint_law
     if isinstance(contact_law, str):
         law_name = str(contact_law).strip().lower().replace("-", "_").replace(" ", "_")
         if law_name in {"desaxce", "de_saxce"}:
@@ -1594,6 +2150,27 @@ def build_projected_radau_contact(
             "soc_fb", "socfb", "soc_fischer_burmeister",
             "fischer_burmeister_soc", "fb_soc", "abh_soc_fb",
         }:
+            # Breuling product cone at internal stages (position-level
+            # Signorini scalar FB on the normal + velocity-level Coulomb
+            # compliance on the tangential), De Saxce / SOC-FB bipotential
+            # at the endpoint Stage 2 where velocity-cone duality is the
+            # variationally correct setting.  See projected_radau_contact
+            # design notes 2026-05-11.
+            law_obj = NCPNormalConeLaw(
+                ncp_type="fischer_burmeister",
+                normal_ncp_type=normal_ncp_type,
+                friction_ncp_type=friction_ncp_type,
+                friction_law=friction_law,
+            )
+            if endpoint_law_obj is None:
+                endpoint_law_obj = SOCFischerBurmeisterLaw(
+                    alpha=desaxce_alpha,
+                    tie_tol=desaxce_tie_tol,
+                )
+        elif law_name in {"soc_fb_uniform", "socfb_uniform"}:
+            # Legacy single-law dispatch: SOC-FB at both stages.  Retained
+            # for regression comparison with pre-split behavior.  Stage 1
+            # SOC-FB is not Breuling-correct; prefer 'soc_fb' for new work.
             law_obj = SOCFischerBurmeisterLaw(
                 alpha=desaxce_alpha,
                 tie_tol=desaxce_tie_tol,
@@ -1608,6 +2185,11 @@ def build_projected_radau_contact(
     if not isinstance(law_obj, ProjectedRadauContactLaw):
         if not hasattr(law_obj, "residual_and_jac"):
             raise TypeError("contact_law must be a string or expose residual_and_jac")
+    if endpoint_law_obj is not None and not isinstance(
+        endpoint_law_obj, ProjectedRadauContactLaw
+    ):
+        if not hasattr(endpoint_law_obj, "residual_and_jac"):
+            raise TypeError("endpoint_law must expose residual_and_jac")
 
     algebraic_projection = None
     constraint_q_slices = []
@@ -1615,19 +2197,27 @@ def build_projected_radau_contact(
         algebraic_projection = AlgebraicConstraintProjection(constraints=constraints)
         constraint_q_slices = list(algebraic_projection.constraint_q_slices)
 
-    if sp.issparse(A):
-        A_aug = sp.block_diag([A, sp.csr_matrix((n_react, n_react))], format="csr")
+    if use_inplace_reaction_state:
+        A_aug = A.tocsr() if sp.issparse(A) else np.asarray(A, dtype=float).copy()
+        y0_aug = y0.copy()
+        if component_slices is not None:
+            cs_aug = list(component_slices)
+        else:
+            cs_aug = [slice(0, n_phys)]
     else:
-        A_aug = np.zeros((n_aug, n_aug), dtype=float)
-        A_aug[:n_phys, :n_phys] = np.asarray(A, dtype=float)
-    y0_aug = np.zeros(n_aug, dtype=float)
-    y0_aug[:n_phys] = y0
+        if sp.issparse(A):
+            A_aug = sp.block_diag([A, sp.csr_matrix((n_react, n_react))], format="csr")
+        else:
+            A_aug = np.zeros((n_aug, n_aug), dtype=float)
+            A_aug[:n_phys, :n_phys] = np.asarray(A, dtype=float)
+        y0_aug = np.zeros(n_aug, dtype=float)
+        y0_aug[:n_phys] = y0
 
-    if component_slices is not None:
-        cs_aug = list(component_slices)
-        cs_aug.append(slice(n_phys, n_aug))
-    else:
-        cs_aug = [slice(0, n_phys), slice(n_phys, n_aug)]
+        if component_slices is not None:
+            cs_aug = list(component_slices)
+            cs_aug.append(slice(n_phys, n_aug))
+        else:
+            cs_aug = [slice(0, n_phys), slice(n_phys, n_aug)]
 
     model = ProjectedRadauContactModel(
         A_phys=A,
@@ -1656,24 +2246,39 @@ def build_projected_radau_contact(
         friction_r=friction_r,
         gap_tol=float(gap_tol),
         endpoint_inactive_handling=endpoint_inactive_handling,
+        reaction_state_indices=reaction_state_indices_arr,
+        reaction_state_to_reported_scale=reaction_state_to_reported_scale,
+        mask_reaction_state_in_smooth_rhs=(
+            bool(mask_reaction_state_in_smooth_rhs)
+            if use_inplace_reaction_state else False
+        ),
         auto_rho_strategy=auto_rho_strategy,
         effective_jacobian_fn=effective_jacobian_fn,
         delassus_cache_log_tol=float(delassus_cache_log_tol),
+        endpoint_law=endpoint_law_obj,
     )
 
-    def rhs_aug(t, y, *extra):
-        out = np.zeros(n_aug, dtype=float)
-        out[:n_phys] = model._smooth_rhs(t, np.asarray(y)[:n_phys])
-        return out
+    if use_inplace_reaction_state:
+        def rhs_aug(t, y, *extra):
+            return model._smooth_rhs(t, np.asarray(y)[:n_phys])
 
-    def jac_aug(t, y, *extra):
-        J = model._smooth_jac(t, np.asarray(y)[:n_phys])
-        J = J.tocsr() if sp.issparse(J) else sp.csr_matrix(J)
-        return sp.bmat(
-            [[J, sp.csr_matrix((n_phys, n_react))],
-             [sp.csr_matrix((n_react, n_phys)), sp.csr_matrix((n_react, n_react))]],
-            format="csr",
-        )
+        def jac_aug(t, y, *extra):
+            J = model._smooth_jac(t, np.asarray(y)[:n_phys])
+            return J.tocsr() if sp.issparse(J) else sp.csr_matrix(J)
+    else:
+        def rhs_aug(t, y, *extra):
+            out = np.zeros(n_aug, dtype=float)
+            out[:n_phys] = model._smooth_rhs(t, np.asarray(y)[:n_phys])
+            return out
+
+        def jac_aug(t, y, *extra):
+            J = model._smooth_jac(t, np.asarray(y)[:n_phys])
+            J = J.tocsr() if sp.issparse(J) else sp.csr_matrix(J)
+            return sp.bmat(
+                [[J, sp.csr_matrix((n_phys, n_react))],
+                 [sp.csr_matrix((n_react, n_phys)), sp.csr_matrix((n_react, n_react))]],
+                format="csr",
+            )
 
     cs = ContactSystem(
         A=A_aug,
@@ -1693,5 +2298,10 @@ def build_projected_radau_contact(
         solver_opts={"rhs_jac": jac_aug},
     )
     cs.projected_radau_contact = model
-    cs.reaction_history = lambda y_hist, t_hist=None: np.asarray(y_hist)[:, n_phys:]
+    if use_inplace_reaction_state:
+        cs.reaction_state_indices = reaction_state_indices_arr
+        cs.reaction_state_to_reported_scale = model.reaction_state_to_reported_scale
+        cs.reaction_history = lambda y_hist, t_hist=None: model.reaction_state_history(y_hist)
+    else:
+        cs.reaction_history = lambda y_hist, t_hist=None: np.asarray(y_hist)[:, n_phys:]
     return cs
