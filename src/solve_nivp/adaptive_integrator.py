@@ -74,6 +74,7 @@ class AdaptiveStepping:
         verbose: bool = False,
         skip_error_indices=None,
         record_attempts: bool = False,
+        record_diagnostics: bool = False,
         # --- DAE-aware error weighting ---
         dae_var_weight: str = "auto",   # "auto", "exclude", "include"
         # --- Active-set filter for nonsmooth contact ---
@@ -128,6 +129,8 @@ class AdaptiveStepping:
         self.verbose = bool(verbose)
         self.skip_error_indices = set(skip_error_indices or [])
         self.record_attempts = bool(record_attempts)
+        self.record_diagnostics = bool(record_diagnostics)
+        self.diagnostic_component_names = None
 
         # numerical order p of the base integrator
         self.p = int(method_order) if method_order is not None else self._infer_method_order(integrator)
@@ -165,6 +168,12 @@ class AdaptiveStepping:
         self._attempt_accept = None
         self._attempt_error = None
         self._attempt_status = None
+        self._attempt_error_blocks = None
+        self._attempt_nonlinear_blocks = None
+        self._attempt_solver_counters = None
+        self._last_error_block_diagnostics = None
+        self._last_nonlinear_block_diagnostics = None
+        self._last_solver_counters = None
         self.reset_attempt_log()
 
         # --- Nonlinear failure recovery tracking ---
@@ -547,7 +556,17 @@ class AdaptiveStepping:
                 accum += float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
                 count += int(np.sum(w_eff_blk > 0.0))
 
-        return 0.0 if count == 0 else math.sqrt(accum / count)
+        E = 0.0 if count == 0 else math.sqrt(accum / count)
+        if getattr(self, 'record_diagnostics', False):
+            denom_diag = max(1e-14, (2.0 ** self.p) - 1.0)
+            raw_err_diag = (np.asarray(y_lo, dtype=float).reshape(-1)
+                            - np.asarray(y_hi, dtype=float).reshape(-1)) / denom_diag
+            scale_ref_diag = np.maximum(
+                np.abs(np.asarray(y_lo, dtype=float).reshape(-1)),
+                np.abs(np.asarray(y_hi, dtype=float).reshape(-1)),
+            )
+            self._record_scaled_error_block_diagnostics(raw_err_diag, scale_ref_diag, E)
+        return E
 
     def _scaled_error_embedded(self, y_new, err_vec) -> float:
         """Compute normalised RMS error from an embedded error vector.
@@ -628,7 +647,149 @@ class AdaptiveStepping:
                 accum += float(np.dot(self._err_buf.ravel(), self._err_buf.ravel()))
                 count += int(np.sum(w_eff_blk > 0.0))
 
-        return 0.0 if count == 0 else math.sqrt(accum / count)
+        E = 0.0 if count == 0 else math.sqrt(accum / count)
+        self._record_scaled_error_block_diagnostics(
+            err_vec, np.abs(np.asarray(y_new, dtype=float).reshape(-1)), E
+        )
+        return E
+
+    # ------------------------------------------------------------------
+    # Diagnostic helpers (optional)
+    # ------------------------------------------------------------------
+    def _component_indices(self, field, n: int) -> np.ndarray:
+        if isinstance(field, slice):
+            start = 0 if field.start is None else int(field.start)
+            stop = n if field.stop is None else int(field.stop)
+            step = 1 if field.step is None else int(field.step)
+            return np.arange(start, stop, step, dtype=int)
+        arr = np.asarray(field)
+        if arr.ndim == 0:
+            return np.array([arr.item()], dtype=int)
+        if arr.dtype == bool:
+            return np.flatnonzero(arr).astype(int, copy=False)
+        return np.asarray(arr, dtype=int).ravel()
+
+    def _diagnostic_component_name(self, index: int, total: int) -> str:
+        names = getattr(self, 'diagnostic_component_names', None)
+        if names is not None:
+            try:
+                names = list(names)
+            except TypeError:
+                names = None
+        if names:
+            if len(names) == total:
+                return str(names[index])
+            if total % len(names) == 0:
+                stage = index // len(names)
+                base = index % len(names)
+                return f"stage{stage}:{names[base]}"
+        return f"block_{index}"
+
+    def _record_scaled_error_block_diagnostics(self, err_vec, scale_ref, global_metric: float) -> None:
+        if not getattr(self, 'record_diagnostics', False):
+            return
+        try:
+            err_vec = np.asarray(err_vec, dtype=float).reshape(-1)
+            scale_ref = np.asarray(scale_ref, dtype=float).reshape(-1)
+            n = err_vec.size
+            atol_v, rtol_v = self._ensure_tol_vectors(n)
+            dae_w = self._ensure_dae_mask(n)
+            transition = self._transition_mask
+            slices = self.component_slices if self.component_slices is not None else [slice(0, n)]
+
+            blocks = []
+            total_sum_sq = 0.0
+            total_count = 0
+            for i, field in enumerate(slices):
+                idx = self._component_indices(field, n)
+                idx = idx[(idx >= 0) & (idx < n)]
+                skipped = self.component_slices is not None and i in self.skip_error_indices
+                if idx.size == 0 or skipped:
+                    block = {
+                        'index': int(i),
+                        'name': self._diagnostic_component_name(i, len(slices)),
+                        'size': int(idx.size),
+                        'count': 0,
+                        'skipped': bool(skipped),
+                        'rms': 0.0,
+                        'max_abs_scaled': 0.0,
+                        'raw_l2': 0.0,
+                        'weight_min': float('nan'),
+                        'weight_max': float('nan'),
+                        'sum_sq': 0.0,
+                        'fraction': 0.0,
+                    }
+                    blocks.append(block)
+                    continue
+
+                weights = atol_v[idx] + rtol_v[idx] * np.abs(scale_ref[idx])
+                scaled = err_vec[idx] / weights
+                w_eff = dae_w[idx].copy()
+                if transition is not None:
+                    w_eff *= transition[idx]
+                scaled = scaled * w_eff
+                count = int(np.sum(w_eff > 0.0))
+                sum_sq = float(np.dot(scaled, scaled))
+                total_sum_sq += sum_sq
+                total_count += count
+
+                block = {
+                    'index': int(i),
+                    'name': self._diagnostic_component_name(i, len(slices)),
+                    'size': int(idx.size),
+                    'count': count,
+                    'skipped': False,
+                    'rms': 0.0 if count == 0 else float(math.sqrt(sum_sq / count)),
+                    'max_abs_scaled': 0.0 if idx.size == 0 else float(np.max(np.abs(scaled))),
+                    'raw_l2': float(np.linalg.norm(err_vec[idx])),
+                    'weight_min': float(np.min(weights)),
+                    'weight_max': float(np.max(weights)),
+                    'sum_sq': sum_sq,
+                    'fraction': 0.0,
+                }
+                blocks.append(block)
+
+            if total_sum_sq > 0.0:
+                for block in blocks:
+                    block['fraction'] = float(block['sum_sq'] / total_sum_sq)
+
+            self._last_error_block_diagnostics = {
+                'kind': 'adaptive_error_wrms',
+                'global_metric': float(global_metric),
+                'threshold': 1.0,
+                'count': int(total_count),
+                'total_sum_sq': float(total_sum_sq),
+                'blocks': blocks,
+            }
+        except Exception as exc:
+            self._last_error_block_diagnostics = {'error': repr(exc)}
+
+    def _diagnostic_solver(self):
+        return getattr(self.integrator, 'solver', None)
+
+    def _diagnostic_counter_snapshot(self, solver):
+        if solver is None:
+            return {}
+        return {
+            'linear_solves': int(getattr(solver, '_diagnostic_linear_solve_count', 0)),
+            'jacobian_evaluations': int(getattr(solver, '_diagnostic_jacobian_count', 0)),
+            'petsc_builds': int(getattr(solver, '_petsc_build_count', 0)),
+            'petsc_vec_creates': int(getattr(solver, '_petsc_vec_create_count', 0)),
+            'petsc_vec_reuses': int(getattr(solver, '_petsc_vec_reuse_count', 0)),
+        }
+
+    def _capture_solver_diagnostics(self, before):
+        if not getattr(self, 'record_diagnostics', False):
+            return
+        solver = self._diagnostic_solver()
+        after = self._diagnostic_counter_snapshot(solver)
+        self._last_solver_counters = {
+            key: int(after.get(key, 0) - (before or {}).get(key, 0))
+            for key in after
+        }
+        self._last_nonlinear_block_diagnostics = getattr(
+            solver, '_last_nl_block_diagnostics', None
+        ) if solver is not None else None
 
     # ------------------------------------------------------------------
     # Attempt logging helpers (optional)
@@ -641,6 +802,9 @@ class AdaptiveStepping:
             self._attempt_accept = None
             self._attempt_error = None
             self._attempt_status = None
+            self._attempt_error_blocks = None
+            self._attempt_nonlinear_blocks = None
+            self._attempt_solver_counters = None
             return
 
         self._attempt_t = []
@@ -648,6 +812,14 @@ class AdaptiveStepping:
         self._attempt_accept = []
         self._attempt_error = []
         self._attempt_status = []
+        if self.record_diagnostics:
+            self._attempt_error_blocks = []
+            self._attempt_nonlinear_blocks = []
+            self._attempt_solver_counters = []
+        else:
+            self._attempt_error_blocks = None
+            self._attempt_nonlinear_blocks = None
+            self._attempt_solver_counters = None
 
     def _finalize_return(self, t, h_attempt, y_out, fk_out, h_next,
                          E_curr, success, solver_error, iterations, status):
@@ -665,6 +837,14 @@ class AdaptiveStepping:
                 except Exception:
                     self._attempt_error.append(np.nan)
             self._attempt_status.append(status)
+            if self.record_diagnostics:
+                if self._attempt_error_blocks is None:
+                    self._attempt_error_blocks = []
+                    self._attempt_nonlinear_blocks = []
+                    self._attempt_solver_counters = []
+                self._attempt_error_blocks.append(self._last_error_block_diagnostics)
+                self._attempt_nonlinear_blocks.append(self._last_nonlinear_block_diagnostics)
+                self._attempt_solver_counters.append(self._last_solver_counters)
 
         return y_out, fk_out, h_next, E_curr, success, solver_error, iterations
 
@@ -673,13 +853,18 @@ class AdaptiveStepping:
         if not self.record_attempts or self._attempt_t is None:
             return None
 
-        return {
+        log = {
             "t": np.asarray(self._attempt_t, dtype=float),
             "dt": np.asarray(self._attempt_h, dtype=float),
             "accepted": np.asarray(self._attempt_accept, dtype=bool),
             "error": np.asarray(self._attempt_error, dtype=float),
             "status": np.asarray(self._attempt_status, dtype=object),
         }
+        if self.record_diagnostics and self._attempt_error_blocks is not None:
+            log["error_blocks"] = list(self._attempt_error_blocks)
+            log["nonlinear_blocks"] = list(self._attempt_nonlinear_blocks)
+            log["solver_counters"] = list(self._attempt_solver_counters)
+        return log
 
     # ------------------------------------------------------------------
     # Nonlinear-failure recovery cap
@@ -976,6 +1161,14 @@ class AdaptiveStepping:
     # ------------------------------------------------------------------
     def _step_embedded(self, fun, t, y, h):
         """Single-step adaptive attempt using the integrator's own error."""
+        self._last_error_block_diagnostics = None
+        self._last_nonlinear_block_diagnostics = None
+        self._last_solver_counters = None
+        _diag_before = (
+            self._diagnostic_counter_snapshot(self._diagnostic_solver())
+            if getattr(self, 'record_diagnostics', False) else None
+        )
+
         # ── Active-set filter: snapshot regime before step ──
         regime_before = None
         if self.active_set_filter:
@@ -988,12 +1181,15 @@ class AdaptiveStepping:
         except RuntimeError as e:
             if self.verbose:
                 print(f"[adaptive/emb] runtime error @ t={t:.6g}: {e}")
+            self._capture_solver_diagnostics(_diag_before)
             self._transition_mask = None
             h_retry = max(self.h_min, self.h_down * h)
             return self._finalize_return(
                 t, h, y, None, h_retry, np.inf, False, np.inf, 0,
                 "embedded_step_runtime_error",
             )
+
+        self._capture_solver_diagnostics(_diag_before)
 
         # ── Active-set filter: build transition mask ──
         self._transition_mask = None

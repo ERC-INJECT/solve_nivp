@@ -112,6 +112,7 @@ class ImplicitEquationSolver:
         damped_step_fraction: float = 1.0,
         diagonal_regularization: float = 0.0,
         modified_newton_identity: bool = False,
+        mn_refactor_interval: int = 0,
     ) -> None:
         if method not in ['VI', 'semismooth_newton']:
             raise ValueError("Unsupported solver method. Use 'VI' or 'semismooth_newton'.")
@@ -198,7 +199,22 @@ class ImplicitEquationSolver:
         self._petsc_comm_obj = None
         self._petsc_effective_mat_type = None
         self._petsc_effective_vec_type = None
+        self._petsc_b_vec = None
+        self._petsc_x_vec = None
+        self._petsc_b_array = None
+        self._petsc_vec_shape = None
+        self._petsc_vec_comm_obj = None
+        self._petsc_vec_type = None
+        self._petsc_vec_create_count = 0
+        self._petsc_vec_reuse_count = 0
         self._petsc_gpu_warned = set()
+
+        # Opt-in diagnostics; disabled by default to keep hot paths unchanged.
+        self.record_diagnostics = False
+        self.diagnostic_component_names = None
+        self._last_nl_block_diagnostics = None
+        self._diagnostic_linear_solve_count = 0
+        self._diagnostic_jacobian_count = 0
 
         # Rho adaptation safeguards (bounds and "stuck" thresholds)
         # These are conservative defaults; they can be adjusted by users after construction if needed.
@@ -260,6 +276,22 @@ class ImplicitEquationSolver:
         self.damped_step_fraction = float(damped_step_fraction)
         self.diagonal_regularization = float(diagonal_regularization)
         self.modified_newton_identity = bool(modified_newton_identity)
+        # ---- Lazy-refactor modified Newton (identity-projection direct-solver path) ----
+        # When > 0, the IDENTITY-projection Newton loop still recomputes the
+        # Jacobian every iteration it deems stale (needed for semismooth
+        # active-set/branch tracking), but it does NOT force the direct
+        # (MUMPS/PETSc) solver to re-factorize on every such recompute.
+        # Instead the existing factorization is REUSED as a modified-Newton
+        # preconditioner (cheap back-solves) and a fresh factorization is
+        # only taken at most once every ``mn_refactor_interval`` Newton
+        # iterations within a single step (and always once at step start).
+        # This is exact: the residual F is unchanged, so the converged root
+        # is identical to full Newton -- only the Newton DIRECTION uses a
+        # stale tangent, costing a few extra (cheap) back-solves in exchange
+        # for eliminating the dominant per-iteration re-factorization cost.
+        # 0 (default) preserves the original refactor-every-recompute behavior.
+        self.mn_refactor_interval = int(mn_refactor_interval)
+        self._mn_iters_since_factor = 0  # per-step counter, reset by _solve_newton_identity
 
         # Tangent structure cache (for dense-to-sparse optimization)
         self._D_cached = None
@@ -519,6 +551,101 @@ class ImplicitEquationSolver:
             f"or n={n}"
         )
 
+    def _diagnostic_component_name(self, index: int, total: int) -> str:
+        names = getattr(self, 'diagnostic_component_names', None)
+        if names is not None:
+            try:
+                names = list(names)
+            except TypeError:
+                names = None
+        if names:
+            if len(names) == total:
+                return str(names[index])
+            if total % len(names) == 0:
+                stage = index // len(names)
+                base = index % len(names)
+                return f"stage{stage}:{names[base]}"
+        return f"block_{index}"
+
+    def _nl_block_diagnostics(self, F: np.ndarray, y: np.ndarray, global_metric: float) -> dict:
+        F = np.asarray(F, dtype=float).reshape(-1)
+        y = np.asarray(y, dtype=float).reshape(-1)
+        n = F.size
+        slices = self.component_slices if self.component_slices is not None else [slice(0, n)]
+
+        if self._use_weighted_norm:
+            atol_v, rtol_v = self._ensure_nl_tol_vectors(n)
+            weights = atol_v + rtol_v * np.abs(y)
+            scaled = F / weights
+            threshold = 1.0
+        else:
+            weights = np.ones(n, dtype=float)
+            scaled = F
+            threshold = float(self.tol)
+
+        blocks = []
+        total_sum_sq = 0.0
+        for i, field in enumerate(slices):
+            idx = self._component_indices(field, n=n, dtype=int)
+            idx = idx[(idx >= 0) & (idx < n)]
+            if idx.size == 0:
+                block = {
+                    'index': int(i),
+                    'name': self._diagnostic_component_name(i, len(slices)),
+                    'size': 0,
+                    'count': 0,
+                    'rms': 0.0,
+                    'max_abs_scaled': 0.0,
+                    'raw_l2': 0.0,
+                    'weight_min': float('nan'),
+                    'weight_max': float('nan'),
+                    'sum_sq': 0.0,
+                    'fraction': 0.0,
+                }
+                blocks.append(block)
+                continue
+
+            scaled_blk = scaled[idx]
+            raw_blk = F[idx]
+            weights_blk = weights[idx]
+            sum_sq = float(np.dot(scaled_blk, scaled_blk))
+            total_sum_sq += sum_sq
+            block = {
+                'index': int(i),
+                'name': self._diagnostic_component_name(i, len(slices)),
+                'size': int(idx.size),
+                'count': int(idx.size),
+                'rms': float(math.sqrt(sum_sq / idx.size)),
+                'max_abs_scaled': float(np.max(np.abs(scaled_blk))),
+                'raw_l2': float(np.linalg.norm(raw_blk)),
+                'weight_min': float(np.min(weights_blk)),
+                'weight_max': float(np.max(weights_blk)),
+                'sum_sq': sum_sq,
+                'fraction': 0.0,
+            }
+            blocks.append(block)
+
+        if total_sum_sq > 0.0:
+            for block in blocks:
+                block['fraction'] = float(block['sum_sq'] / total_sum_sq)
+
+        return {
+            'kind': 'weighted_wrms' if self._use_weighted_norm else 'legacy_l2',
+            'global_metric': float(global_metric),
+            'threshold': threshold,
+            'count': int(n),
+            'total_sum_sq': float(total_sum_sq),
+            'blocks': blocks,
+        }
+
+    def _record_nl_block_diagnostics(self, F: np.ndarray, y: np.ndarray, global_metric: float) -> None:
+        if not getattr(self, 'record_diagnostics', False):
+            return
+        try:
+            self._last_nl_block_diagnostics = self._nl_block_diagnostics(F, y, global_metric)
+        except Exception as exc:
+            self._last_nl_block_diagnostics = {'error': repr(exc)}
+
     def _wrms(self, F: np.ndarray, y: np.ndarray) -> float:
         """Weighted RMS norm: ``sqrt(mean((F_i / w_i)^2))`` with ``w_i = atol_i + rtol_i*|y_i|``.
 
@@ -554,8 +681,11 @@ class ImplicitEquationSolver:
     def _errf_metric(self, F: np.ndarray, y: np.ndarray) -> float:
         """Return the convergence metric value (for reporting / modified Newton logic)."""
         if self._use_weighted_norm:
-            return self._wrms(F, y)
-        return float(np.linalg.norm(F))
+            val = self._wrms(F, y)
+        else:
+            val = float(np.linalg.norm(F))
+        self._record_nl_block_diagnostics(F, y, val)
+        return val
 
     def _converged_with_metric(self, F: np.ndarray, y: np.ndarray) -> tuple[bool, float]:
         """Compute convergence metric and test in a single call.
@@ -568,8 +698,10 @@ class ImplicitEquationSolver:
         """
         if self._use_weighted_norm:
             val = self._wrms(F, y)
+            self._record_nl_block_diagnostics(F, y, val)
             return (val <= 1.0, val)
         val = float(np.linalg.norm(F))
+        self._record_nl_block_diagnostics(F, y, val)
         return (val < self.tol, val)
 
 
@@ -746,6 +878,7 @@ class ImplicitEquationSolver:
             except Exception:
                 pass
             self._petsc_mat = None
+        self._destroy_petsc_vectors()
         self._petsc_build_count = 0
         self._petsc_shape = None
         self._petsc_pattern_key = None
@@ -1045,6 +1178,20 @@ class ImplicitEquationSolver:
             if self._J_cross_call.shape == (n, n):
                 J_local = self._J_cross_call
 
+        # ---- Lazy-refactor modified Newton (opt-in via mn_refactor_interval) ----
+        # Reset the per-step "iterations since last factorization" counter.
+        # When > 0, refactor is forced once at the first stale recompute of
+        # this step, then suppressed for the next (mn_refactor_interval-1)
+        # recomputes (reuse the factor as a modified-Newton preconditioner),
+        # then forced again, etc.  Only meaningful on the direct PETSc path.
+        _lazy_refactor = (
+            self.mn_refactor_interval > 0
+            and not _use_splu_path
+            and self.linear_solver == 'petsc'
+        )
+        self._mn_iters_since_factor = 0
+        _mn_have_factor = False  # becomes True after the first real factorization this step
+
         prev_errF = np.inf      # previous *iteration's* errF (always updated)
 
         for iteration in range(1, self.max_iter + 1):
@@ -1080,7 +1227,25 @@ class ImplicitEquationSolver:
                 self._lu = None               # also invalidate persistent cache
                 self._lu_shape = None
                 self._J_cross_call = None     # will be re-set after linear solve
-                self._petsc_needs_matrix_update = True  # force MUMPS re-factorisation
+                # ---- Lazy-refactor gate (opt-in) ----
+                # By default, force a fresh MUMPS factorization on every
+                # stale-J recompute.  When lazy-refactor is active, only
+                # force a re-factorization at most once every
+                # ``mn_refactor_interval`` recomputes within this step:
+                # the first recompute factors, the next (interval-1) reuse
+                # the existing factor as a modified-Newton preconditioner.
+                if _lazy_refactor and _mn_have_factor and \
+                        self._mn_iters_since_factor < self.mn_refactor_interval:
+                    # Reuse the existing factorization (do NOT set the
+                    # re-factorization flag); J_local still carries the
+                    # fresh tangent for line-search gradients / branch
+                    # tracking, but PETSc back-solves with the stale factor.
+                    self._mn_iters_since_factor += 1
+                else:
+                    self._petsc_needs_matrix_update = True  # force MUMPS re-factorisation
+                    if _lazy_refactor:
+                        _mn_have_factor = True
+                        self._mn_iters_since_factor = 0
 
             # --- Linear solve: J @ delta = -F_in ---
             rhs = -F_in
@@ -2373,6 +2538,7 @@ class ImplicitEquationSolver:
 
     def _compute_jacobian_csr(self, func, y, sparse_active):
         """Compute Jacobian and return as CSR, using caching to avoid dense-to-sparse overhead."""
+        self._diagnostic_jacobian_count += 1
         # 1. Compute raw Jacobian (dense or sparse)
         if self.jacobian is not None:
             J_raw = self.jacobian(y)
@@ -2604,6 +2770,7 @@ class ImplicitEquationSolver:
         return out
 
     def _solve_linear_sparse(self, J, rhs, rtol=None, pattern_hint=None):
+        self._diagnostic_linear_solve_count += 1
         n = J.shape[0]
         b = rhs if (isinstance(rhs, np.ndarray) and rhs.ndim == 1) else np.asarray(rhs).reshape(n)
 
@@ -2887,6 +3054,20 @@ class ImplicitEquationSolver:
         stop = start + base + (1 if rank < extra else 0)
         return int(start), int(stop)
 
+    def _destroy_petsc_vectors(self):
+        for attr in ('_petsc_b_vec', '_petsc_x_vec'):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.destroy()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+        self._petsc_b_array = None
+        self._petsc_vec_shape = None
+        self._petsc_vec_comm_obj = None
+        self._petsc_vec_type = None
+
     def _petsc_type_supported(self, kind, type_name):
         """Return True when the current PETSc build accepts the requested type."""
         if not PETSC_AVAILABLE or not type_name:
@@ -3095,6 +3276,7 @@ class ImplicitEquationSolver:
             pass  # Skip to solve phase
         elif need_rebuild:
             # Destroy old objects if they exist
+            self._destroy_petsc_vectors()
             if self._petsc_mat is not None:
                 try:
                     self._petsc_mat.destroy()
@@ -3265,6 +3447,7 @@ class ImplicitEquationSolver:
         self._petsc_build_count += 1
 
         # Create PETSc vectors (GPU or CPU)
+        cache_vectors = False
         if distributed:
             local_b = np.ascontiguousarray(b[row_start:row_stop], dtype=np.float64)
             b_petsc = PETSc.Vec().createMPI((local_n, n), comm=comm)
@@ -3284,8 +3467,32 @@ class ImplicitEquationSolver:
             x_petsc.setSizes(n)
             x_petsc.setUp()
         else:
-            b_petsc = PETSc.Vec().createWithArray(b.copy(), comm=comm)
-            x_petsc = self._petsc_mat.createVecRight()
+            b_arr = np.asarray(b, dtype=PETSc.ScalarType).reshape(-1)
+            vec_shape = (int(n),)
+            reuse_vectors = (
+                self._petsc_b_vec is not None
+                and self._petsc_x_vec is not None
+                and self._petsc_vec_shape == vec_shape
+                and self._petsc_vec_comm_obj is comm
+                and self._petsc_vec_type is None
+            )
+            if not reuse_vectors:
+                self._destroy_petsc_vectors()
+                self._petsc_b_array = np.empty(vec_shape, dtype=PETSc.ScalarType)
+                self._petsc_b_array[:] = b_arr
+                self._petsc_b_vec = PETSc.Vec().createWithArray(self._petsc_b_array, comm=comm)
+                self._petsc_x_vec = self._petsc_mat.createVecRight()
+                self._petsc_vec_shape = vec_shape
+                self._petsc_vec_comm_obj = comm
+                self._petsc_vec_type = None
+                self._petsc_vec_create_count += 1
+            else:
+                self._petsc_b_array[:] = b_arr
+                self._petsc_vec_reuse_count += 1
+            b_petsc = self._petsc_b_vec
+            x_petsc = self._petsc_x_vec
+            x_petsc.set(0.0)
+            cache_vectors = True
 
         # Solve
         self._petsc_ksp.solve(b_petsc, x_petsc)
@@ -3330,8 +3537,9 @@ class ImplicitEquationSolver:
                 RuntimeWarning
             )
 
-        # Cleanup vectors (but keep KSP and Mat for reuse)
-        b_petsc.destroy()
-        x_petsc.destroy()
+        # Cleanup ephemeral vectors, but keep reusable CPU Vecs with KSP and Mat.
+        if not cache_vectors:
+            b_petsc.destroy()
+            x_petsc.destroy()
 
         return (x, success)

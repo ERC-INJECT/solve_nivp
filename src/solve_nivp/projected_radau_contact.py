@@ -264,6 +264,64 @@ def _soc_jordan_multiplication(x: np.ndarray) -> np.ndarray:
     return L
 
 
+def _soc_fb_phi_and_jac_2d(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    tie_tol: float = 1.0e-14,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r"""Closed-form d = 2 specialization of :func:`_soc_fb_phi_and_jac`.
+
+    On ℝ × ℝ the Jordan-multiplication matrices are arrow matrices
+    ``L_u = [[u0, u1], [u1, u0]]`` with eigenpairs ``(u0 ± u1, (1, ±1)/√2)``,
+    so ``L_s⁻¹`` and the Moore-Penrose pseudoinverse used at the cone
+    boundary both have two-term closed forms.  Scalar arithmetic replaces
+    the generic spectral machinery; eigenvalue thresholding mirrors
+    ``np.linalg.pinv(L_s, rcond=tie_tol)`` so degenerate-case Clarke
+    elements coincide with the generic path.
+    """
+    x0, x1 = float(x[0]), float(x[1])
+    y0, y1 = float(y[0]), float(y[1])
+
+    w0 = x0 * x0 + x1 * x1 + y0 * y0 + y1 * y1
+    w1 = 2.0 * (x0 * x1 + y0 * y1)
+    abs_w1 = abs(w1)
+    sqrt_lam1 = np.sqrt(max(w0 - abs_w1, 0.0))
+    sqrt_lam2 = np.sqrt(max(w0 + abs_w1, 0.0))
+    s0 = 0.5 * (sqrt_lam1 + sqrt_lam2)
+    if abs_w1 > tie_tol:
+        s1 = 0.5 * (sqrt_lam2 - sqrt_lam1) * (1.0 if w1 >= 0.0 else -1.0)
+    else:
+        s1 = 0.0
+    phi = np.array([x0 + y0 - s0, x1 + y1 - s1])
+
+    interior = (s0 > abs(s1) + tie_tol) and (s0 > tie_tol)
+    if interior:
+        det = s0 * s0 - s1 * s1
+        i00 = s0 / det
+        i01 = -s1 / det
+    else:
+        # Eigenvalues of L_s are s0 ± s1 >= 0 (s lies in the cone);
+        # threshold against rcond * lambda_max exactly as np.linalg.pinv.
+        lam_p = s0 + s1
+        lam_m = s0 - s1
+        cutoff = tie_tol * max(lam_p, lam_m)
+        c_p = 1.0 / lam_p if lam_p > cutoff else 0.0
+        c_m = 1.0 / lam_m if lam_m > cutoff else 0.0
+        i00 = 0.5 * (c_p + c_m)
+        i01 = 0.5 * (c_p - c_m)
+
+    df_dx = np.array([
+        [1.0 - (i00 * x0 + i01 * x1), -(i00 * x1 + i01 * x0)],
+        [-(i01 * x0 + i00 * x1), 1.0 - (i01 * x1 + i00 * x0)],
+    ])
+    df_dy = np.array([
+        [1.0 - (i00 * y0 + i01 * y1), -(i00 * y1 + i01 * y0)],
+        [-(i01 * y0 + i00 * y1), 1.0 - (i01 * y1 + i00 * y0)],
+    ])
+    return phi, df_dx, df_dy
+
+
 def _soc_fb_phi_and_jac(
     x: np.ndarray,
     y: np.ndarray,
@@ -290,6 +348,8 @@ def _soc_fb_phi_and_jac(
     x = np.asarray(x, dtype=float).ravel()
     y = np.asarray(y, dtype=float).ravel()
     d = x.size
+    if d == 2:
+        return _soc_fb_phi_and_jac_2d(x, y, tie_tol=tie_tol)
 
     # Residual + s, computed once.
     phi = _soc_fb_phi(x, y, tie_tol=tie_tol)
@@ -690,6 +750,7 @@ class ProjectedRadauContactModel:
     reported_reaction_units: str
     get_s0: Optional[Callable]
     get_w0: Optional[Callable]
+    constant_contact_offsets: bool
     normal_r: Any
     friction_r: Any
     gap_tol: float
@@ -1014,12 +1075,54 @@ class ProjectedRadauContactModel:
             return self._matvec(self.U_contact, y)
         return y[self.reaction_extract_rows]
 
-    def _offset_force(self, y, t):
+    def _static_gap_jacobian_dense(self, y, t):
+        cached = getattr(self, "_gap_jacobian_dense_static", None)
+        if cached is not None:
+            return cached
+        if self.gap_func is None and self.C_extract is not None:
+            if sp.issparse(self.C_extract):
+                gap_jac = self.C_extract[self.normal_rows, :].tocsr()
+                cached = gap_jac.toarray()
+            else:
+                cached = np.asarray(self.C_extract[self.normal_rows, :], dtype=float)
+            self._gap_jacobian_dense_static = cached
+            return cached
+        gap_jac = self.gap_jacobian(y, t)
+        return (
+            gap_jac.toarray()
+            if sp.issparse(gap_jac)
+            else np.asarray(gap_jac, dtype=float)
+        )
+
+    def _static_contact_operator_dense(self):
+        cached = getattr(self, "_U_contact_dense_static", None)
+        if cached is not None:
+            return cached
+        if self.U_contact is not None:
+            cached = (
+                self.U_contact.toarray()
+                if sp.issparse(self.U_contact)
+                else np.asarray(self.U_contact, dtype=float)
+            )
+        else:
+            cached = np.zeros((self.n_react, self.n_phys), dtype=float)
+            cached[np.arange(self.n_react), self.reaction_extract_rows] = 1.0
+        self._U_contact_dense_static = cached
+        return cached
+
+    def _evaluate_offset_force(self, y, t):
         out = np.zeros(self.n_react, dtype=float)
         if self.get_s0 is None and self.get_w0 is None:
             return out
         y_aug = self._callback_augmented_state(y)
-        s0 = _eval_s0(self.get_s0, self._s0_nargs, len(self.contacts), y_aug, t=t, Fk_val=None)
+        s0 = _eval_s0(
+            self.get_s0,
+            self._s0_nargs,
+            len(self.contacts),
+            y_aug,
+            t=t,
+            Fk_val=None,
+        )
         for k, ci in enumerate(self.contacts):
             sl = ci["block_slice"]
             out[sl.start] = float(s0[k])
@@ -1029,6 +1132,15 @@ class ProjectedRadauContactModel:
                     self.get_w0, self._w0_nargs, y_aug, k, m, t=t, Fk_val=None
                 )
         return out
+
+    def _offset_force(self, y, t):
+        if not bool(self.constant_contact_offsets):
+            return self._evaluate_offset_force(y, t)
+        cached = getattr(self, "_constant_offset_force_cache", None)
+        if cached is None:
+            cached = self._evaluate_offset_force(y, t)
+            self._constant_offset_force_cache = cached
+        return cached.copy()
 
     def _scale_arrays(self, y, t, h):
         n_blocks = len(self.contacts)
@@ -1568,15 +1680,11 @@ class ProjectedRadauContactModel:
 
     def _contact_jacobian(self, y, t, percussion, offset_measure, h, *, endpoint):
         gaps = self.gap(y, t)
-        gap_jac = self.gap_jacobian(y, t)
-        gap_dense = gap_jac.toarray() if sp.issparse(gap_jac) else np.asarray(gap_jac, dtype=float)
-        U = self.U_contact
-        if U is not None:
-            U_dense = U.toarray() if sp.issparse(U) else np.asarray(U, dtype=float)
+        gap_dense = self._static_gap_jacobian_dense(y, t)
+        U_dense = self._static_contact_operator_dense()
+        if self.U_contact is not None:
             u_contact = U_dense @ y
         else:
-            U_dense = np.zeros((self.n_react, self.n_phys), dtype=float)
-            U_dense[np.arange(self.n_react), self.reaction_extract_rows] = 1.0
             u_contact = y[self.reaction_extract_rows]
         mu = _vectorize_mu(self.contacts, y, t=t, Fk_val=None)
         mu_y = self._mu_state_jacobian(y, t, mu)
@@ -2039,6 +2147,7 @@ def build_projected_radau_contact(
     desaxce_tie_tol=1.0e-14,
     get_s0=None,
     get_w0=None,
+    constant_contact_offsets=False,
     normal_r="auto",
     friction_r="auto",
     auto_rho_strategy="h_scaled",
@@ -2242,6 +2351,7 @@ def build_projected_radau_contact(
         reported_reaction_units=reported_reaction_units,
         get_s0=get_s0,
         get_w0=get_w0,
+        constant_contact_offsets=bool(constant_contact_offsets),
         normal_r=normal_r,
         friction_r=friction_r,
         gap_tol=float(gap_tol),

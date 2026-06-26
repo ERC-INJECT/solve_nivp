@@ -278,6 +278,62 @@ class TestDAEErrorWeighting:
         assert E_auto == pytest.approx(E_incl, rel=1e-12)
 
 
+
+class TestAttemptDiagnostics:
+    def test_embedded_attempt_log_records_block_diagnostics_and_solver_counters(self):
+        class _FakeSolver:
+            def __init__(self):
+                self._diagnostic_linear_solve_count = 10
+                self._diagnostic_jacobian_count = 3
+                self._petsc_build_count = 4
+                self._petsc_vec_create_count = 1
+                self._petsc_vec_reuse_count = 6
+                self._last_nl_block_diagnostics = None
+
+        class _FakeEmbeddedIntegrator:
+            has_embedded_error = True
+
+            def __init__(self):
+                self.solver = _FakeSolver()
+
+            def step(self, fun, t, y, h):
+                self.solver._diagnostic_linear_solve_count += 2
+                self.solver._diagnostic_jacobian_count += 1
+                self.solver._petsc_build_count += 1
+                self.solver._petsc_vec_reuse_count += 2
+                self.solver._last_nl_block_diagnostics = {
+                    'global_metric': 0.25,
+                    'blocks': [{'index': 0, 'name': 'field', 'rms': 0.25}],
+                }
+                return y.copy(), None, np.array([0.001, 0.2]), True, 4
+
+        stepper = AdaptiveStepping(
+            _FakeEmbeddedIntegrator(),
+            component_slices=[slice(0, 1), slice(1, 2)],
+            atol=1e-6,
+            rtol=1e-3,
+            h0=0.1,
+            method_order=2,
+            record_attempts=True,
+            record_diagnostics=True,
+        )
+        stepper.diagnostic_component_names = ['small', 'dominant']
+
+        stepper.step(lambda t, y: -y, 0.0, np.array([1.0, 1.0]), 0.1)
+        log = stepper.get_attempt_log()
+
+        assert 'error_blocks' in log
+        assert 'nonlinear_blocks' in log
+        assert 'solver_counters' in log
+        assert log['solver_counters'][0]['linear_solves'] == 2
+        assert log['solver_counters'][0]['jacobian_evaluations'] == 1
+        assert log['solver_counters'][0]['petsc_builds'] == 1
+        assert log['solver_counters'][0]['petsc_vec_reuses'] == 2
+        assert log['nonlinear_blocks'][0]['global_metric'] == pytest.approx(0.25)
+        assert [blk['name'] for blk in log['error_blocks'][0]['blocks']] == ['small', 'dominant']
+        assert log['error_blocks'][0]['blocks'][1]['fraction'] > log['error_blocks'][0]['blocks'][0]['fraction']
+
+
 class TestDAEErrorWeightingSparse:
     """DAE mask with sparse mass matrix."""
 

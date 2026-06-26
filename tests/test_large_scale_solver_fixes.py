@@ -53,13 +53,18 @@ class _FakeVec:
         self.array = None
         self.size = None
         self.comm = None
+        self.destroyed = False
+        self.create_with_array_calls = 0
+        self.set_array_calls = 0
+        self.set_calls = 0
 
     def create(self, comm=None):
         self.comm = comm
         return self
 
     def createWithArray(self, arr, comm=None):
-        self.array = np.array(arr, copy=True)
+        self.create_with_array_calls += 1
+        self.array = np.asarray(arr)
         self.comm = comm
         return self
 
@@ -74,12 +79,19 @@ class _FakeVec:
             self.array = np.zeros(self.size)
 
     def setArray(self, arr):
-        self.array = np.array(arr, copy=True)
+        self.set_array_calls += 1
+        self.array = np.asarray(arr)
+
+    def set(self, value):
+        self.set_calls += 1
+        if self.array is not None:
+            self.array[...] = value
 
     def getArray(self):
         return self.array
 
     def destroy(self):
+        self.destroyed = True
         return None
 
 
@@ -313,6 +325,97 @@ def test_petsc_direct_updates_same_pattern_without_recreating_ksp(monkeypatch):
     np.testing.assert_allclose(solver._petsc_mat.last_values, J2.data)
     assert solver._petsc_ksp.getPC().setup_calls == 1
     assert solver._petsc_ksp.getPC().reuse_preconditioner is True
+
+
+def test_petsc_cpu_vectors_are_reused_between_solves(monkeypatch):
+    monkeypatch.setattr(ns, 'PETSC_AVAILABLE', True)
+    monkeypatch.setattr(ns, 'PETSc', _FakePETSc)
+
+    solver = ImplicitEquationSolver(
+        method='semismooth_newton',
+        proj=IdentityProjection(),
+        linear_solver='petsc',
+        petsc_options={'ksp_type': 'gmres', 'pc_type': 'jacobi'},
+        petsc_reuse_steps=5,
+    )
+
+    J = sp.eye(3, format='csr')
+    b1 = np.array([1.0, 2.0, 3.0])
+    b2 = np.array([4.0, 5.0, 6.0])
+
+    x1, ok1 = solver._solve_with_petsc(J, b1)
+    assert ok1
+    np.testing.assert_allclose(x1, b1)
+    b_vec0 = solver._petsc_b_vec
+    x_vec0 = solver._petsc_x_vec
+    assert b_vec0 is not None
+    assert x_vec0 is not None
+    assert not b_vec0.destroyed
+    assert not x_vec0.destroyed
+
+    x2, ok2 = solver._solve_with_petsc(J, b2)
+
+    assert ok2
+    np.testing.assert_allclose(x2, b2)
+    assert solver._petsc_b_vec is b_vec0
+    assert solver._petsc_x_vec is x_vec0
+    assert not b_vec0.destroyed
+    assert not x_vec0.destroyed
+    assert b_vec0.set_array_calls == 0
+    assert x_vec0.set_calls == 2
+
+
+def test_petsc_cpu_vector_cache_resets_when_shape_changes(monkeypatch):
+    monkeypatch.setattr(ns, 'PETSC_AVAILABLE', True)
+    monkeypatch.setattr(ns, 'PETSc', _FakePETSc)
+
+    solver = ImplicitEquationSolver(
+        method='semismooth_newton',
+        proj=IdentityProjection(),
+        linear_solver='petsc',
+        petsc_options={'ksp_type': 'gmres', 'pc_type': 'jacobi'},
+        petsc_reuse_steps=5,
+    )
+
+    _, ok1 = solver._solve_with_petsc(sp.eye(3, format='csr'), np.ones(3))
+    assert ok1
+    b_vec0 = solver._petsc_b_vec
+    x_vec0 = solver._petsc_x_vec
+
+    x2, ok2 = solver._solve_with_petsc(sp.eye(4, format='csr'), np.arange(4.0))
+
+    assert ok2
+    np.testing.assert_allclose(x2, np.arange(4.0))
+    assert solver._petsc_b_vec is not b_vec0
+    assert solver._petsc_x_vec is not x_vec0
+    assert b_vec0.destroyed
+    assert x_vec0.destroyed
+
+
+def test_petsc_cpu_vector_cache_is_cleared_by_invalidate_all_caches(monkeypatch):
+    monkeypatch.setattr(ns, 'PETSC_AVAILABLE', True)
+    monkeypatch.setattr(ns, 'PETSc', _FakePETSc)
+
+    solver = ImplicitEquationSolver(
+        method='semismooth_newton',
+        proj=IdentityProjection(),
+        linear_solver='petsc',
+        petsc_options={'ksp_type': 'gmres', 'pc_type': 'jacobi'},
+    )
+
+    _, ok = solver._solve_with_petsc(sp.eye(3, format='csr'), np.ones(3))
+    assert ok
+    b_vec0 = solver._petsc_b_vec
+    x_vec0 = solver._petsc_x_vec
+
+    solver.invalidate_all_caches()
+
+    assert solver._petsc_b_vec is None
+    assert solver._petsc_x_vec is None
+    assert solver._petsc_b_array is None
+    assert solver._petsc_vec_shape is None
+    assert b_vec0.destroyed
+    assert x_vec0.destroyed
 
 
 def test_fieldsplit_accepts_array_component_slices(monkeypatch):

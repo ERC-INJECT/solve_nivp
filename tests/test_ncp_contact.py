@@ -5,7 +5,14 @@ import pytest
 
 import solve_nivp
 from solve_nivp.contact import ContactSystem
-from solve_nivp.ncp_contact import build_dynamic_ncp_contact, build_ncp_contact
+from solve_nivp.alart_curnier_contact import _project_ball_and_jac
+from solve_nivp.ncp_contact import (
+    _contact_block_residual_and_jac_2d,
+    _friction_compliance_and_jac,
+    _normal_ncp_residual_and_jac,
+    build_dynamic_ncp_contact,
+    build_ncp_contact,
+)
 from solve_nivp.projections import IdentityProjection
 
 
@@ -24,6 +31,118 @@ def _bouncing_ball_setup(mu=0.3):
     y0 = np.array([2.0, 0.0, 0.0, 1.0])
     contacts = [dict(vel_normal_idx=1, vel_tangential_idx=[0], mu=mu, e=0.0)]
     return A, rhs, y0, contacts, gap_func
+
+
+def _reference_contact_block_2d(
+    gap,
+    u_blk,
+    r_blk,
+    mu,
+    normal_ncp_type,
+    friction_ncp_type,
+    normal_scale,
+    friction_scale,
+    friction_law,
+    *,
+    tie_tol=1.0e-14,
+):
+    u_blk = np.asarray(u_blk, dtype=float)
+    r_blk = np.asarray(r_blk, dtype=float)
+    f_blk = np.zeros(2, dtype=float)
+    df_dgap = np.zeros(2, dtype=float)
+    df_du = np.zeros((2, 2), dtype=float)
+    df_dr = np.zeros((2, 2), dtype=float)
+
+    phi_n, dphi_dgap, dphi_drn = _normal_ncp_residual_and_jac(
+        gap, r_blk[0], normal_ncp_type, normal_scale, tie_tol=tie_tol
+    )
+    f_blk[0] = phi_n
+    df_dgap[0] = dphi_dgap
+    df_dr[0, 0] = dphi_drn
+
+    mu_lambda_n = float(mu * r_blk[0])
+    if mu_lambda_n <= tie_tol:
+        f_blk[1] = r_blk[1]
+        df_dr[1, 1] = 1.0
+        return f_blk, df_dgap, df_du, df_dr
+
+    if friction_law == "natural_map":
+        y_vec = np.array([r_blk[1] - float(friction_scale) * u_blk[1]])
+        proj, dproj_ddelta, dproj_dy = _project_ball_and_jac(
+            y_vec, mu_lambda_n, tie_tol=tie_tol
+        )
+        f_blk[1] = proj[0] - r_blk[1]
+        df_du[1, 1] = -float(friction_scale) * dproj_dy[0, 0]
+        df_dr[1, 1] = dproj_dy[0, 0] - 1.0
+        df_dr[1, 0] = float(mu) * dproj_ddelta[0]
+        return f_blk, df_dgap, df_du, df_dr
+
+    u_t = float(u_blk[1])
+    r_t = float(r_blk[1])
+    speed = abs(u_t)
+    r_t_norm = abs(r_t)
+    cone_gap = mu_lambda_n - r_t_norm
+    W, dW_dspeed, dW_dgap, dW_dmulambda = _friction_compliance_and_jac(
+        speed, cone_gap, mu_lambda_n, friction_ncp_type, friction_scale,
+        tie_tol=tie_tol,
+    )
+
+    f_blk[1] = u_t + W * r_t
+    if speed > tie_tol:
+        dspeed_du = u_t / speed
+    elif r_t_norm > tie_tol:
+        dspeed_du = -r_t / r_t_norm
+    else:
+        dspeed_du = 0.0
+
+    drnorm_dr = r_t / r_t_norm if r_t_norm > tie_tol else 0.0
+    dW_du = dW_dspeed * dspeed_du
+    dW_dr_t = -dW_dgap * drnorm_dr
+    dW_dr_n = (dW_dmulambda + dW_dgap) * float(mu)
+
+    df_du[1, 1] = 1.0 + r_t * dW_du
+    df_dr[1, 1] = W + r_t * dW_dr_t
+    df_dr[1, 0] = r_t * dW_dr_n
+    return f_blk, df_dgap, df_du, df_dr
+
+
+@pytest.mark.parametrize("friction_law", ["compliance", "natural_map"])
+@pytest.mark.parametrize(
+    "gap,u_blk,r_blk,mu",
+    [
+        (-0.2, np.array([0.0, 0.4]), np.array([0.7, -0.2]), 0.6),
+        (0.1, np.array([0.0, 0.0]), np.array([0.5, 0.3]), 0.5),
+        (-0.1, np.array([0.0, 0.2]), np.array([0.0, 0.1]), 0.6),
+    ],
+)
+def test_contact_block_2d_fast_path_matches_reference(
+    friction_law, gap, u_blk, r_blk, mu
+):
+    got = _contact_block_residual_and_jac_2d(
+        gap,
+        u_blk,
+        r_blk,
+        mu,
+        "fischer_burmeister",
+        "fischer_burmeister",
+        1.7,
+        0.8,
+        friction_law,
+    )
+    expected = _reference_contact_block_2d(
+        gap,
+        u_blk,
+        r_blk,
+        mu,
+        "fischer_burmeister",
+        "fischer_burmeister",
+        1.7,
+        0.8,
+        friction_law,
+    )
+
+    for got_arr, expected_arr in zip(got, expected):
+        np.testing.assert_allclose(got_arr, expected_arr, rtol=1.0e-13, atol=1.0e-13)
 
 
 def test_return_type_and_projection():

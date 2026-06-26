@@ -351,6 +351,83 @@ def test_soc_fischer_burmeister_residual_fast_path_matches_full_jacobian_path():
         np.testing.assert_allclose(f_fast, f_full, rtol=1.0e-13, atol=1.0e-13)
 
 
+def test_projected_radau_contact_jacobian_uses_static_dense_operator_cache(monkeypatch):
+    C = csr_matrix(np.eye(2))
+    D = csr_matrix(np.eye(2))
+    cs = build_projected_radau_contact(
+        np.eye(2),
+        _zero_rhs,
+        np.zeros(2),
+        [{"vel_normal_idx": 0, "vel_tangential_idx": [1], "mu": 0.5}],
+        C_extract=C,
+        D_extract=D,
+        B=np.eye(2),
+        rhs_jac=_zero_jac,
+        contact_law="minimum_map",
+        normal_r=1.0,
+        friction_r=1.0,
+        reported_reaction_units="impulse",
+    )
+    model = cs.projected_radau_contact
+
+    def fail_gap_jacobian(*_args, **_kwargs):
+        raise AssertionError("static C_extract should use the cached dense gap Jacobian")
+
+    monkeypatch.setattr(model, "gap_jacobian", fail_gap_jacobian)
+    Jy, Jr = model._contact_jacobian(
+        np.array([0.1, 0.2]),
+        0.0,
+        np.array([0.3, -0.04]),
+        np.zeros(2),
+        0.25,
+        endpoint=False,
+    )
+
+    assert Jy.shape == (2, 2)
+    assert Jr.shape == (2, 2)
+    assert np.all(np.isfinite(Jy.toarray()))
+    assert np.all(np.isfinite(Jr.toarray()))
+
+
+def test_projected_radau_constant_contact_offsets_cache_callbacks():
+    calls = {"s0": 0, "w0": 0}
+
+    def get_s0(y):
+        calls["s0"] += 1
+        return np.array([2.0])
+
+    def get_w0(y, k):
+        calls["w0"] += 1
+        return np.array([0.25])
+
+    cs = build_projected_radau_contact(
+        np.eye(2),
+        _zero_rhs,
+        np.zeros(2),
+        [{"vel_normal_idx": 0, "vel_tangential_idx": [1], "mu": 0.5}],
+        C_extract=np.eye(2),
+        D_extract=np.eye(2),
+        B=np.eye(2),
+        rhs_jac=_zero_jac,
+        contact_law="minimum_map",
+        get_s0=get_s0,
+        get_w0=get_w0,
+        constant_contact_offsets=True,
+        normal_r=1.0,
+        friction_r=1.0,
+        reported_reaction_units="impulse",
+    )
+    model = cs.projected_radau_contact
+
+    first = model._offset_force(np.array([0.0, 0.0]), 0.0)
+    first_call_count = calls.copy()
+    second = model._offset_force(np.array([9.0, -4.0]), 2.0)
+
+    np.testing.assert_allclose(first, [2.0, 0.25])
+    np.testing.assert_allclose(second, [2.0, 0.25])
+    assert calls == first_call_count
+
+
 def test_projected_radau_contact_jacobian_includes_dmu_dy():
     def mu(y):
         return 0.5 + 0.1 * y[2]
@@ -888,3 +965,27 @@ def test_bouncing_ball_projected_radau_is_inelastic_after_impact():
         [mass * gravity * h, 0.0],
         atol=1.0e-12,
     )
+
+def test_soc_fb_2d_fast_path_matches_generic_jordan():
+    from solve_nivp.projected_radau_contact import (
+        _soc_fb_phi_and_jac,
+        _soc_fb_phi_and_jac_2d,
+    )
+    # Padding with a zero second tangential embeds the R^2 cone in R^3 where
+    # the Jordan matrices are block-diagonal, so the generic spectral path
+    # must reproduce the closed-form d=2 branch in the top-left 2x2 block.
+    rng = np.random.default_rng(7)
+    cases = [rng.normal(size=4) * s for s in (1.0, 1e-3, 1e3) for _ in range(10)]
+    cases.append(np.array([1.0, 1.0, 0.0, 0.0]))     # s on the cone boundary
+    cases.append(np.array([0.0, 0.0, 0.0, 0.0]))     # origin (s = 0)
+    cases.append(np.array([0.3, 0.3, 0.4, 0.4]))     # w_T aligned
+    for vec in cases:
+        x2, y2 = vec[:2], vec[2:]
+        x3 = np.array([x2[0], x2[1], 0.0])
+        y3 = np.array([y2[0], y2[1], 0.0])
+        phi2, dx2, dy2 = _soc_fb_phi_and_jac_2d(x2, y2)
+        phi3, dx3, dy3 = _soc_fb_phi_and_jac(x3, y3)
+        np.testing.assert_allclose(phi2, phi3[:2], rtol=1e-12, atol=1e-14)
+        np.testing.assert_allclose(dx2, dx3[:2, :2], rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(dy2, dy3[:2, :2], rtol=1e-12, atol=1e-12)
+        assert abs(phi3[2]) < 1e-14

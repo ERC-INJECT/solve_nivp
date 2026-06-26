@@ -9,6 +9,8 @@ Verifies that:
  - Top-level solve_nivp forwards nl_atol / nl_rtol correctly
 """
 
+import math
+
 import numpy as np
 import pytest
 
@@ -208,6 +210,33 @@ class TestImplicitSolverWRMS:
             tol=1e-10,
         )
         assert solver._use_weighted_norm is False
+
+    def test_weighted_norm_block_diagnostics(self):
+        """Diagnostics should identify which component dominates the WRMS norm."""
+        solver = ImplicitEquationSolver(
+            method='semismooth_newton',
+            proj=IdentityProjection(),
+            tol=1e-10,
+            nl_atol=1.0,
+            nl_rtol=0.0,
+            component_slices=[slice(0, 2), slice(2, 4)],
+        )
+        solver.record_diagnostics = True
+        solver.diagnostic_component_names = ['slow', 'dominant']
+
+        F = np.array([0.5, 0.5, 2.0, 2.0])
+        y = np.zeros(4)
+
+        converged, metric = solver._converged_with_metric(F, y)
+
+        assert converged is False
+        assert metric == pytest.approx(math.sqrt((0.25 + 0.25 + 4.0 + 4.0) / 4.0))
+        diag = solver._last_nl_block_diagnostics
+        assert diag['global_metric'] == pytest.approx(metric)
+        assert [blk['name'] for blk in diag['blocks']] == ['slow', 'dominant']
+        assert diag['blocks'][0]['rms'] == pytest.approx(0.5)
+        assert diag['blocks'][1]['rms'] == pytest.approx(2.0)
+        assert diag['blocks'][1]['fraction'] > diag['blocks'][0]['fraction']
 
 
 # ===================================================================

@@ -69,6 +69,7 @@ from .integrations import BackwardEuler, BackwardEulerSchur, RadauIIASchur, Trap
 from .solvers.block_system import SchurComplementSolver, BlockStructuredSystem
 from .ODESystem import ODESystem
 from .ODESolver import ODESolver
+from .mjf_integration import (MJFIntegrationMethod, solve_mjf_fixed_step, MJFContactView)
 from .contact import build_impulse_contact, ContactSystem
 from .alart_curnier_contact import (
   build_alart_curnier_contact,
@@ -211,8 +212,9 @@ def solve_nivp(
   adaptive_opts : dict or None
     Optional controls for the adaptive stepper. Recognized keys include
     ``h_min``, ``h_max``, ``h_up``, ``h_down``, ``safety``, ``use_PI``,
-    ``method_order`` (alias ``p``), ``atol``, ``rtol``, and
-    ``skip_error_indices``. ``h0`` here (if provided) overrides the top-level
+    ``method_order`` (alias ``p``), ``atol``, ``rtol``, ``record_diagnostics``,
+    ``diagnostic_component_names``, and ``skip_error_indices``. ``h0`` here (if
+    provided) overrides the top-level
     ``h0`` for the initial step guess. Unrecognized keys are ignored.
   adaptive : bool, default True
     Enable Richardson extrapolation based adaptive step size control.
@@ -428,6 +430,19 @@ def solve_nivp(
 
       # Forward active-set filter setting
       stepper.active_set_filter = bool(active_set_filter)
+
+      # Optional diagnostics for blockwise error/residual profiling.
+      _record_diag = bool(adaptive_opts.get('record_diagnostics', False))
+      stepper.record_diagnostics = _record_diag
+      solver_instance.record_diagnostics = _record_diag
+      _diag_names = adaptive_opts.get('diagnostic_component_names', None)
+      if _diag_names is not None:
+        try:
+          _diag_names = list(_diag_names)
+        except TypeError:
+          _diag_names = None
+        stepper.diagnostic_component_names = _diag_names
+        solver_instance.diagnostic_component_names = _diag_names
 
       # Handle auto-h0 from top level
       if h0 is None or (isinstance(h0, str) and str(h0).lower() == 'auto'):

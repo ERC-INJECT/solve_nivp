@@ -235,6 +235,93 @@ def _friction_compliance_and_jac(
     )
 
 
+def _contact_block_residual_and_jac_2d(
+    gap,
+    u_blk,
+    r_blk,
+    mu,
+    normal_ncp_type,
+    friction_ncp_type,
+    normal_scale,
+    friction_scale,
+    friction_law="compliance",
+    *,
+    tie_tol=1.0e-14,
+):
+    r"""Specialized two-row NCP block residual and quasi-Newton Jacobian."""
+    u_blk = np.asarray(u_blk, dtype=float)
+    r_blk = np.asarray(r_blk, dtype=float)
+
+    f_blk = np.zeros(2, dtype=float)
+    df_dgap = np.zeros(2, dtype=float)
+    df_du = np.zeros((2, 2), dtype=float)
+    df_dr = np.zeros((2, 2), dtype=float)
+
+    r_n = float(r_blk[0])
+    phi_n, dphi_dgap, dphi_drn = _normal_ncp_residual_and_jac(
+        gap, r_n, normal_ncp_type, normal_scale, tie_tol=tie_tol
+    )
+    f_blk[0] = phi_n
+    df_dgap[0] = dphi_dgap
+    df_dr[0, 0] = dphi_drn
+
+    r_t = float(r_blk[1])
+    mu_lambda_n = float(mu * r_n)
+    if mu_lambda_n <= tie_tol:
+        f_blk[1] = r_t
+        df_dr[1, 1] = 1.0
+        return f_blk, df_dgap, df_du, df_dr
+
+    u_t = float(u_blk[1])
+    if friction_law == "natural_map":
+        y_t = r_t - float(friction_scale) * u_t
+        abs_y = abs(y_t)
+        if mu_lambda_n <= 0.0:
+            proj = 0.0
+            dproj_ddelta = 0.0
+            dproj_dy = 0.0
+        elif abs_y <= mu_lambda_n + tie_tol:
+            proj = y_t
+            dproj_ddelta = 0.0
+            dproj_dy = 1.0
+        else:
+            sign_y = 1.0 if y_t >= 0.0 else -1.0
+            proj = mu_lambda_n * sign_y
+            dproj_ddelta = sign_y
+            dproj_dy = 0.0
+        f_blk[1] = proj - r_t
+        df_du[1, 1] = -float(friction_scale) * dproj_dy
+        df_dr[1, 1] = dproj_dy - 1.0
+        df_dr[1, 0] = float(mu) * dproj_ddelta
+        return f_blk, df_dgap, df_du, df_dr
+
+    speed = abs(u_t)
+    r_t_norm = abs(r_t)
+    cone_gap = mu_lambda_n - r_t_norm
+    W, dW_dspeed, dW_dgap, dW_dmulambda = _friction_compliance_and_jac(
+        speed, cone_gap, mu_lambda_n, friction_ncp_type, friction_scale,
+        tie_tol=tie_tol,
+    )
+
+    f_blk[1] = u_t + W * r_t
+    if speed > tie_tol:
+        dspeed_du = u_t / speed
+    elif r_t_norm > tie_tol:
+        dspeed_du = -r_t / r_t_norm
+    else:
+        dspeed_du = 0.0
+
+    drnorm_dr = r_t / r_t_norm if r_t_norm > tie_tol else 0.0
+    dW_du = dW_dspeed * dspeed_du
+    dW_dr_t = -dW_dgap * drnorm_dr
+    dW_dr_n = (dW_dmulambda + dW_dgap) * float(mu)
+
+    df_du[1, 1] = 1.0 + r_t * dW_du
+    df_dr[1, 1] = W + r_t * dW_dr_t
+    df_dr[1, 0] = r_t * dW_dr_n
+    return f_blk, df_dgap, df_du, df_dr
+
+
 def _contact_block_residual_and_jac(
     gap,
     u_blk,
@@ -253,6 +340,19 @@ def _contact_block_residual_and_jac(
     r_blk = np.asarray(r_blk, dtype=float)
     d = r_blk.size
     m = d - 1
+    if d == 2:
+        return _contact_block_residual_and_jac_2d(
+            gap,
+            u_blk,
+            r_blk,
+            mu,
+            normal_ncp_type,
+            friction_ncp_type,
+            normal_scale,
+            friction_scale,
+            friction_law,
+            tie_tol=tie_tol,
+        )
 
     f_blk = np.zeros(d, dtype=float)
     df_dgap = np.zeros(d, dtype=float)
