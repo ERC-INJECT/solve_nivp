@@ -6,7 +6,11 @@ import pytest
 from solve_nivp.moreau_jean_fremond import (
     build_moreau_jean_fremond,
     MoreauJeanFremondStepper,
+    DescriptorMoreauJeanFremondStepper,
+    solve_mjf_adaptive,
 )
+from solve_nivp.soccp_pgs import fremond_shift_factory, _shift_jacobian_fd
+from solve_nivp.nonlinear_solvers import PETSC_AVAILABLE
 
 
 def _no_contact_stepper(M, K, C, n_solid, F_callable=None, theta=0.5):
@@ -154,6 +158,274 @@ def test_invalid_theta_with_high_restitution_raises():
             F_callable=lambda t: np.zeros(1),
             e_N=0.5, theta=1.0,
         )
+
+
+def test_invalid_contact_solver_raises():
+    M = np.eye(1); K = np.zeros((1, 1)); C = np.zeros((1, 1))
+    with pytest.raises(ValueError, match="contact_solver"):
+        build_moreau_jean_fremond(
+            M, K, C,
+            contacts=[{"block_size": 1, "mu_init": 0.0}],
+            H_callable=np.array([[1.0]]),
+            F_callable=lambda t: np.zeros(1),
+            e_N=0.0, theta=0.5,
+            contact_solver="not-a-solver",
+        )
+
+
+@pytest.mark.skipif(not PETSC_AVAILABLE, reason="petsc4py is not available")
+def test_petsc_ssn_inelastic_impact_matches_pgs():
+    mass = 1.0
+    g = 9.81
+    M = np.array([[mass]])
+    K = np.array([[0.0]])
+    C = np.array([[0.0]])
+    kwargs = dict(
+        contacts=[{"block_size": 1, "mu_init": 0.0}],
+        H_callable=np.array([[1.0]]),
+        F_callable=lambda t: np.array([-mass * g]),
+        e_N=0.0,
+        theta=0.5,
+    )
+    stepper_pgs, aux_pgs = build_moreau_jean_fremond(M, K, C, **kwargs)
+    stepper_petsc, aux_petsc = build_moreau_jean_fremond(
+        M, K, C,
+        contact_solver="petsc_ssn",
+        contact_petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        **kwargs,
+    )
+
+    y0 = np.array([0.0, -2.0])
+    y_pgs, _, info_pgs = stepper_pgs.step(0.0, y0, aux_pgs, 0.01)
+    y_petsc, _, info_petsc = stepper_petsc.step(0.0, y0, aux_petsc, 0.01)
+
+    np.testing.assert_allclose(y_petsc, y_pgs, atol=1.0e-9)
+    np.testing.assert_allclose(
+        info_petsc["p_contact"], info_pgs["p_contact"], atol=1.0e-9,
+    )
+    assert info_petsc["contact_solver"] == "petsc_ssn"
+    assert info_petsc["contact_ssn_converged"]
+    assert info_petsc["contact_linear_solver"] == "dense"
+
+    stepper_forced, aux_forced = build_moreau_jean_fremond(
+        M, K, C,
+        contact_solver="petsc_ssn",
+        contact_linear_solver="petsc",
+        contact_petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        **kwargs,
+    )
+    y_forced, _, info_forced = stepper_forced.step(0.0, y0, aux_forced, 0.01)
+    np.testing.assert_allclose(y_forced, y_pgs, atol=1.0e-9)
+    assert info_forced["contact_linear_solver"] == "petsc"
+
+
+@pytest.mark.skipif(not PETSC_AVAILABLE, reason="petsc4py is not available")
+def test_petsc_ssn_sliding_block_matches_pgs():
+    mass = 1.0
+    g = 9.81
+    mu = 0.4
+    F_T = 1.5 * mu * mass * g
+    M = mass * np.eye(2)
+    K = np.zeros((2, 2))
+    C = np.zeros((2, 2))
+    H = np.eye(2)
+    kwargs = dict(
+        contacts=[{"block_size": 2, "mu_init": mu}],
+        H_callable=H,
+        F_callable=lambda t: np.array([-mass * g, F_T]),
+        e_N=0.0,
+        theta=0.5,
+    )
+    stepper_pgs, aux_pgs = build_moreau_jean_fremond(M, K, C, **kwargs)
+    stepper_petsc, aux_petsc = build_moreau_jean_fremond(
+        M, K, C,
+        contact_solver="petsc_ssn",
+        contact_petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        **kwargs,
+    )
+
+    y_pgs = np.array([0.0, 0.0, 0.0, 0.0])
+    y_petsc = y_pgs.copy()
+    for k in range(3):
+        y_pgs, aux_pgs, info_pgs = stepper_pgs.step(k * 0.001, y_pgs, aux_pgs, 0.001)
+        y_petsc, aux_petsc, info_petsc = stepper_petsc.step(
+            k * 0.001, y_petsc, aux_petsc, 0.001,
+        )
+
+    np.testing.assert_allclose(y_petsc, y_pgs, atol=1.0e-8)
+    np.testing.assert_allclose(
+        info_petsc["p_contact"], info_pgs["p_contact"], atol=1.0e-8,
+    )
+    assert info_petsc["contact_ssn_converged"]
+    assert info_petsc["contact_ssn_residual"] < 1.0e-9
+
+
+@pytest.mark.skipif(not PETSC_AVAILABLE, reason="petsc4py is not available")
+def test_petsc_ssn_soc_projection_residual_sliding_block_reaches_coulomb_limit():
+    mass = 1.0
+    g = 9.81
+    mu = 0.4
+    F_T = 1.5 * mu * mass * g
+    M = mass * np.eye(2)
+    K = np.zeros((2, 2))
+    C = np.zeros((2, 2))
+    stepper, aux = build_moreau_jean_fremond(
+        M, K, C,
+        contacts=[{"block_size": 2, "mu_init": mu}],
+        H_callable=np.eye(2),
+        F_callable=lambda t: np.array([-mass * g, F_T]),
+        e_N=0.0,
+        theta=0.5,
+        contact_solver="petsc_ssn",
+        contact_residual="soc_projection",
+        contact_petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+    )
+
+    y = np.zeros(4)
+    h = 0.001
+    n_steps = 50
+    for k in range(n_steps):
+        y, aux, info = stepper.step(k * h, y, aux, h)
+
+    expected_acceleration = (F_T - mu * mass * g) / mass
+    np.testing.assert_allclose(y[3], expected_acceleration * n_steps * h, rtol=2.0e-2)
+    p_contact = info["p_contact"]
+    assert abs(np.linalg.norm(p_contact[1:]) - mu * p_contact[0]) < 1.0e-6
+    assert info["contact_residual"] == "soc_projection"
+    assert info["contact_ssn_converged"]
+    assert info["contact_ssn_residual"] < 1.0e-9
+
+
+@pytest.mark.skipif(not PETSC_AVAILABLE, reason="petsc4py is not available")
+def test_descriptor_mjf_enforces_dae_constraint_with_contact():
+    # Descriptor state y = [q, v, ell], with algebraic constraint ell = q.
+    # The contact impulse acts on v, while the theta state must satisfy the
+    # algebraic row.  Since the old state is consistent, y_{n+1} is also
+    # consistent when the theta state is constrained.
+    A = np.diag([1.0, 1.0, 0.0])
+
+    def rhs(t, y):
+        return np.array([y[1], 0.0, 0.0])
+
+    def rhs_jac(t, y):
+        J = np.zeros((3, 3))
+        J[0, 1] = 1.0
+        return J
+
+    constraint = {
+        "g": lambda q: q.copy(),
+        "dg_dy": lambda q: np.eye(1),
+        "y_slice": slice(0, 1),
+        "q_slice": slice(2, 3),
+    }
+    stepper = DescriptorMoreauJeanFremondStepper(
+        A=A,
+        rhs_callable=rhs,
+        rhs_jac_callable=rhs_jac,
+        D_extract=np.array([[0.0, 1.0, 0.0]]),
+        B=np.array([[0.0], [1.0], [0.0]]),
+        contacts=[{"vel_normal_idx": 0, "vel_tangential_idx": [], "mu": 0.0, "e": 0.0}],
+        constraints=[constraint],
+        theta=0.5,
+        contact_solver="petsc_ssn",
+        contact_petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        theta_linear_solver="petsc",
+        theta_petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+    )
+    aux = {"mu": np.array([0.0])}
+    y0 = np.array([0.0, -1.0, 0.0])
+
+    y1, aux1, info = stepper.step(0.0, y0, aux, 0.1)
+
+    np.testing.assert_allclose(y1[2], y1[0], atol=1.0e-12)
+    np.testing.assert_allclose(y1[1], 0.0, atol=1.0e-10)
+    assert info["contact_solver"] == "petsc_ssn"
+    assert info["contact_ssn_converged"]
+
+
+@pytest.mark.skipif(not PETSC_AVAILABLE, reason="petsc4py is not available")
+def test_descriptor_mjf_contact_offset_shifts_cone_without_load():
+    A = np.diag([1.0, 1.0, 0.0])
+
+    def rhs(t, y):
+        return np.array([y[1], 0.0, 0.0])
+
+    def rhs_jac(t, y):
+        J = np.zeros((3, 3))
+        J[0, 1] = 1.0
+        return J
+
+    constraint = {
+        "g": lambda q: q.copy(),
+        "dg_dy": lambda q: np.eye(1),
+        "y_slice": slice(0, 1),
+        "q_slice": slice(2, 3),
+    }
+    stepper = DescriptorMoreauJeanFremondStepper(
+        A=A,
+        rhs_callable=rhs,
+        rhs_jac_callable=rhs_jac,
+        D_extract=np.array([[0.0, 1.0, 0.0]]),
+        B=np.array([[0.0], [1.0], [0.0]]),
+        contacts=[{"vel_normal_idx": 0, "vel_tangential_idx": [], "mu": 0.0, "e": 0.0}],
+        constraints=[constraint],
+        theta=0.5,
+        contact_solver="petsc_ssn",
+        contact_petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        theta_linear_solver="petsc",
+        theta_petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        contact_offset_force=lambda y, t: np.array([4.0]),
+    )
+    y0 = np.zeros(3)
+
+    y1, aux1, info = stepper.step(0.0, y0, {"mu": np.array([0.0])}, 0.25)
+
+    np.testing.assert_allclose(y1, y0, atol=1.0e-12)
+    np.testing.assert_allclose(info["p_contact"], np.zeros(1), atol=1.0e-12)
+    np.testing.assert_allclose(info["p_contact_effective"], np.array([1.0]), atol=1.0e-12)
+
+
+@pytest.mark.skipif(not PETSC_AVAILABLE, reason="petsc4py is not available")
+def test_descriptor_mjf_contact_offset_uses_storage_units_for_scaled_reactions():
+    A = np.diag([1.0, 1.0, 0.0])
+
+    def rhs(t, y):
+        return np.array([y[1], 0.0, 0.0])
+
+    def rhs_jac(t, y):
+        J = np.zeros((3, 3))
+        J[0, 1] = 1.0
+        return J
+
+    constraint = {
+        "g": lambda q: q.copy(),
+        "dg_dy": lambda q: np.eye(1),
+        "y_slice": slice(0, 1),
+        "q_slice": slice(2, 3),
+    }
+    stepper = DescriptorMoreauJeanFremondStepper(
+        A=A,
+        rhs_callable=rhs,
+        rhs_jac_callable=rhs_jac,
+        D_extract=np.array([[0.0, 1.0, 0.0]]),
+        B=np.array([[0.0], [1.0], [0.0]]),
+        contacts=[{"vel_normal_idx": 0, "vel_tangential_idx": [], "mu": 0.0, "e": 0.0}],
+        constraints=[constraint],
+        theta=0.5,
+        contact_solver="petsc_ssn",
+        contact_petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        theta_linear_solver="petsc",
+        theta_petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        contact_offset_force=lambda y, t: np.array([4.0]),
+        reaction_state_to_reported_scale=0.5,
+    )
+
+    y1, aux1, info = stepper.step(0.0, np.zeros(3), {"mu": np.array([0.0])}, 0.25)
+
+    np.testing.assert_allclose(y1, np.zeros(3), atol=1.0e-12)
+    np.testing.assert_allclose(info["p_contact"], np.zeros(1), atol=1.0e-12)
+    np.testing.assert_allclose(info["p_contact_effective"], np.array([2.0]), atol=1.0e-12)
+    np.testing.assert_allclose(info["p_contact_offset"], np.array([2.0]), atol=1.0e-12)
 
 
 def test_2d_sliding_block_constant_drive_reaches_coulomb_limit():
@@ -344,3 +616,182 @@ def test_energy_slack_nonnegative_across_regimes():
                 f"F_T={F_T}, step={k}, slack={info['slack']}, "
                 f"regime={info['regime']}"
             )
+
+def _descriptor_sliding_block(mu, F_T, *, mass=1.0, g=9.81, n_slip=0):
+    """First-order descriptor sliding block: y = [q_n, q_t, v_n, v_t(, s)].
+
+    With n_slip=1 a cumulative-slip row ds/dt = |v_t| is appended for
+    slip-weakening tests.
+    """
+    n = 4 + n_slip
+    A = np.eye(n)
+
+    def rhs(t, y):
+        out = np.zeros(n)
+        out[0] = y[2]
+        out[1] = y[3]
+        out[2] = -mass * g
+        out[3] = F_T
+        if n_slip:
+            out[4] = abs(y[3])
+        return out
+
+    def rhs_jac(t, y):
+        J = np.zeros((n, n))
+        J[0, 2] = 1.0
+        J[1, 3] = 1.0
+        if n_slip:
+            J[4, 3] = 1.0 if y[3] >= 0.0 else -1.0
+        return J
+
+    D = np.zeros((2, n))
+    D[0, 2] = 1.0
+    D[1, 3] = 1.0
+    B = np.zeros((n, 2))
+    B[2, 0] = 1.0
+    B[3, 1] = 1.0
+    stepper = DescriptorMoreauJeanFremondStepper(
+        A=A,
+        rhs_callable=rhs,
+        rhs_jac_callable=rhs_jac,
+        D_extract=D,
+        B=B,
+        contacts=[{"vel_normal_idx": 0, "vel_tangential_idx": [1],
+                   "mu_init": mu, "e": 0.0}],
+        theta=0.5,
+        contact_solver="petsc_ssn",
+        theta_linear_solver="scipy",
+    )
+    return stepper
+
+
+def test_fremond_shift_analytic_jacobian_matches_fd():
+    shift = fremond_shift_factory(
+        np.array([0.3]), np.array([0.2]), np.array([0.1]), theta=0.5,
+    )
+    u_slip = np.array([0.2, -0.7])
+    np.testing.assert_allclose(
+        shift.jacobian(u_slip, 0), _shift_jacobian_fd(shift, u_slip, 0),
+        atol=1.0e-6,
+    )
+    u_kink = np.array([0.2, 0.0])
+    J_kink = shift.jacobian(u_kink, 0)
+    np.testing.assert_allclose(
+        J_kink, _shift_jacobian_fd(shift, u_kink, 0), atol=1.0e-6,
+    )
+    assert J_kink[0, 1] == pytest.approx(0.3)
+
+
+def test_descriptor_theta_cache_consistent_across_mu_and_h():
+    # One stepper instance reuses the cached theta system across calls with
+    # identical (t, y, h) but different mu, then rebuilds for a new h.  Every
+    # result must match a fresh stepper with no cache history.
+    mass, g = 1.0, 9.81
+    F_T = 1.5 * 0.4 * mass * g
+    y0 = np.array([0.0, 0.0, 0.0, 0.0])
+    h = 0.01
+    shared = _descriptor_sliding_block(0.4, F_T)
+
+    cases = [
+        ({"mu": np.array([0.4])}, h),
+        ({"mu": np.array([0.05])}, h),
+        ({"mu": np.array([0.05])}, 0.5 * h),
+    ]
+    for aux, h_k in cases:
+        y_shared, _, info_shared = shared.step(0.0, y0, dict(aux), h_k)
+        fresh = _descriptor_sliding_block(0.4, F_T)
+        y_fresh, _, info_fresh = fresh.step(0.0, y0, dict(aux), h_k)
+        np.testing.assert_allclose(y_shared, y_fresh, atol=1.0e-12)
+        np.testing.assert_allclose(
+            info_shared["p_contact"], info_fresh["p_contact"], atol=1.0e-12,
+        )
+
+    y_a, _, info_a = shared.step(0.0, y0, {"mu": np.array([0.4])}, h)
+    y_b, _, info_b = shared.step(0.0, y0, {"mu": np.array([0.05])}, h)
+    assert not np.allclose(y_a, y_b)
+    assert abs(info_a["p_contact"][1]) > abs(info_b["p_contact"][1])
+
+
+
+def test_descriptor_mjf_state_dependent_mu_uses_theta_state_without_outer_fixed_point():
+    mass, g = 1.0, 9.81
+    mu_static = 0.6
+    mu_dynamic = 0.2
+    D_c = 1.0e-3
+    F_T = 1.5 * mu_static * mass * g
+    stepper = _descriptor_sliding_block(mu_static, F_T, mass=mass, g=g, n_slip=1)
+
+    def mu_from_state(z_theta):
+        slip = np.asarray(z_theta[4:5], dtype=float)
+        return mu_static - (mu_static - mu_dynamic) * np.minimum(slip / D_c, 1.0)
+
+    dmu_calls = {"count": 0}
+
+    def dmu_dstate(z_theta):
+        dmu_calls["count"] += 1
+        slip = float(z_theta[4])
+        grad = np.zeros((1, z_theta.size), dtype=float)
+        if slip < D_c:
+            grad[0, 4] = -(mu_static - mu_dynamic) / D_c
+        return grad
+
+    stepper.mu_state_callback = mu_from_state
+    stepper.dmu_dstate_callback = dmu_dstate
+    y0 = np.zeros(5)
+
+    y1, _aux1, info = stepper.step(
+        0.0, y0, {"mu": np.array([mu_static])}, 0.01,
+    )
+
+    mu_expected = mu_from_state(y0 + stepper.theta * (y1 - y0))
+    np.testing.assert_allclose(info["mu_used"], mu_expected, atol=1.0e-12)
+    assert abs(info["mu_used"][0] - mu_static) > 1.0e-3
+    assert dmu_calls["count"] > 0
+    assert info["contact_ssn_converged"]
+
+def test_solve_mjf_adaptive_sliding_block_matches_analytical():
+    mass, g, mu = 1.0, 9.81, 0.4
+    F_T = 1.5 * mu * mass * g
+    stepper = _descriptor_sliding_block(mu, F_T)
+    t_end = 0.05
+    t, y, h, info, attempts = solve_mjf_adaptive(
+        stepper, (0.0, t_end), np.zeros(4), {"mu": np.array([mu])},
+        rtol=1.0e-4, atol=1.0e-8, h0=1.0e-3, h_min=1.0e-9, h_max=t_end,
+    )
+    assert t[-1] == pytest.approx(t_end)
+    np.testing.assert_allclose(np.diff(t), h, atol=1.0e-15)
+    accel = (F_T - mu * mass * g) / mass
+    assert y[-1, 3] == pytest.approx(accel * t_end, rel=2.0e-2)
+    assert y[-1, 2] == pytest.approx(0.0, abs=1.0e-8)
+    assert all("adaptive_error" in rec for rec in info)
+    assert "p_contact_force" in info[-1]
+    # Sliding contact sits on the cone edge with the mu used by the law.
+    p_eff = info[-1]["p_contact_effective"]
+    assert abs(abs(p_eff[1]) - mu * p_eff[0]) < 1.0e-8
+
+
+def test_solve_mjf_adaptive_mu_fixed_point_slip_weakening():
+    mass, g = 1.0, 9.81
+    mu_s, mu_d, D_c = 0.6, 0.2, 1.0e-3
+    F_T = 1.2 * mu_s * mass * g
+    stepper = _descriptor_sliding_block(mu_s, F_T, n_slip=1)
+
+    def mu_from_state(y_state):
+        frac = min(float(y_state[4]) / D_c, 1.0)
+        return np.array([mu_s - (mu_s - mu_d) * frac])
+
+    t_end = 0.08
+    t, y, h, info, attempts = solve_mjf_adaptive(
+        stepper, (0.0, t_end), np.zeros(5), {"mu": np.array([mu_s])},
+        rtol=1.0e-4, atol=1.0e-8, h0=1.0e-3, h_min=1.0e-10, h_max=5.0e-3,
+        mu_from_state=mu_from_state, mu_fixed_point_tol=1.0e-10,
+    )
+    assert t[-1] == pytest.approx(t_end)
+    assert y[-1, 4] > D_c  # fully weakened
+    assert info[-1]["mu_law"][0] == pytest.approx(mu_d)
+    assert max(rec["mu_fixed_point_iters"] for rec in info) >= 1
+    assert max(rec["mu_fixed_point_error"] for rec in info) <= 1.0e-9 + 1.0e-12
+    # Reaction sits on the weakened cone: |p_t| = mu_law * p_n.
+    p_eff = info[-1]["p_contact_effective"]
+    mu_law = info[-1]["mu_law"][0]
+    assert abs(abs(p_eff[1]) - mu_law * p_eff[0]) < 1.0e-8

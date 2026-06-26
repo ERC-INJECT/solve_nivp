@@ -108,6 +108,25 @@ def fremond_shift_factory(
         out[0] += (theta * (1.0 + float(e_N_vec[k])) - 1.0) * float(u_N_old[k])
         return out
 
+    def _shift_jacobian(u_block: np.ndarray, k: int) -> np.ndarray:
+        # d(u_hat)/du = I + e_0 (alpha u_T / ||u_T||)^T; the restitution term
+        # is constant in u.  At the bipotential kink u_T = 0 pick the Clarke
+        # element with all-ones tangent direction, matching the forward-FD
+        # choice of _shift_jacobian_fd so semismooth Newton paths agree.
+        u_block = np.asarray(u_block, dtype=float).ravel()
+        d = u_block.size
+        J = np.eye(d, dtype=float)
+        alpha_k = float(alpha_vec[k])
+        if d > 1 and alpha_k > 0.0:
+            u_T = u_block[1:]
+            norm_T = float(np.linalg.norm(u_T))
+            if norm_T > 0.0:
+                J[0, 1:] = alpha_k * u_T / norm_T
+            else:
+                J[0, 1:] = alpha_k
+        return J
+
+    _shift.jacobian = _shift_jacobian
     return _shift
 
 
