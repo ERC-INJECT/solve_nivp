@@ -3,10 +3,6 @@ solve\_nivp.nonlinear\_solvers
 
 .. automodule:: solve_nivp.nonlinear_solvers
 
-   
-   .. rubric:: Classes
-
-   .. autosummary::
-   
-      ImplicitEquationSolver
+Compatibility module. New code should prefer
+``solve_nivp.solvers.nonlinear_solvers``.
    

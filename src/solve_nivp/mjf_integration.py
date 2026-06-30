@@ -81,7 +81,7 @@ class MJFIntegrationMethod(IntegrationMethod):
         self.aux = _copy_aux(aux0)
         self.n_c = int(n_c)
         self.reaction_scale = float(reaction_scale)
-        r0 = (np.zeros(2 * self.n_c) if warm_r is None
+        r0 = (np.zeros(self.stepper.n_react) if warm_r is None
               else np.asarray(warm_r, float).copy())
         self.reaction_history = [r0]
         self.info_history: list = []
@@ -132,10 +132,14 @@ class MJFIntegrationMethod(IntegrationMethod):
         else:
             y1, aux1, info = self._step_weakening(t, y, h)
         self.aux = aux1
-        p_contact = np.asarray(info.get("p_contact", np.zeros(2 * self.n_c)), float)
+        p_contact = np.asarray(info.get("p_contact", np.zeros(self.stepper.n_react)), float)
         self.reaction_history.append(p_contact * self.reaction_scale / h)
         self.info_history.append(dict(info))
-        success = bool(np.all(np.isfinite(y1)))
+        success = bool(
+            np.all(np.isfinite(y1))
+            and info.get("soccp_converged", True)
+            and info.get("mu_fp_converged", True)
+        )
         err = float(info.get("soccp_residual", 0.0) or 0.0)
         iters = int(info.get("soccp_outer_iters", 0) or 0)
         return y1, None, err, success, iters

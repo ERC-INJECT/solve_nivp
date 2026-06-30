@@ -10,9 +10,13 @@ solve\_nivp.integrations
    
       AlgebraicBackwardEuler
       BackwardEuler
+      BackwardEulerSchur
       CompositeMethod
       EmbeddedBETR
       IntegrationMethod
+      RadauIIA
+      RadauIIASchur
+      SDIRK2
       ThetaMethod
       Trapezoidal
    

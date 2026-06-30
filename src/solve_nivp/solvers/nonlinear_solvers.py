@@ -1912,7 +1912,7 @@ class ImplicitEquationSolver:
                     J_in = J_in.toarray()
                 # Dense: J = I - D + D @ diag(lam) @ J
                 if np.ndim(lam) >= 1:
-                    _J_lam = lam[np.newaxis, :] * J_in   # row-scale J_in
+                    _J_lam = lam[:, None] * J_in   # row-scale J_in
                 else:
                     _J_lam = lam * J_in
                 if Dstate is None:
@@ -2556,13 +2556,19 @@ class ImplicitEquationSolver:
         # 2. Convert/Cache for Sparse
         if self._J_cached is not None:
             if sp.issparse(J_raw):
-                # Assume constant pattern: copy data
-                if self._J_cached.data.size == J_raw.data.size:
+                J_raw = J_raw.tocsr()
+                # Reuse the cached CSR only when the sparsity pattern is
+                # identical; a same-nnz pattern change would copy values into
+                # the wrong positions.
+                if (self._J_cached.data.size == J_raw.data.size
+                        and self._J_cached.indptr.size == J_raw.indptr.size
+                        and np.array_equal(self._J_cached.indptr, J_raw.indptr)
+                        and np.array_equal(self._J_cached.indices, J_raw.indices)):
                      self._J_cached.data[:] = J_raw.data
                      return self._J_cached
                 else:
-                     # Pattern changed? Rebuild
-                     self._J_cached = self._to_csr(J_raw)
+                     # Pattern changed: rebuild
+                     self._J_cached = J_raw
                      self._J_rows = None
                      return self._J_cached
             elif isinstance(J_raw, np.ndarray):

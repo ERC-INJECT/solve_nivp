@@ -593,8 +593,20 @@ def build_impulse_contact(
     # from DOFs undergoing a stick↔slip or contact↔separation transition.
     _vel_dof_map = []
     for ci in _contacts:
-        dofs = [ci['vN']] + list(ci['vT'])
-        _vel_dof_map.append(np.array(dofs, dtype=int))
+        rows = [ci['vN']] + list(ci['vT'])
+        if D_extract is not None:
+            # With extraction maps, vN/vT are rows of C_extract/D_extract;
+            # resolve them to the physical DOFs the velocity rows couple to.
+            dofs = set()
+            for rr in rows:
+                if sp.issparse(D_extract):
+                    cols = D_extract.getrow(rr).indices
+                else:
+                    cols = np.nonzero(np.asarray(D_extract)[rr])[0]
+                dofs.update(int(c) for c in cols)
+            _vel_dof_map.append(np.array(sorted(dofs), dtype=int))
+        else:
+            _vel_dof_map.append(np.array(rows, dtype=int))
     # Attach to the SOC projection (CompositeContactProjection delegates)
     soc_proj._velocity_dof_map = _vel_dof_map
 

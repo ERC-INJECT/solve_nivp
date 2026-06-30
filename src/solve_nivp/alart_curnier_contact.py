@@ -349,6 +349,7 @@ def build_alart_curnier_contact(
     get_dw0_load_dz=None,
     get_s0_ref=None,
     get_w0_ref=None,
+    smooth_rhs_is_affine=False,
 ):
     r"""Build a full-state Alart-Curnier contact system.
 
@@ -797,15 +798,17 @@ def build_alart_curnier_contact(
         offset_vec = _assemble_offset_vector(y, t=t, Fk_val=Fk_val)
         load_offset_vec = _assemble_load_offset_vector(y, t=t, Fk_val=Fk_val)
 
-        # Differential / physical rows — fast path when smooth RHS is
-        # linear (A constant, body-force/BCs constant).  On the first
-        # call we snapshot b = rhs_smooth(t, 0) and J = rhs_jac so that
-        # subsequent evaluations are a single sparse matvec + vector add.
-        if rhs_jac is not None and _rhs_neg_A[0] is not None:
+        # Differential / physical rows — fast path only under an explicit
+        # affine opt-in (A constant, body-force/BCs constant).  Then the RHS
+        # is rhs_smooth(t, yp) = J yp + b with J = rhs_jac and b =
+        # rhs_smooth(t, 0), snapshot once and reused as a sparse matvec.
+        # A provided rhs_jac alone does NOT imply an affine RHS, so without
+        # the flag we evaluate rhs_smooth directly each call.
+        if smooth_rhs_is_affine and rhs_jac is not None and _rhs_neg_A[0] is not None:
             out[:n_phys] = np.asarray(
                 _rhs_neg_A[0] @ yp
             ).ravel() + _rhs_b_const[0]
-        elif rhs_jac is not None:
+        elif smooth_rhs_is_affine and rhs_jac is not None:
             # First call: build cache
             J_s = _call_with_time_state_fk(rhs_jac, t, yp, None)
             J_s = _dense_or_sparse(J_s)
@@ -1063,6 +1066,7 @@ def build_dynamic_alart_curnier_contact(
     get_dw0_load_dz=None,
     get_s0_ref=None,
     get_w0_ref=None,
+    smooth_rhs_is_affine=False,
 ):
     r"""Build an explicit-velocity dynamic Alart-Curnier contact system.
 
@@ -1116,4 +1120,5 @@ def build_dynamic_alart_curnier_contact(
         get_dw0_load_dz=get_dw0_load_dz,
         get_s0_ref=get_s0_ref,
         get_w0_ref=get_w0_ref,
+        smooth_rhs_is_affine=smooth_rhs_is_affine,
     )

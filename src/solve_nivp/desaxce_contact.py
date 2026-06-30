@@ -740,7 +740,12 @@ def build_dynamic_desaxce_contact(
 
     n_react = reaction_idx
 
-    if B is None and gap_extract is not None:
+    if B is None and vel_extract is not None:
+        if sp.issparse(vel_extract):
+            B_mat = vel_extract[reaction_extract_rows, :].T.tocsr()
+        else:
+            B_mat = np.asarray(vel_extract[reaction_extract_rows, :].T, dtype=float)
+    elif B is None and gap_extract is not None:
         if sp.issparse(gap_extract):
             B_mat = gap_extract[reaction_extract_rows, :].T.tocsr()
         else:
@@ -927,7 +932,7 @@ def build_dynamic_desaxce_contact(
     def _reaction_response_matrix(t, yp, *, prev_state=None, h_val=None):
         h_eff = 1.0 if h_val is None or h_val <= 0.0 else float(h_val)
         key = h_eff
-        if key in _response_cache:
+        if smooth_rhs_is_affine and key in _response_cache:
             return _response_cache[key]
 
         J_phys = _physical_jacobian(t, yp, prev_state=prev_state, h_val=h_eff)
@@ -1271,7 +1276,6 @@ def build_dynamic_desaxce_residual_contact(
     get_s0=None,
     get_w0=None,
     smooth_rhs_is_affine=False,
-    delassus_mode="full",
 ):
     r"""Build a full-state De Saxce natural-map contact system.
 
@@ -1364,17 +1368,6 @@ def build_dynamic_desaxce_residual_contact(
             "reaction_units must be 'force' or 'impulse' "
             f"(got {reaction_units!r})"
         )
-    if delassus_mode is not None and delassus_mode is not False:
-        delassus_mode = str(delassus_mode).strip().lower()
-        if delassus_mode not in {"full", "diagonal"}:
-            raise ValueError(
-                "delassus_mode must be 'full', 'diagonal', or None "
-                f"(got {delassus_mode!r})"
-            )
-    else:
-        delassus_mode = None
-    _delassus_mode = delassus_mode
-
     # Resolve contact_rho: scalar, callable, or "auto".
     _rho_auto = isinstance(contact_rho, str) and contact_rho.strip().lower() == "auto"
     if _rho_auto:
@@ -1451,7 +1444,12 @@ def build_dynamic_desaxce_residual_contact(
     _rho_schur_base = None
     _rho_h_cell = [1.0]
 
-    if B is None and gap_extract is not None:
+    if B is None and vel_extract is not None:
+        if sp.issparse(vel_extract):
+            B_mat = vel_extract[reaction_extract_rows, :].T.tocsr()
+        else:
+            B_mat = np.asarray(vel_extract[reaction_extract_rows, :].T, dtype=float)
+    elif B is None and gap_extract is not None:
         if sp.issparse(gap_extract):
             B_mat = gap_extract[reaction_extract_rows, :].T.tocsr()
         else:
@@ -1767,9 +1765,8 @@ def build_dynamic_desaxce_residual_contact(
             r_blk = r[sl]
             offset_blk = offset_vec[sl] if _has_offset else None
             if inactive_handling == "hard_zero" and float(gaps[k]) > gap_tol:
+                # Open contact: enforce zero reaction (r = 0), not r = -offset.
                 phi = r_blk.copy()
-                if offset_blk is not None:
-                    phi = phi + offset_blk
             else:
                 u_blk = np.asarray(u_rel[sl], dtype=float).copy()
                 if normal_mode in {"gap_be", "gap_plus_velocity_be"} and h_val is not None and h_val > 0.0:
@@ -1809,9 +1806,6 @@ def build_dynamic_desaxce_residual_contact(
         mu_all, beta_all = _vectorize_contact_params(yp, t=t, Fk_val=Fk_val)
         rho_all = _vectorize_rho(yp, t=t, Fk_val=Fk_val)
         offset_vec = _assemble_offset_vector(y, t=t, Fk_val=Fk_val)
-
-        _h_eff = float(h_val) if h_val is not None and h_val > 0.0 else 1.0
-        _delassus_all = _h_eff * _rho_schur_per_comp
 
         bl_parts = []
         br_dense = np.zeros((n_react, n_react), dtype=float)

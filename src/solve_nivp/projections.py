@@ -20,6 +20,8 @@ import numpy as np
 import scipy.sparse as sp
 from abc import ABC, abstractmethod
 
+from .soc import proj_mu_scaled_soc as _soc_proj_mu_scaled
+
 try:
     from ._numba_accel import NUMBA_AVAILABLE as _NUMBA_OK, projD_optimized_nb, classify_regions_nb
 except Exception:  # pragma: no cover
@@ -1837,110 +1839,14 @@ class MuScaledSOCProjection(Projection):
     # ------------------------------------------------------------------
     @staticmethod
     def _proj_mu_scaled_soc(z, mu, return_jacobian=False, eps=1e-30):
-        r"""Project ``z = (s, w)`` onto :math:`K_\mu` via spectral eigenvalues.
+        r"""Project ``z = (s, w)`` onto :math:`K_\mu`.
 
-        Spectral eigenvalues of the μ-scaled SOC:
-
-        .. math::
-            \lambda_+ = s + \mu\,r, \qquad
-            \lambda_- = s - r/\mu \quad (\mu > 0)
-
-        where :math:`r = \|w\|`.  Region classification:
-
-        * **Interior**: :math:`\lambda_- \ge 0` and :math:`s \ge 0`
-        * **Polar**: :math:`\lambda_+ \le 0`
-        * **Boundary**: :math:`\lambda_+ > 0` and :math:`\lambda_- < 0`
-
-        Projection via positive-part of eigenvalues:
-
-        .. math::
-            \Pi_{K_\mu}(z) = (\lambda_+)_+\, c_+ + (\lambda_-)_+\, c_-
-
-        No value regularisation is needed: when :math:`r = 0`,
-        :math:`\lambda_+ = \lambda_- = s`, so the point is interior
-        (:math:`s \ge 0`) or polar (:math:`s \le 0`), never boundary.
-
-        Parameters
-        ----------
-        z : ndarray, shape (1+m,)
-            The vector ``[s, w_1, ..., w_m]``.
-        mu : float
-            Friction coefficient (cone opening).
-        return_jacobian : bool
-            If ``True`` return ``(projection, jacobian)`` where
-            *jacobian* is the ``(1+m, 1+m)`` Clarke sub-differential.
-        eps : float
-            Kept for API compatibility; only used to stabilise the
-            angular-stiffness ratio :math:`\lambda_+/r` in the Jacobian
-            when :math:`r \to 0`.
-
-        Returns
-        -------
-        p : ndarray, shape (1+m,)
-            or ``(p, J)`` when ``return_jacobian=True``.
+        Thin wrapper around :func:`solve_nivp.soc.proj_mu_scaled_soc`; the
+        spectral projector lives in the shared ``soc`` leaf module so the
+        cone primitives are defined in one place.  See that function for the
+        spectral-eigenvalue derivation and Clarke-Jacobian formulae.
         """
-        z = np.asarray(z, dtype=float)
-        s = float(z[0])
-        w = z[1:].copy()
-        m = w.size
-        d = 1 + m                       # block dimension
-        r = float(np.linalg.norm(w))     # ||w||
-
-        # ---- μ = 0: degenerate cone K_0 = {(s, 0) : s ≥ 0} ----
-        if mu <= 0.0:
-            p = np.zeros(d)
-            p[0] = max(s, 0.0)
-            if not return_jacobian:
-                return p
-            J = np.zeros((d, d))
-            if s >= 0.0:
-                J[0, 0] = 1.0       # Clarke selection at s = 0
-            return p, J
-
-        # ---- Spectral eigenvalues ----
-        lam_plus  = s + mu * r       # λ₊ = s + μ‖w‖
-        lam_minus = s - r / mu       # λ₋ = s − ‖w‖/μ
-
-        # ---- Region 1: interior (λ₋ ≥ 0 and s ≥ 0) ----
-        if lam_minus >= 0.0 and s >= 0.0:
-            if return_jacobian:
-                return z.copy(), np.eye(d)
-            return z.copy()
-
-        # ---- Region 2: polar (λ₊ ≤ 0) ----
-        if lam_plus <= 0.0:
-            if return_jacobian:
-                return np.zeros(d), np.zeros((d, d))
-            return np.zeros(d)
-
-        # ---- Region 3: boundary (λ₊ > 0, λ₋ < 0) ----
-        # r > 0 is guaranteed here: λ₊ > 0 and λ₋ < 0 with μ > 0
-        # implies r > 0 (if r = 0, then λ₊ = λ₋ = s, same sign).
-        alpha = 1.0 / (1.0 + mu * mu)
-        w_hat = w / r                  # exact, no regularisation
-
-        p = np.empty(d)
-        p[0] = alpha * lam_plus
-        p[1:] = (alpha * mu * lam_plus) * w_hat
-
-        if not return_jacobian:
-            return p
-
-        # Clarke sub-differential on the boundary:
-        #   J = α [ 1          μ ŵᵀ                         ]
-        #         [ μ ŵ        μ² ŵŵᵀ + μ(λ₊/r)(I − ŵŵᵀ)  ]
-        wwT = np.outer(w_hat, w_hat)
-        r_jac = max(r, eps)            # stabilise λ₊/r near apex
-        J = np.empty((d, d))
-        J[0, 0] = alpha
-        J[0, 1:] = alpha * mu * w_hat
-        J[1:, 0] = alpha * mu * w_hat
-        J[1:, 1:] = alpha * (
-            mu * mu * wwT
-            + mu * (lam_plus / r_jac) * (np.eye(m) - wwT)
-        )
-
-        return p, J
+        return _soc_proj_mu_scaled(z, mu, return_jacobian=return_jacobian, eps=eps)
 
     # ------------------------------------------------------------------
     # Spectral-consistent projector with branch persistence

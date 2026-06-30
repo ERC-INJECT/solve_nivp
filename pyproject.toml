@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "solve_nivp"
-version = "0.2.0rc1"
+version = "0.2.0.dev3"
 description = "A Python toolkit for integrating nonsmooth dynamical systems"
 readme = "README.md"
 license = "MIT"
@@ -51,8 +51,12 @@ docs = [
 petsc = [
   "petsc4py>=3.20",
 ]
+accel = [
+  "numba>=0.58",
+]
 all = [
   "petsc4py>=3.20",
+  "numba>=0.58",
   "gymnasium>=0.29",
   "stable-baselines3>=2.2",
   "sb3-contrib>=2.2",

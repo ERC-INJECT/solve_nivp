@@ -81,6 +81,7 @@ class ODESystem:
             self.method = method
             if A is not None:
                 self.method.A = A
+                self.method.use_identity = False
         # Otherwise, select the integration method based on the provided string.
         elif isinstance(method, str):
             self.method = self._select_method(method.lower(), a, A)
@@ -166,7 +167,6 @@ class ODESystem:
                 iterations : int, number of iterations taken by the solver.
         """
         y_new, f_new, solver_error, success, iterations = self.method.step(self.fun, t, self.current_y, h)
-        self.current_y = y_new  # Update the system state.
         return y_new, f_new, solver_error, success, iterations
 
     def step_adaptive(self, t: float, h: float):

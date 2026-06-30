@@ -50,7 +50,7 @@ See the Sphinx documentation (``docs/``) for extended examples.
 
 import numpy as np
 
-__version__ = "0.2.0rc1"
+__version__ = "0.2.0.dev3"
 
 from .projections import (
   Projection,
@@ -358,6 +358,16 @@ def solve_nivp(
   if jacobian_scaling is None:
     jacobian_scaling = _js_from_opts if _js_from_opts is not None else 'none'
 
+  # Reserved keys are passed explicitly below; reject duplicates in solver_opts
+  # rather than letting them raise an opaque duplicate-keyword TypeError.
+  _reserved_solver_keys = {'method', 'proj', 'component_slices',
+                           'nl_atol', 'nl_rtol'}
+  _conflicting = _reserved_solver_keys & set(_solver_opts)
+  if _conflicting:
+    raise ValueError(
+      f"solver_opts may not contain reserved keys {sorted(_conflicting)}; "
+      "pass them via the dedicated solve_nivp arguments instead")
+
   # Provide a sensible default component_slices for VI if not supplied
   if isinstance(solver, str) and solver.lower() == 'vi' and component_slices is None:
     try:
@@ -392,11 +402,12 @@ def solve_nivp(
   elif m == 'trapezoidal':
     integrator = Trapezoidal(solver=solver_instance, A=A, **_integrator_opts)
   elif m == 'theta':
-    integrator = ThetaMethod(theta=0.5, solver=solver_instance, A=A, **_integrator_opts)
+    _theta = _integrator_opts.pop('theta', 0.5)
+    integrator = ThetaMethod(theta=_theta, solver=solver_instance, A=A, **_integrator_opts)
   elif m == 'composite':
     integrator = CompositeMethod(solver=solver_instance, A=A, **_integrator_opts)
   elif m == 'embedded_betr':
-    integrator = EmbeddedBETR(solver=solver_instance, A=A)
+    integrator = EmbeddedBETR(solver=solver_instance, A=A, **_integrator_opts)
   elif m == 'sdirk2':
     integrator = SDIRK2(solver=solver_instance, A=A, **_integrator_opts)
   elif m in ('radau_iia', 'radau'):

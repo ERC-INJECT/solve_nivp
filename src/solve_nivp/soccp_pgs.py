@@ -27,13 +27,15 @@ Reference: Acary, Bremond, Huber 2018 (Siconos), Acary-Collins-Craft 2025
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 import numpy as np
 import scipy.sparse as sp
 
-from .projected_radau_contact import (
+from .soc import (
     _soc_fb_phi,
     _soc_fb_phi_and_jac,
 )
@@ -64,9 +66,34 @@ def desaxce_shift_factory(mu_vec: np.ndarray, *, alpha: Optional[np.ndarray] = N
         u_block = np.asarray(u_block, dtype=float).ravel()
         out = u_block.copy()
         if u_block.size > 1 and alpha_vec[k] > 0.0:
-            out[0] += float(alpha_vec[k]) * float(np.linalg.norm(u_block[1:]))
+            u_T = u_block[1:]
+            out[0] += float(alpha_vec[k]) * math.sqrt(float(u_T @ u_T))
         return out
 
+    def _shift_jacobian(u_block: np.ndarray, k: int) -> np.ndarray:
+        # d(u_hat)/du = I + e_0 (alpha u_T / ||u_T||)^T.  At the kink u_T = 0
+        # pick the Clarke element with all-ones tangent direction, matching the
+        # forward-difference choice of _shift_jacobian_fd.
+        u_block = np.asarray(u_block, dtype=float).ravel()
+        d = u_block.size
+        J = np.eye(d, dtype=float)
+        alpha_k = float(alpha_vec[k])
+        if d > 1 and alpha_k > 0.0:
+            u_T = u_block[1:]
+            norm_T = math.sqrt(float(u_T @ u_T))
+            if norm_T > 0.0:
+                J[0, 1:] = alpha_k * u_T / norm_T
+            else:
+                J[0, 1:] = alpha_k
+        return J
+
+    _shift.jacobian = _shift_jacobian
+    # Raw parameters for the fused numba assembly kernel (no normal offset for
+    # the pure De Saxce bipotential shift).
+    _shift._soc_shift_params = {
+        "alpha": alpha_vec,
+        "rest": np.zeros(mu_vec.size, dtype=float),
+    }
     return _shift
 
 
@@ -104,7 +131,8 @@ def fremond_shift_factory(
         u_block = np.asarray(u_block, dtype=float).ravel()
         out = u_block.copy()
         if u_block.size > 1 and alpha_vec[k] > 0.0:
-            out[0] += float(alpha_vec[k]) * float(np.linalg.norm(u_block[1:]))
+            u_T = u_block[1:]
+            out[0] += float(alpha_vec[k]) * math.sqrt(float(u_T @ u_T))
         out[0] += (theta * (1.0 + float(e_N_vec[k])) - 1.0) * float(u_N_old[k])
         return out
 
@@ -119,7 +147,7 @@ def fremond_shift_factory(
         alpha_k = float(alpha_vec[k])
         if d > 1 and alpha_k > 0.0:
             u_T = u_block[1:]
-            norm_T = float(np.linalg.norm(u_T))
+            norm_T = math.sqrt(float(u_T @ u_T))
             if norm_T > 0.0:
                 J[0, 1:] = alpha_k * u_T / norm_T
             else:
@@ -127,6 +155,12 @@ def fremond_shift_factory(
         return J
 
     _shift.jacobian = _shift_jacobian
+    # Raw parameters for the fused numba assembly kernel: the per-contact
+    # tangential coupling and the constant normal-shift offset.
+    _shift._soc_shift_params = {
+        "alpha": alpha_vec,
+        "rest": (theta * (1.0 + e_N_vec) - 1.0) * u_N_old,
+    }
     return _shift
 
 
@@ -249,7 +283,11 @@ def _local_solve_soccp(
         u = W_local @ p + b_local
         u_hat = shift_fn(u, contact_index) if shift_fn is not None else u
         if shift_fn is not None:
-            d_uhat_du = _shift_jacobian_fd(shift_fn, u, contact_index)
+            shift_jac = getattr(shift_fn, "jacobian", None)
+            if shift_jac is not None:
+                d_uhat_du = shift_jac(u, contact_index)
+            else:
+                d_uhat_du = _shift_jacobian_fd(shift_fn, u, contact_index)
         else:
             d_uhat_du = np.eye(d, dtype=float)
 
@@ -258,7 +296,7 @@ def _local_solve_soccp(
 
         phi_sd, dphi_dx, dphi_dy = _soc_fb_phi_and_jac(x_sd, y_sd)
         f_phys = T_y_inv @ phi_sd
-        res = float(np.linalg.norm(f_phys))
+        res = math.sqrt(float(f_phys @ f_phys))
         if res < tol:
             return p, it + 1, res
 
@@ -279,7 +317,7 @@ def _local_solve_soccp(
                 p_trial = p + alpha * delta
                 phi_trial, _ = _residual(p_trial)
                 f_trial = T_y_inv @ phi_trial
-                res_trial = float(np.linalg.norm(f_trial))
+                res_trial = math.sqrt(float(f_trial @ f_trial))
                 if np.isfinite(res_trial) and res_trial <= (1.0 - armijo_c * alpha) * base:
                     p = p_trial
                     accepted = True
@@ -293,7 +331,7 @@ def _local_solve_soccp(
     # Compute final residual
     phi_final, _ = _residual(p)
     f_final = T_y_inv @ phi_final
-    return p, max_iter, float(np.linalg.norm(f_final))
+    return p, max_iter, math.sqrt(float(f_final @ f_final))
 
 
 # -----------------------------------------------------------------------------
@@ -414,7 +452,7 @@ def soccp_pgs(
 
         diff = float(np.linalg.norm(p - p_prev))
         ref = max(1.0, float(np.linalg.norm(p)))
-        if diff / ref < tol_outer:
+        if diff / ref < tol_outer and local_res_max < tol_outer:
             info.outer_iters = outer_it + 1
             info.converged = True
             info.outer_residual = diff / ref

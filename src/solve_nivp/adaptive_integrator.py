@@ -274,6 +274,32 @@ class AdaptiveStepping:
         proj = getattr(solver, 'proj', None)
         return proj
 
+    def _invalidate_solver_caches_on_failure(self):
+        """Drop cached LU / Jacobian / PETSc state after a nonlinear failure.
+
+        A retry uses a different step size, hence a different iteration matrix
+        ``M/(γh) − J``; reusing a stale factorisation from the failed attempt
+        would corrupt the solve.  After ``_NL_RESCUE_THRESH`` consecutive
+        failures a full solver reset destroys the PETSc KSP, ILU and
+        equilibration caches as well.
+        """
+        solver = getattr(self.integrator, 'solver', None)
+        if solver is not None:
+            solver._lu = None
+            solver._lu_shape = None
+            solver._J_cross_call = None
+            solver._petsc_needs_matrix_update = True
+            if self._consecutive_nl_fails >= self._NL_RESCUE_THRESH:
+                if hasattr(solver, 'invalidate_all_caches'):
+                    solver.invalidate_all_caches()
+                if self.verbose:
+                    print(
+                        f"[adaptive] full solver reset after "
+                        f"{self._consecutive_nl_fails} consecutive NL failures"
+                    )
+        if hasattr(self.integrator, '_lu_h_cache'):
+            self.integrator._lu_h_cache.clear()
+
     # ------------------------------------------------------------------
     # DAE-aware error weighting
     # ------------------------------------------------------------------
@@ -1173,7 +1199,7 @@ class AdaptiveStepping:
         regime_before = None
         if self.active_set_filter:
             proj = self._get_projection()
-            if proj is not None:
+            if proj is not None and callable(getattr(proj, 'regime_snapshot', None)):
                 regime_before = proj.regime_snapshot()
 
         try:
@@ -1195,7 +1221,7 @@ class AdaptiveStepping:
         self._transition_mask = None
         if self.active_set_filter and regime_before is not None:
             proj = self._get_projection()
-            if proj is not None:
+            if proj is not None and callable(getattr(proj, 'regime_changed_mask', None)):
                 mask = proj.regime_changed_mask(regime_before, y.shape[0])
                 if mask is not None:
                     self._transition_mask = mask
@@ -1212,31 +1238,7 @@ class AdaptiveStepping:
             # Mark that we are in NL-failure recovery (for death-spiral cap)
             self._in_nl_recovery = True
             self._nl_success_no_fail = 0
-            # Invalidate the solver's cached LU factorisation so that the
-            # retry with a smaller h (and therefore a different iteration
-            # matrix M/(γh_new) − J) does not blindly reuse a stale
-            # factorisation from the failed attempt.
-            solver = getattr(self.integrator, 'solver', None)
-            if solver is not None:
-                solver._lu = None
-                solver._lu_shape = None
-                solver._J_cross_call = None
-                solver._petsc_needs_matrix_update = True
-                # After several consecutive failures, do a full solver reset:
-                # destroy PETSc KSP (stale MUMPS factorisation), ILU,
-                # equilibration cache — everything.  This forces a completely
-                # fresh Jacobian + factorisation on the next attempt.
-                if self._consecutive_nl_fails >= self._NL_RESCUE_THRESH:
-                    if hasattr(solver, 'invalidate_all_caches'):
-                        solver.invalidate_all_caches()
-                    if self.verbose:
-                        print(
-                            f"[adaptive] full solver reset after "
-                            f"{self._consecutive_nl_fails} consecutive NL failures"
-                        )
-            # Also clear the integrator's step-size LU cache
-            if hasattr(self.integrator, '_lu_h_cache'):
-                self.integrator._lu_h_cache.clear()
+            self._invalidate_solver_caches_on_failure()
             h_retry = max(self.h_min, self.h_down * h)
             return self._finalize_return(
                 t, h, y, None, h_retry, np.inf, False, np.inf, it,
@@ -1316,7 +1318,7 @@ class AdaptiveStepping:
         regime_before = None
         if self.active_set_filter:
             proj = self._get_projection()
-            if proj is not None:
+            if proj is not None and callable(getattr(proj, 'regime_snapshot', None)):
                 regime_before = proj.regime_snapshot()
 
         # ------------------------------------------------------
@@ -1350,24 +1352,7 @@ class AdaptiveStepping:
             # Mark NL-failure recovery (for death-spiral cap)
             self._in_nl_recovery = True
             self._nl_success_no_fail = 0
-            # Invalidate cached LU — h is about to change
-            solver = getattr(self.integrator, 'solver', None)
-            if solver is not None:
-                solver._lu = None
-                solver._lu_shape = None
-                solver._J_cross_call = None
-                solver._petsc_needs_matrix_update = True
-                if self._consecutive_nl_fails >= self._NL_RESCUE_THRESH:
-                    if hasattr(solver, 'invalidate_all_caches'):
-                        solver.invalidate_all_caches()
-                    if self.verbose:
-                        print(
-                            f"[adaptive] full solver reset after "
-                            f"{self._consecutive_nl_fails} consecutive NL failures"
-                        )
-            # Also clear the integrator's step-size LU cache
-            if hasattr(self.integrator, '_lu_h_cache'):
-                self.integrator._lu_h_cache.clear()
+            self._invalidate_solver_caches_on_failure()
             h_retry = max(self.h_min, self.h_down * h)
             return self._finalize_return(
                 t,
@@ -1394,6 +1379,7 @@ class AdaptiveStepping:
                     print(f"[adaptive] half-step fail #1 @ t={t:.6g}")
                 self._in_nl_recovery = True
                 self._nl_success_no_fail = 0
+                self._invalidate_solver_caches_on_failure()
                 h_retry = max(self.h_min, self.h_down * h)
                 return self._finalize_return(
                     t,
@@ -1415,6 +1401,7 @@ class AdaptiveStepping:
                     print(f"[adaptive] half-step fail #2 @ t={t:.6g}")
                 self._in_nl_recovery = True
                 self._nl_success_no_fail = 0
+                self._invalidate_solver_caches_on_failure()
                 h_retry = max(self.h_min, self.h_down * h)
                 return self._finalize_return(
                     t,
@@ -1456,7 +1443,7 @@ class AdaptiveStepping:
         self._transition_mask = None
         if self.active_set_filter and regime_before is not None:
             proj = self._get_projection()
-            if proj is not None:
+            if proj is not None and callable(getattr(proj, 'regime_changed_mask', None)):
                 mask = proj.regime_changed_mask(regime_before, y.shape[0])
                 if mask is not None:
                     self._transition_mask = mask

@@ -8,9 +8,13 @@ solve\_nivp.projections
 
    .. autosummary::
    
+      AlgebraicConstraintProjection
+      AnisotropicSOCProjection
+      CompositeContactProjection
       CoulombProjection
       GeneralMoreauVIProjection
       IdentityProjection
+      MoreauSOCProjection
       MuScaledSOCProjection
       Projection
       SignProjection

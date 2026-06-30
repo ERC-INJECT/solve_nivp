@@ -34,6 +34,7 @@ contact dynamics."  HAL-04230941.
 
 from __future__ import annotations
 
+import inspect as _inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -49,8 +50,17 @@ from .soccp_pgs import (
     _shift_jacobian_fd,
     _classify_regime,
 )
-from .projected_radau_contact import _soc_fb_phi_and_jac
+from .soc import _soc_fb_phi_and_jac
 from .projections import IdentityProjection, MuScaledSOCProjection
+
+try:
+    from ._numba_accel import (
+        NUMBA_AVAILABLE as _NUMBA_OK,
+        soc_fb_ssn_assemble as _soc_fb_assemble_nb,
+    )
+except Exception:  # pragma: no cover - numba is an optional dependency
+    _NUMBA_OK = False
+    _soc_fb_assemble_nb = None
 from .solvers.nonlinear_solvers import ImplicitEquationSolver, PETSC_AVAILABLE
 
 
@@ -659,11 +669,16 @@ class MoreauJeanFremondStepper:
         return float(np.clip(val, self.contact_soc_rho_min, self.contact_soc_rho_max))
 
     def _contact_block_transforms(self, mu_vec: np.ndarray) -> list:
-        """Per-block mu-scaled cone transforms (T_x, T_y, T_y_inv).
+        """Per-block mu-scaled cone transforms (t_x, t_y, t_y_inv).
 
         ``None`` marks blocks handled by the scalar branch (d == 1 or
         vanishing friction).  Hoisted out of the residual loop so one SSN
         solve builds them once instead of per Newton/line-search evaluation.
+
+        The self-dual rescalings ``T_x = diag(1, mu I)``, ``T_y = diag(mu, I)``
+        are diagonal, so each is stored as its diagonal vector and applied by
+        broadcasting -- this avoids the per-block 2x2/3x3 matmul overhead in
+        the residual/Jacobian loop.
         """
         transforms = []
         for k, sl in enumerate(self.block_slices):
@@ -672,13 +687,13 @@ class MoreauJeanFremondStepper:
             if d == 1 or mu <= 1.0e-14:
                 transforms.append(None)
                 continue
-            T_x = np.eye(d, dtype=float)
-            T_x[1:, 1:] *= mu
-            T_y = np.eye(d, dtype=float)
-            T_y[0, 0] = mu
-            T_y_inv = np.eye(d, dtype=float)
-            T_y_inv[0, 0] = 1.0 / mu
-            transforms.append((T_x, T_y, T_y_inv))
+            t_x = np.ones(d, dtype=float)
+            t_x[1:] = mu
+            t_y = np.ones(d, dtype=float)
+            t_y[0] = mu
+            t_y_inv = np.ones(d, dtype=float)
+            t_y_inv[0] = 1.0 / mu
+            transforms.append((t_x, t_y, t_y_inv))
         return transforms
 
     def _contact_ssn_residual_jacobian(
@@ -694,10 +709,43 @@ class MoreauJeanFremondStepper:
     ):
         n_react = b.size
         p = np.asarray(p, dtype=float).ravel()
+        use_soc_natural_map = self.contact_residual == "soc_projection"
+
+        # Fast path: fused numba kernel for the soc_fb residual mode with a
+        # built-in Frémond/De Saxce shift and uniform block dimension.  Falls
+        # back to the pure-NumPy loop below for the soc_projection mode, custom
+        # shifts (no _soc_shift_params), mixed block dims, or no numba.
+        shift_params = getattr(shift_fn, "_soc_shift_params", None)
+        if (
+            _NUMBA_OK
+            and not use_soc_natural_map
+            and shift_params is not None
+            and n_react > 0
+            and self.block_slices
+        ):
+            dims = [sl.stop - sl.start for sl in self.block_slices]
+            if all(dd == dims[0] for dd in dims):
+                W_c = np.ascontiguousarray(
+                    W.toarray() if sp.issparse(W) else W, dtype=float
+                )
+                res_nb, jac_nb, u_nb = _soc_fb_assemble_nb(
+                    W_c,
+                    np.ascontiguousarray(b, dtype=float),
+                    p,
+                    np.ascontiguousarray(mu_vec, dtype=float),
+                    np.ascontiguousarray(shift_params["alpha"], dtype=float),
+                    np.ascontiguousarray(shift_params["rest"], dtype=float),
+                    int(dims[0]),
+                    bool(want_jacobian),
+                    1.0e-14,
+                )
+                if want_jacobian:
+                    return res_nb, jac_nb, u_nb
+                return res_nb, None, u_nb
+
         u_full = W @ p + b
         residual = np.zeros(n_react, dtype=float)
         jac = np.zeros((n_react, n_react), dtype=float) if want_jacobian else None
-        use_soc_natural_map = self.contact_residual == "soc_projection"
         if transforms is None:
             transforms = self._contact_block_transforms(mu_vec)
         shift_jacobian = getattr(shift_fn, "jacobian", None)
@@ -747,10 +795,10 @@ class MoreauJeanFremondStepper:
                             jac[sl.start + 1:sl.stop, sl.start + 1:sl.stop] = np.eye(d - 1)
                 continue
 
-            T_x, T_y, T_y_inv = transforms[k]
+            t_x, t_y, t_y_inv = transforms[k]
 
-            x_sd = T_x @ u_hat
-            y_sd = T_y @ p_block
+            x_sd = t_x * u_hat
+            y_sd = t_y * p_block
 
             if use_soc_natural_map:
                 rho = self._contact_soc_rho_value(W[sl, sl], d)
@@ -764,22 +812,26 @@ class MoreauJeanFremondStepper:
                         z, 1.0, return_jacobian=False,
                     )
                     J_proj = None
-                residual[sl] = T_y_inv @ (y_sd - proj_z)
+                residual[sl] = t_y_inv * (y_sd - proj_z)
                 if want_jacobian:
-                    jac[sl, :] = T_y_inv @ (
-                        J_proj @ (rho * T_x @ d_uhat_du @ W_rows)
-                    )
-                    jac[sl, sl] += T_y_inv @ (
-                        (np.eye(d, dtype=float) - J_proj) @ T_y
+                    # T_y_inv @ (J_proj @ (rho * T_x @ d_uhat_du @ W_rows));
+                    # diagonal T_x / T_y_inv applied as row scalings.
+                    M_row = t_x[:, None] * (d_uhat_du @ W_rows)
+                    jac[sl, :] = t_y_inv[:, None] * (J_proj @ (rho * M_row))
+                    jac[sl, sl] += t_y_inv[:, None] * (
+                        (np.eye(d, dtype=float) - J_proj) * t_y[None, :]
                     )
                 continue
 
             phi_sd, dphi_dx, dphi_dy = _soc_fb_phi_and_jac(x_sd, y_sd)
-            residual[sl] = T_y_inv @ phi_sd
+            residual[sl] = t_y_inv * phi_sd
 
             if want_jacobian:
-                jac[sl, :] = T_y_inv @ (dphi_dx @ T_x @ d_uhat_du @ W_rows)
-                jac[sl, sl] += T_y_inv @ (dphi_dy @ T_y)
+                # T_y_inv @ (dphi_dx @ T_x @ d_uhat_du @ W_rows) and
+                # T_y_inv @ (dphi_dy @ T_y), with diagonal T_* as broadcasts.
+                M_row = t_x[:, None] * (d_uhat_du @ W_rows)
+                jac[sl, :] = t_y_inv[:, None] * (dphi_dx @ M_row)
+                jac[sl, sl] += t_y_inv[:, None] * (dphi_dy * t_y[None, :])
 
         if want_jacobian:
             return residual, jac, u_full
@@ -939,21 +991,116 @@ class MoreauJeanFremondStepper:
         }
 
 
+_GMRES_HAS_RTOL = "rtol" in _inspect.signature(spla.gmres).parameters
+
+
+def _gmres_compat(A, b, *, M=None, rtol=1.0e-10, atol=0.0, restart=100, maxiter=1000):
+    """``scipy.sparse.linalg.gmres`` across the rtol/tol kwarg rename (>=1.12)."""
+    if _GMRES_HAS_RTOL:
+        return spla.gmres(A, b, M=M, rtol=rtol, atol=atol,
+                          restart=restart, maxiter=maxiter)
+    return spla.gmres(A, b, M=M, tol=rtol, atol=atol,
+                      restart=restart, maxiter=maxiter)
+
+
+def _build_dense_row_woodbury(op_csr, rows):
+    """Split ``op = op_sparse + U V^T`` for an operator that is sparse except for
+    a few dense rows, and prefactor it for a Sherman-Morrison-Woodbury solve.
+
+    A descriptor with full-state feedback (e.g. a dense LQR/observer gain fed
+    back through one algebraic row) has a theta operator that is otherwise
+    banded but for those gain rows; a single dense row fills the sparse LU and
+    dominates the factorization.  Each such row ``r`` is rank-1: ``U`` columns
+    are the unit vectors ``e_r`` and ``V`` columns hold the row's off-diagonal
+    content, so ``op_sparse`` keeps only the diagonal on those rows and is
+    genuinely sparse.  Factor ``op_sparse`` once, then correct with the rank-k
+    capacitance ``C = I + V^T op_sparse^{-1} U``.  Exact (an identity), so it
+    does not perturb the Newton/adaptive behaviour the way a truncated gain
+    would.  Returns ``None`` (caller falls back to a plain LU) if the structure
+    does not apply -- e.g. a peeled row has a zero diagonal.
+    """
+    n = op_csr.shape[0]
+    rows = np.unique(np.asarray(rows, dtype=int).ravel())
+    rows = rows[(rows >= 0) & (rows < n)]
+    if rows.size == 0:
+        return None
+    k = int(rows.size)
+    indptr, indices, data = op_csr.indptr, op_csr.indices, op_csr.data
+    V = np.zeros((n, k))
+    op = op_csr.tolil()
+    for j, r in enumerate(rows):
+        s, e = indptr[r], indptr[r + 1]
+        rowvec = np.zeros(n)
+        rowvec[indices[s:e]] = data[s:e]
+        diag = float(rowvec[r])
+        if abs(diag) < 1.0e-300:
+            return None
+        rowvec[r] = 0.0
+        V[:, j] = rowvec
+        op.rows[int(r)] = [int(r)]
+        op.data[int(r)] = [diag]
+    try:
+        lu = spla.splu(op.tocsc())
+        U = np.zeros((n, k))
+        U[rows, np.arange(k)] = 1.0
+        W = np.asarray(lu.solve(U)).reshape(n, k)
+        Cinv = np.linalg.inv(np.eye(k) + V.T @ W)
+    except (RuntimeError, ValueError, np.linalg.LinAlgError):
+        return None
+    return {"lu": lu, "W": W, "V": V, "Cinv": Cinv}
+
+
 class _ThetaFactorization:
-    """One LU factorization of the theta operator.
+    """One factorization (or preconditioned iterative solve) of the theta operator.
 
     A single ``step()`` needs ``n_react + 2`` solves against the same matrix
     (predictor, Delassus columns, corrector); this object factorizes once and
     back-substitutes, batching the Delassus block as a multi-RHS solve.  Its
     lifetime is tied to one ``(t, y, h)`` triple, so no staleness is possible
     regardless of step rejections or exceptions.
+
+    Backends:
+
+    * ``"scipy"`` -- direct sparse LU (``splu``).
+    * ``"petsc"`` -- PETSc KSP; direct (``preonly``/``lu`` + MUMPS) or
+      iterative (e.g. ``gmres`` + ``hypre``/``fieldsplit``) purely via
+      ``petsc_options`` -- no code change needed to switch.
+    * ``"iterative"`` -- PETSc-free GMRES + ILU preconditioner (SciPy), for
+      low-memory solves at dense meshes where direct-LU fill-in dominates and
+      PETSc is unavailable.  Options: ``drop_tol``, ``fill_factor``, ``rtol``,
+      ``atol``, ``restart``, ``maxiter``, ``strict``.
     """
 
-    def __init__(self, op, backend: str, petsc_options: Optional[dict] = None):
+    def __init__(self, op, backend: str, petsc_options: Optional[dict] = None,
+                 dense_rows=None):
         self.backend = str(backend or "scipy").lower()
         op_csr = op.tocsr() if sp.issparse(op) else sp.csr_matrix(op)
         self.shape = op_csr.shape
-        if self.backend == "petsc":
+        # Sherman-Morrison-Woodbury fast path for a sparse operator with a few
+        # dense (feedback-gain) rows; direct-LU backend only.
+        self._wb = None
+        if (self.backend == "scipy" and dense_rows is not None
+                and np.atleast_1d(dense_rows).size > 0):
+            self._wb = _build_dense_row_woodbury(op_csr, dense_rows)
+        if self.backend == "iterative":
+            opts = dict(petsc_options or {})
+            self._op = op_csr.tocsc()
+            self._rtol = float(opts.get("rtol", 1.0e-10))
+            self._atol = float(opts.get("atol", 0.0))
+            self._restart = int(opts.get("restart", 100))
+            self._maxiter = int(opts.get("maxiter", 1000))
+            self._strict = bool(opts.get("strict", True))
+            drop_tol = float(opts.get("drop_tol", 1.0e-4))
+            fill_factor = float(opts.get("fill_factor", 10.0))
+            try:
+                ilu = spla.spilu(self._op, drop_tol=drop_tol,
+                                 fill_factor=fill_factor)
+                self._M = spla.LinearOperator(self.shape, ilu.solve)
+            except (RuntimeError, ValueError):
+                # ILU can fail on strongly singular/saddle blocks; fall back to
+                # unpreconditioned GMRES rather than crashing.
+                self._M = None
+        elif self.backend == "petsc":
             if not PETSC_AVAILABLE:
                 raise RuntimeError(
                     "theta_linear_solver='petsc' requires petsc4py/PETSc"
@@ -978,11 +1125,31 @@ class _ThetaFactorization:
             self._ksp = ksp
             self._x = self._mat.createVecLeft()
             self._b = self._mat.createVecRight()
-        else:
+        elif self._wb is None:
             self._lu = spla.splu(op_csr.tocsc())
+
+    def _wb_apply(self, B):
+        """Woodbury solve: ``op^{-1} B = x0 - W C^{-1} (V^T x0)``, ``x0 = op_sparse^{-1} B``."""
+        wb = self._wb
+        x0 = wb["lu"].solve(B)
+        return x0 - wb["W"] @ (wb["Cinv"] @ (wb["V"].T @ x0))
 
     def solve(self, rhs: np.ndarray) -> np.ndarray:
         rhs = np.asarray(rhs, dtype=float).ravel()
+        if self._wb is not None:
+            return np.asarray(self._wb_apply(rhs))
+        if self.backend == "iterative":
+            x, info = _gmres_compat(
+                self._op, rhs, M=self._M, rtol=self._rtol, atol=self._atol,
+                restart=self._restart, maxiter=self._maxiter,
+            )
+            if info != 0 and self._strict:
+                raise RuntimeError(
+                    "theta iterative solve did not converge "
+                    f"(gmres info={info}); loosen rtol or strengthen the "
+                    "preconditioner (drop_tol/fill_factor)"
+                )
+            return np.asarray(x)
         if self.backend == "petsc":
             self._b.setArray(rhs)
             self._ksp.solve(self._b, self._x)
@@ -993,6 +1160,12 @@ class _ThetaFactorization:
         RHS = np.asarray(RHS, dtype=float)
         if RHS.ndim == 1:
             RHS = RHS[:, None]
+        if self._wb is not None:
+            return np.asarray(self._wb_apply(RHS))
+        if self.backend == "iterative":
+            return np.column_stack(
+                [self.solve(RHS[:, j]) for j in range(RHS.shape[1])]
+            )
         if self.backend == "petsc":
             PETSc = self._PETSc
             try:
@@ -1017,6 +1190,7 @@ class _ThetaFactorization:
         return np.asarray(self._lu.solve(RHS))
 
     def destroy(self):
+        self._wb = None
         if self.backend == "petsc":
             for attr in ("_x", "_b", "_ksp", "_mat"):
                 obj = getattr(self, attr, None)
@@ -1066,7 +1240,9 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         contact_linear_solver: str = "auto",
         theta_linear_solver: str = "scipy",
         theta_petsc_options: Optional[dict] = None,
+        theta_iterative_options: Optional[dict] = None,
         theta_petsc_reuse_steps: int = 1,
+        theta_dense_rows: Optional[Any] = None,
         contact_ssn_tol: float = 1.0e-10,
         contact_ssn_max_iter: int = 30,
         contact_ssn_line_search: bool = True,
@@ -1176,13 +1352,19 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             contact_linear_solver
         )
         self.theta_linear_solver = str(theta_linear_solver or "scipy").lower()
-        if self.theta_linear_solver not in ("scipy", "petsc"):
+        if self.theta_linear_solver not in ("scipy", "petsc", "iterative"):
             raise ValueError(
-                "theta_linear_solver must be 'scipy' or 'petsc'; "
+                "theta_linear_solver must be 'scipy', 'petsc', or 'iterative'; "
                 f"got {self.theta_linear_solver!r}"
             )
         self.theta_petsc_options = dict(theta_petsc_options or self.contact_petsc_options)
+        self.theta_iterative_options = dict(theta_iterative_options or {})
         self.theta_petsc_reuse_steps = max(1, int(theta_petsc_reuse_steps))
+        if theta_dense_rows is None:
+            self.theta_dense_rows = None
+        else:
+            rows = np.unique(np.asarray(theta_dense_rows, dtype=int).ravel())
+            self.theta_dense_rows = rows if rows.size else None
         self.contact_ssn_tol = float(contact_ssn_tol)
         self.contact_ssn_max_iter = int(contact_ssn_max_iter)
         self.contact_ssn_line_search = bool(contact_ssn_line_search)
@@ -1190,6 +1372,14 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         self._contact_petsc_solver = None
         self._theta_cache = None
         self._B_dense = None
+        # last converged effective contact impulse + its (t, y, h) key, reused
+        # as the contact-SSN warm start on mu fixed-point re-entries (identical
+        # (t, y, h), only mu changed) when the caller supplies no nonzero
+        # p_contact_prev.  Restricted to re-entries on purpose: warm-starting a
+        # semismooth Newton across steps can shift the active set into a worse
+        # basin and slow/stall convergence.  Initial guess only.
+        self._last_p_eff = None
+        self._last_call_key = None
 
     @property
     def state_size(self) -> int:
@@ -1363,8 +1553,13 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         # operator changed -> (re)factorize and rebuild the Delassus block
         if cache is not None and cache.get("fac") is not None:
             cache["fac"].destroy()
-        backend = "petsc" if self.theta_linear_solver == "petsc" else "scipy"
-        fac = _ThetaFactorization(op, backend, self.theta_petsc_options)
+        if self.theta_linear_solver == "iterative":
+            fac = _ThetaFactorization(op, "iterative", self.theta_iterative_options,
+                                      dense_rows=self.theta_dense_rows)
+        else:
+            backend = "petsc" if self.theta_linear_solver == "petsc" else "scipy"
+            fac = _ThetaFactorization(op, backend, self.theta_petsc_options,
+                                      dense_rows=self.theta_dense_rows)
         z_pred = fac.solve(rhs_base)
         entry = {
             "t": float(t),
@@ -1637,22 +1832,38 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         y = np.asarray(y, dtype=float).ravel()
         theta_sys = self._theta_system_cached(t, y, h)
         rhs_base = theta_sys["rhs"]
-        fac = theta_sys["fac"]
         z_pred = theta_sys["z_pred"]
 
         if self.n_react > 0:
-            B = self.B.tocsr() if sp.issparse(self.B) else sp.csr_matrix(self.B)
             W = theta_sys["W"]
             u_old = theta_sys["u_old"]
             b_soccp = theta_sys["b_soccp"]
-            p0 = aux.get("p_contact_prev", np.zeros(self.n_react, dtype=float))
-            if len(p0) != self.n_react:
-                p0 = np.zeros(self.n_react, dtype=float)
+            p0 = aux.get("p_contact_prev", None)
+            p0 = (np.zeros(self.n_react, dtype=float)
+                  if p0 is None or len(p0) != self.n_react
+                  else np.asarray(p0, dtype=float))
             offset_impulse = self._contact_offset_impulse(
                 z_pred, float(t) + self.theta * float(h), h,
             )
             b_eff = b_soccp - W @ offset_impulse
-            p0_eff = np.asarray(p0, dtype=float) + offset_impulse
+            # Warm start (initial guess only; converged solution unchanged):
+            # prefer a caller-supplied nonzero impulse; otherwise, on a mu
+            # fixed-point re-entry (identical (t, y, h)), reuse the previous
+            # iteration's converged impulse -- only mu changed, so it is a tight
+            # guess that cuts contact-SSN iterations on the 2nd+ mu sweeps.
+            reentry = (
+                self._last_call_key is not None
+                and self._last_call_key[0] == float(t)
+                and self._last_call_key[2] == float(h)
+                and np.array_equal(self._last_call_key[1], y)
+            )
+            if np.any(p0):
+                p0_eff = p0 + offset_impulse
+            elif (reentry and self._last_p_eff is not None
+                  and self._last_p_eff.size == self.n_react):
+                p0_eff = self._last_p_eff.copy()
+            else:
+                p0_eff = offset_impulse.copy()
             t_theta = float(t) + self.theta * float(h)
             if self.mu_state_callback is not None:
                 if self.contact_solver != "petsc_ssn":
@@ -1687,7 +1898,13 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
                         W, b_eff, mu_vec, shift_fn, p0_eff,
                     )
             p_contact = p_effective - offset_impulse
-            z_theta = fac.solve(rhs_base + np.asarray(B @ p_contact).ravel())
+            self._last_p_eff = np.asarray(p_effective, dtype=float).copy()
+            self._last_call_key = (float(t), y.copy(), float(h))
+            # z_theta = A^{-1}(rhs_base + B p_contact) = z_pred + X_contact p_contact
+            # by linearity, since z_pred = A^{-1} rhs_base and X_contact = A^{-1} B
+            # are already cached -- avoids a full theta-operator back-substitution
+            # on every (mu fixed-point) step() call.
+            z_theta = z_pred + np.asarray(theta_sys["X_contact"], dtype=float) @ p_contact
             if self.mu_state_callback is not None:
                 mu_vec = self._mu_from_theta_state(z_theta, t_theta)
         else:

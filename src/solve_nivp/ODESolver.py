@@ -76,6 +76,13 @@ class ODESolver:
         self.t0, self.tf = t_span
         self.h_initial = h
 
+        if not (h > 0.0):
+            raise ValueError(f"step size h must be positive, got {h}")
+        if not (self.tf > self.t0):
+            raise ValueError(
+                f"t_span must be increasing, got (t0={self.t0}, tf={self.tf})"
+            )
+
         # ---- t_eval validation and bookkeeping ----
         self._use_t_eval: bool = False
         self._t_eval: Optional[np.ndarray] = None
@@ -176,7 +183,7 @@ class ODESolver:
             self.t_values.append(t_store)
             self.y_values.append(y.copy())
             if self.store_fk:
-                self.fk.append(fk_val.copy() if fk_val is not None else None)
+                self.fk.append(fk_val.copy() if hasattr(fk_val, "copy") else fk_val)
             else:
                 self.fk.append(None)
             self.h_values.append(h_taken)

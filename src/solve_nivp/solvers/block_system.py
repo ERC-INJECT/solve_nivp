@@ -103,6 +103,10 @@ class SchurComplementSolver:
         self.diagonal_regularization = float(diagonal_regularization)
         self.use_preconditioner = bool(use_preconditioner)
         self.linear_solver = str(linear_solver).strip().lower()
+        if self.linear_solver not in ("direct", "pcr"):
+            raise ValueError(
+                f"linear_solver must be 'direct' or 'pcr', got {linear_solver!r}"
+            )
 
     def _to_dense(self, M):
         if sp.issparse(M):
@@ -123,17 +127,18 @@ class SchurComplementSolver:
     def _solve_linear_direct(self, H, B_top, B_bot, C, g, h_c):
         """Solve the full saddle-point system with a direct factorisation."""
         n_p = g.shape[0]
-        H_arr = self._to_dense(H)
-        Bt = self._to_dense(B_top)
-        Bb = self._to_dense(B_bot)
-        C_arr = self._to_dense(C)
-
-        A_full = np.block([[H_arr, Bt],
-                           [Bb,    C_arr]])
         rhs_full = np.concatenate([g, h_c])
 
-        x = la.solve(A_full, rhs_full)
-        residual = float(np.linalg.norm(A_full @ x - rhs_full))
+        if any(sp.issparse(M) for M in (H, B_top, B_bot, C)):
+            A_full = sp.bmat([[H, B_top],
+                              [B_bot, C]], format="csr")
+            x = spla.spsolve(A_full, rhs_full)
+            residual = float(np.linalg.norm(A_full @ x - rhs_full))
+        else:
+            A_full = np.block([[self._to_dense(H), self._to_dense(B_top)],
+                               [self._to_dense(B_bot), self._to_dense(C)]])
+            x = la.solve(A_full, rhs_full)
+            residual = float(np.linalg.norm(A_full @ x - rhs_full))
         return x[:n_p], x[n_p:], {
             "converged": True, "iterations": 1,
             "residual_norm": residual, "residual_history": [residual],
@@ -247,6 +252,9 @@ class SchurComplementSolver:
             delta_u, delta_lam, info = self.solve_linear(
                 H, B_top, B_bot, C, g, h_c, precond_diag,
             )
+
+            if not info.get("converged", True):
+                return y.copy(), err, False, iteration
 
             alpha = self.damped_step_fraction
             y[:n_p] += alpha * delta_u
@@ -394,6 +402,10 @@ class SchurComplementSolver:
             delta_u, delta_lam, info = self.solve_linear(
                 H_full, Bt_full, Bb_diag, C_diag, g_full, hc_full,
             )
+
+            if not info.get("converged", True):
+                Y_s = Z[(s - 1) * n_aug:s * n_aug]
+                return Y_s.copy(), err, False, iteration
 
             alpha = self.damped_step_fraction
             for i in range(s):

@@ -33,3 +33,48 @@ jobs:
     
     - name: Run self-test
       run: solve_nivp-selftest
+
+  docs:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install documentation dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .[docs]
+
+    - name: Build documentation without warnings
+      run: python -m sphinx -W --keep-going -b html docs/source docs/_build/html
+
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Build source and wheel distributions
+      run: |
+        python -m pip install --upgrade pip
+        pip install build
+        rm -rf /tmp/solve-nivp-dist
+        python -m build --outdir /tmp/solve-nivp-dist
+
+    - name: Install wheel in a clean environment
+      run: |
+        rm -rf /tmp/solve-nivp-wheel-test
+        python -m venv /tmp/solve-nivp-wheel-test
+        /tmp/solve-nivp-wheel-test/bin/python -m pip install --upgrade pip
+        /tmp/solve-nivp-wheel-test/bin/python -m pip install /tmp/solve-nivp-dist/*.whl
+        /tmp/solve-nivp-wheel-test/bin/python -c "import solve_nivp; from solve_nivp import ODESolver, solve_nivp as solve; print(solve_nivp.__version__)"

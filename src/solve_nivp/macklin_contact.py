@@ -237,7 +237,11 @@ def build_macklin_contact_blocked(
         vN = int(c["vel_normal_idx"])
         vT = list(np.atleast_1d(c.get("vel_tangential_idx", [])).astype(int))
         mu_val = c.get("mu", 0.0)
-        mu = float(mu_val) if not callable(mu_val) else 0.0
+        if callable(mu_val):
+            raise TypeError(
+                "build_macklin_contact_blocked does not support callable "
+                "(state-dependent) mu; pass a scalar friction coefficient")
+        mu = float(mu_val)
         norm_contacts.append({"vN": vN, "vT": vT, "mu": mu})
         vel_indices_list.append(vN)
         vel_indices_list.extend(vT)

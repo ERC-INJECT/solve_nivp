@@ -1219,7 +1219,9 @@ class SDIRK2(BackwardEuler):
         #   err = h γ (K2 − K1)
         #       = (Y2 − y_shift) − (Y1 − y)
         #       = (Y2 − y_shift) − dY1
-        err_embed = (Y2 - y_shift) - dY1
+        # Use the projected output y_new so a post-step projection correction
+        # is reflected in the error the adaptive controller sees.
+        err_embed = (y_new - y_shift) - dY1
 
         total_iters = it1 + it2
         return y_new, Fk2, err_embed, True, total_iters
@@ -1921,6 +1923,12 @@ class RadauIIA(BackwardEuler):
         for k in range(s):
             err_embed += coeffs[k] * (Y[k] - y)
 
+        # Reflect a post-step projection correction so the adaptive controller
+        # sees error based on the projected final state, not the raw collocation
+        # output Y[-1].
+        if proj_delta is not None:
+            err_embed = err_embed + proj_delta
+
         return y_new, Fk_last, err_embed, True, total_iters
 
 
@@ -1931,11 +1939,17 @@ class EmbeddedBETR(IntegrationMethod):
     Acts as a plain TR stepper with optional exact residual Jacobian.
     """
 
-    def __init__(self, solver=None, A=None):
+    def __init__(self, solver=None, A=None, pass_prev_state=False,
+                 pass_step_size=False, post_step_projection=None,
+                 post_step_rhok=1.0):
         self.solver = solver or ImplicitEquationSolver(method='semismooth_newton')
         self.A = A
         self.use_identity = (A is None)
         self.order = 2
+        self.pass_prev_state = pass_prev_state
+        self.pass_step_size = pass_step_size
+        self.post_step_projection = post_step_projection
+        self.post_step_rhok = post_step_rhok
 
     def _get_A(self, n):
         if not self.use_identity:
@@ -2010,14 +2024,16 @@ class EmbeddedBETR(IntegrationMethod):
 
 if __name__ == "__main__":
     # Optional quick smoke test when running this module directly
+    from .projections import IdentityProjection
+
     def rhs(t, y, Fk=None):
         return -y
 
     y0 = np.array([1.0])
     t0 = 0.0
     h = 0.2
-    be = BackwardEuler(solver=ImplicitEquationSolver(method='semismooth_newton', proj=lambda *args, **kw: None))
-    tr = Trapezoidal(solver=ImplicitEquationSolver(method='semismooth_newton', proj=lambda *args, **kw: None))
-    comp = CompositeMethod(solver=ImplicitEquationSolver(method='semismooth_newton', proj=lambda *args, **kw: None))
+    be = BackwardEuler(solver=ImplicitEquationSolver(method='semismooth_newton', proj=IdentityProjection()))
+    tr = Trapezoidal(solver=ImplicitEquationSolver(method='semismooth_newton', proj=IdentityProjection()))
+    comp = CompositeMethod(solver=ImplicitEquationSolver(method='semismooth_newton', proj=IdentityProjection()))
     print("TR:", tr.step(rhs, t0, y0.copy(), h))
     print("Composite:", comp.step(rhs, t0, y0.copy(), h))

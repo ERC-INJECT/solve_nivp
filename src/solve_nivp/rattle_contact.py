@@ -245,7 +245,8 @@ class RattleBilateralSpec:
     def eval_chi_gamma(self, t: float, q: np.ndarray) -> np.ndarray:
         if self.gamma is None:
             return np.zeros(0, dtype=float)
-        return _asvec(self.gamma(t, q, np.zeros(0)))
+        nu = _as_2d(_eval_callable_or_const(self.W_g, t, q)).shape[0]
+        return _asvec(self.gamma(t, q, np.zeros(nu, dtype=float)))
 
 
 @dataclass
@@ -544,7 +545,9 @@ class RattleSolver:
         # --- Block (kin, q): I - 0.5*h * d(qdot_new)/d(q_new) ---
         J[:nq, :nq] = np.eye(nq)
         if self.mech.dB_dq is not None:
-            pass  # TODO: configuration-dependent B Jacobian
+            raise NotImplementedError(
+                "configuration-dependent B (dB_dq) is not supported in the "
+                "Stage-1 RATTLE Jacobian")
         # For B=I case, d(qdot_new)/d(q_new) = 0, so J[kin,q] = I.
 
         # --- Block (kin, u): -0.5*h * (B_n + B_new) ---
