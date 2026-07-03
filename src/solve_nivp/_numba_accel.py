@@ -172,7 +172,16 @@ def _soc_fb_phi_jac_nb(x, y, want_jac, tie):
         w0 = x0 * x0 + x1 * x1 + y0 * y0 + y1 * y1
         w1 = 2.0 * (x0 * x1 + y0 * y1)
         aw = abs(w1)
-        sq1 = np.sqrt(max(w0 - aw, 0.0))
+        # lam1 = w0 - |w1| cancellation-free (w0, |w1| ~ ||reaction||^2 cancel near the cone
+        # boundary): (w0^2-|w1|^2)/(w0+|w1|) with the numerator as a sum of squares.  Mirrors
+        # solve_nivp.soc._fb_sqrt_lam1_2d; keeps the FB root on the cone to machine precision.
+        _fx = (x0 - x1) * (x0 + x1)
+        _fy = (y0 - y1) * (y0 + y1)
+        _c1 = x0 * y0 - x1 * y1
+        _c2 = x0 * y1 - x1 * y0
+        _den = w0 + aw
+        _lam1 = (_fx * _fx + _fy * _fy + 2.0 * (_c1 * _c1 + _c2 * _c2)) / _den if _den > 0.0 else 0.0
+        sq1 = np.sqrt(_lam1) if _lam1 > 0.0 else 0.0
         sq2 = np.sqrt(max(w0 + aw, 0.0))
         s0 = 0.5 * (sq1 + sq2)
         if aw > tie:
@@ -219,7 +228,25 @@ def _soc_fb_phi_jac_nb(x, y, want_jac, tie):
     for j in range(d - 1):
         wTn += wT[j] * wT[j]
     wTn = np.sqrt(wTn)
-    sq1 = np.sqrt(max(wN - wTn, 0.0))
+    # lam1 = wN - ||wT|| cancellation-free (mirrors solve_nivp.soc._fb_lam1_general): sum-of-squares
+    # numerator with the Cauchy-Schwarz/Gram term, over (wN + ||wT||).
+    _axT = 0.0; _ayT = 0.0; _xy = 0.0
+    for j in range(1, d):
+        _axT += x[j] * x[j]; _ayT += y[j] * y[j]; _xy += x[j] * y[j]
+    _axT = np.sqrt(_axT); _ayT = np.sqrt(_ayT)
+    _fx = (x[0] - _axT) * (x[0] + _axT)
+    _fy = (y[0] - _ayT) * (y[0] + _ayT)
+    _c1 = x[0] * y[0] - _xy
+    _c2 = 0.0
+    for j in range(1, d):
+        _cr = x[0] * y[j] - y[0] * x[j]; _c2 += _cr * _cr
+    _gram = 0.0
+    for i in range(1, d):
+        for j in range(i + 1, d):
+            _t = x[i] * y[j] - x[j] * y[i]; _gram += _t * _t
+    _den = wN + wTn
+    _lam1 = (_fx * _fx + _fy * _fy + 2.0 * (_c1 * _c1 + _c2 + _gram)) / _den if _den > 0.0 else 0.0
+    sq1 = np.sqrt(_lam1) if _lam1 > 0.0 else 0.0
     sq2 = np.sqrt(max(wN + wTn, 0.0))
     sN = 0.5 * (sq1 + sq2)
     phi = np.empty(d)

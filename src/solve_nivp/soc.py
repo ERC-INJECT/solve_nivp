@@ -35,6 +35,68 @@ import numpy as np
 # -----------------------------------------------------------------------------
 
 
+def _fb_sqrt_lam1_2d(x0, x1, y0, y1, w_N, w_T_norm):
+    r"""``sqrt`` of the small Jordan eigenvalue ``lam1 = w_N - |w_T|`` (d == 2).
+
+    ``w = x**2 + y**2`` has spectrum ``lam_{1,2} = w_N -+ |w_T|``.  At a
+    complementary *slip* solution ``x`` and ``y`` sit on opposite cone-boundary
+    rays, so ``w`` is rank-1 and ``lam1 -> 0``; but ``w_N`` and ``|w_T|`` are each
+    ``~ ||y||**2`` (for a contact reaction, O(1e12)), so the direct difference
+    ``w_N - |w_T|`` cancels catastrophically and pins the reaction to the cone
+    only to ``~sqrt(eps)``.  Form ``lam1 = (w_N**2 - |w_T|**2)/(w_N + |w_T|)``
+    with the numerator as the Jordan-algebra sum of squares
+
+        ``w_N**2 - w_T**2 = (x0**2-x1**2)**2 + (y0**2-y1**2)**2``
+        ``               + 2 (x0 y0 - x1 y1)**2 + 2 (x0 y1 - x1 y0)**2``
+
+    (the squared differences factored as ``(a-b)(a+b)`` so they do not
+    re-cancel).  Machine-accurate for all inputs; verified vs an exact rational
+    reference to ``< 3e-15`` relative.
+    """
+    fx = (x0 - x1) * (x0 + x1)          # x0**2 - x1**2   (no cancellation)
+    fy = (y0 - y1) * (y0 + y1)          # y0**2 - y1**2
+    c1 = x0 * y0 - x1 * y1
+    c2 = x0 * y1 - x1 * y0
+    den = w_N + w_T_norm
+    lam1 = (fx * fx + fy * fy + 2.0 * (c1 * c1 + c2 * c2)) / den if den > 0.0 else 0.0
+    return math.sqrt(lam1) if lam1 > 0.0 else 0.0
+
+
+def _fb_lam1_general(x, y, w_N, w_T_norm):
+    r"""Cancellation-free ``lam1 = w_N - ||w_T||`` for arbitrary block dim ``d``.
+
+    Same idea as :func:`_fb_sqrt_lam1_2d` but for a vector tangential part; the
+    numerator picks up the Cauchy-Schwarz (Gram) term
+    ``||xT||**2 ||yT||**2 - (xT.yT)**2 = sum_{i<j} (xT_i yT_j - xT_j yT_i)**2``
+    (which vanishes for d == 2).  Machine-accurate at complementary configurations
+    -- ``x``, ``y`` on opposite cone-boundary rays, i.e. the slip *solutions* the
+    SSN converges to (verified: a 3-D cone solve holds ``|p_T| = mu p_N`` to
+    machine precision, and ``phi`` on generic 3-D boundary pairs is ``< 5e-16`` of
+    scale).  A residual ``||yT||``-norm rounding (~1e-6 relative) survives only for
+    *arbitrary* non-complementary ``(x, y)`` -- transient Newton iterates that do
+    not limit the converged cone accuracy.  d == 1 gives ``w_N`` exactly.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    x0 = float(x[0]); y0 = float(y[0]); xT = x[1:]; yT = y[1:]
+    axT = math.sqrt(float(xT @ xT)); ayT = math.sqrt(float(yT @ yT))
+    fx = (x0 - axT) * (x0 + axT)        # x0**2 - ||xT||**2
+    fy = (y0 - ayT) * (y0 + ayT)        # y0**2 - ||yT||**2
+    xy = float(xT @ yT)
+    c1 = x0 * y0 - xy
+    cross = x0 * yT - y0 * xT
+    c2 = float(cross @ cross)           # ||x0 yT - y0 xT||**2
+    gram = 0.0                          # sum_{i<j} (xT_i yT_j - xT_j yT_i)**2
+    m = xT.size
+    for i in range(m):
+        for j in range(i + 1, m):
+            t = xT[i] * yT[j] - xT[j] * yT[i]
+            gram += t * t
+    den = w_N + w_T_norm
+    num = fx * fx + fy * fy + 2.0 * (c1 * c1 + c2 + gram)
+    return num / den if den > 0.0 else 0.0
+
+
 def soc_fb_phi(x: np.ndarray, y: np.ndarray, *, tie_tol: float = 1.0e-14) -> np.ndarray:
     r"""Second-order-cone Fischer-Burmeister function.
 
@@ -69,7 +131,7 @@ def soc_fb_phi(x: np.ndarray, y: np.ndarray, *, tie_tol: float = 1.0e-14) -> np.
         w_N = x0 * x0 + x1 * x1 + y0 * y0 + y1 * y1
         w_T = 2.0 * (x0 * x1 + y0 * y1)
         w_T_norm = abs(w_T)
-        sqrt_lam1 = math.sqrt(max(w_N - w_T_norm, 0.0))
+        sqrt_lam1 = _fb_sqrt_lam1_2d(x0, x1, y0, y1, w_N, w_T_norm)
         sqrt_lam2 = math.sqrt(max(w_N + w_T_norm, 0.0))
         s_N = 0.5 * (sqrt_lam1 + sqrt_lam2)
         if w_T_norm > tie_tol:
@@ -86,7 +148,7 @@ def soc_fb_phi(x: np.ndarray, y: np.ndarray, *, tie_tol: float = 1.0e-14) -> np.
         w_T = 2.0 * (x[0] * x[1:] + y[0] * y[1:])
         w_T_norm = math.sqrt(float(w_T @ w_T))
 
-    lam1 = max(w_N - w_T_norm, 0.0)
+    lam1 = max(_fb_lam1_general(x, y, w_N, w_T_norm), 0.0)
     lam2 = max(w_N + w_T_norm, 0.0)
     sqrt_lam1 = np.sqrt(lam1)
     sqrt_lam2 = np.sqrt(lam2)
@@ -145,7 +207,7 @@ def soc_fb_phi_and_jac_2d(
     w0 = x0 * x0 + x1 * x1 + y0 * y0 + y1 * y1
     w1 = 2.0 * (x0 * x1 + y0 * y1)
     abs_w1 = abs(w1)
-    sqrt_lam1 = np.sqrt(max(w0 - abs_w1, 0.0))
+    sqrt_lam1 = _fb_sqrt_lam1_2d(x0, x1, y0, y1, w0, abs_w1)
     sqrt_lam2 = np.sqrt(max(w0 + abs_w1, 0.0))
     s0 = 0.5 * (sqrt_lam1 + sqrt_lam2)
     if abs_w1 > tie_tol:

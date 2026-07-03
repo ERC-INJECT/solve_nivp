@@ -251,7 +251,13 @@ class MoreauJeanFremondStepper:
     contact_petsc_reuse_steps: int = 1
     contact_linear_solver: str = "auto"
     contact_ssn_tol: float = 1.0e-10
-    contact_ssn_max_iter: int = 30
+    # Cap on semismooth-Newton iterations for the cone solve.  Near a marginal
+    # stick/slip boundary the SOCCP is only weakly semismooth and convergence to
+    # contact_ssn_tol can need ~50-100 iterations; a cap of 30 stalls there just
+    # short of tol, which the adaptive driver sees as a step failure -> spurious
+    # rejection -> h collapse.  Easy steps break early on the residual, so the
+    # higher cap only does extra work where it prevents that collapse.
+    contact_ssn_max_iter: int = 100
     contact_ssn_line_search: bool = True
     contact_allow_nonconverged: bool = False
 
@@ -668,7 +674,7 @@ class MoreauJeanFremondStepper:
             raise ValueError(f"contact_soc_rho must be finite and positive (got {val})")
         return float(np.clip(val, self.contact_soc_rho_min, self.contact_soc_rho_max))
 
-    def _contact_block_transforms(self, mu_vec: np.ndarray) -> list:
+    def _contact_block_transforms(self, mu_vec: np.ndarray, block_slices=None) -> list:
         """Per-block mu-scaled cone transforms (t_x, t_y, t_y_inv).
 
         ``None`` marks blocks handled by the scalar branch (d == 1 or
@@ -679,9 +685,15 @@ class MoreauJeanFremondStepper:
         are diagonal, so each is stored as its diagonal vector and applied by
         broadcasting -- this avoids the per-block 2x2/3x3 matmul overhead in
         the residual/Jacobian loop.
+
+        ``block_slices`` overrides ``self.block_slices`` so an active subset of
+        contacts (gap index set) can be solved as a self-contained reduced
+        problem; it defaults to all blocks.
         """
+        if block_slices is None:
+            block_slices = self.block_slices
         transforms = []
-        for k, sl in enumerate(self.block_slices):
+        for k, sl in enumerate(block_slices):
             d = sl.stop - sl.start
             mu = float(mu_vec[k])
             if d == 1 or mu <= 1.0e-14:
@@ -706,7 +718,10 @@ class MoreauJeanFremondStepper:
         *,
         want_jacobian: bool,
         transforms: Optional[list] = None,
+        block_slices=None,
     ):
+        if block_slices is None:
+            block_slices = self.block_slices
         n_react = b.size
         p = np.asarray(p, dtype=float).ravel()
         use_soc_natural_map = self.contact_residual == "soc_projection"
@@ -721,9 +736,9 @@ class MoreauJeanFremondStepper:
             and not use_soc_natural_map
             and shift_params is not None
             and n_react > 0
-            and self.block_slices
+            and block_slices
         ):
-            dims = [sl.stop - sl.start for sl in self.block_slices]
+            dims = [sl.stop - sl.start for sl in block_slices]
             if all(dd == dims[0] for dd in dims):
                 W_c = np.ascontiguousarray(
                     W.toarray() if sp.issparse(W) else W, dtype=float
@@ -747,10 +762,10 @@ class MoreauJeanFremondStepper:
         residual = np.zeros(n_react, dtype=float)
         jac = np.zeros((n_react, n_react), dtype=float) if want_jacobian else None
         if transforms is None:
-            transforms = self._contact_block_transforms(mu_vec)
+            transforms = self._contact_block_transforms(mu_vec, block_slices)
         shift_jacobian = getattr(shift_fn, "jacobian", None)
 
-        for k, sl in enumerate(self.block_slices):
+        for k, sl in enumerate(block_slices):
             u = np.asarray(u_full[sl], dtype=float)
             p_block = np.asarray(p[sl], dtype=float)
             d = p_block.size
@@ -844,15 +859,22 @@ class MoreauJeanFremondStepper:
         mu_vec: np.ndarray,
         shift_fn,
         p0: np.ndarray,
+        block_slices=None,
     ) -> tuple[np.ndarray, SocppPgsInfo, dict]:
-        """Global reduced SOCCP semismooth Newton with PETSc linear solves."""
+        """Global reduced SOCCP semismooth Newton with PETSc linear solves.
+
+        ``block_slices`` (default all) lets the caller pass only the active
+        contacts (gap index set) as a self-contained reduced problem.
+        """
+        if block_slices is None:
+            block_slices = self.block_slices
         if sp.issparse(W):
             W_dense = np.asarray(W.toarray(), dtype=float)
         else:
             W_dense = np.asarray(W, dtype=float)
         b = np.asarray(b, dtype=float).ravel()
         p = np.asarray(p0, dtype=float).copy()
-        transforms = self._contact_block_transforms(mu_vec)
+        transforms = self._contact_block_transforms(mu_vec, block_slices)
         linear_backend = (
             "dense"
             if self.contact_linear_solver == "dense"
@@ -867,7 +889,7 @@ class MoreauJeanFremondStepper:
         for it in range(max(1, self.contact_ssn_max_iter)):
             F, J, _u = self._contact_ssn_residual_jacobian(
                 p, W_dense, b, mu_vec, shift_fn, want_jacobian=True,
-                transforms=transforms,
+                transforms=transforms, block_slices=block_slices,
             )
             residual_norm = float(np.linalg.norm(F))
             iters = it + 1
@@ -884,6 +906,7 @@ class MoreauJeanFremondStepper:
                     F_trial, _, _ = self._contact_ssn_residual_jacobian(
                         p_trial, W_dense, b, mu_vec, shift_fn,
                         want_jacobian=False, transforms=transforms,
+                        block_slices=block_slices,
                     )
                     trial_norm = float(np.linalg.norm(F_trial))
                     if np.isfinite(trial_norm) and trial_norm <= (1.0 - 1.0e-4 * alpha) * residual_norm:
@@ -896,6 +919,7 @@ class MoreauJeanFremondStepper:
                     F_trial, _, _ = self._contact_ssn_residual_jacobian(
                         p_trial, W_dense, b, mu_vec, shift_fn,
                         want_jacobian=False, transforms=transforms,
+                        block_slices=block_slices,
                     )
                     if np.all(np.isfinite(F_trial)):
                         p = p_trial
@@ -906,7 +930,7 @@ class MoreauJeanFremondStepper:
 
         F_final, _, u_full = self._contact_ssn_residual_jacobian(
             p, W_dense, b, mu_vec, shift_fn, want_jacobian=False,
-            transforms=transforms,
+            transforms=transforms, block_slices=block_slices,
         )
         residual_norm = float(np.linalg.norm(F_final))
         converged = converged or residual_norm < self.contact_ssn_tol
@@ -925,7 +949,7 @@ class MoreauJeanFremondStepper:
         )
         info.regime = [
             _classify_regime(p[sl], u_full[sl], float(mu_vec[k]), tol=self.contact_ssn_tol)
-            for k, sl in enumerate(self.block_slices)
+            for k, sl in enumerate(block_slices)
         ]
         diag = {
             "contact_solver": "petsc_ssn",
@@ -1050,6 +1074,60 @@ def _build_dense_row_woodbury(op_csr, rows):
     return {"lu": lu, "W": W, "V": V, "Cinv": Cinv}
 
 
+def _build_lowrank_woodbury(op_sparse_csr, U, V, coef):
+    """Prefactor ``op = op_sparse + coef * U V^T`` for a Sherman-Morrison-Woodbury solve.
+
+    Unlike :func:`_build_dense_row_woodbury` (which peels dense *rows* of a single
+    operator and is therefore rank = number of dense rows), this takes the rank-k
+    update factors ``U, V`` directly, so a globally low-rank feedback term costs
+    only its true rank.  ``op_sparse`` is the operator built from the *sparse*
+    Jacobian (the caller arranges for ``rhs_jac`` to omit the ``-U V^T`` term);
+    the factorization is exact.  Returns ``None`` (caller falls back to plain LU)
+    if ``op_sparse`` is singular or the capacitance is.
+    """
+    U = np.asarray(U, dtype=float); V = np.asarray(V, dtype=float)
+    if U.ndim == 1: U = U[:, None]
+    if V.ndim == 1: V = V[:, None]
+    k = U.shape[1]
+    try:
+        lu = spla.splu(op_sparse_csr.tocsc())
+        W = np.asarray(lu.solve(float(coef) * U)).reshape(U.shape[0], k)
+        Cinv = np.linalg.inv(np.eye(k) + V.T @ W)
+    except (RuntimeError, ValueError, np.linalg.LinAlgError):
+        return None
+    return {"lu": lu, "W": W, "V": V, "Cinv": Cinv}
+
+
+def _solve_unilateral_lcp(M, q, *, tol=1.0e-14, max_iter=200):
+    """Projected Gauss-Seidel for the symmetric LCP ``0 <= q + M nu _|_ nu >= 0``.
+
+    Used only for the small (n_contacts x n_contacts) *position projection* problem
+    of the combined scheme -- a pure unilateral (no friction) complementarity over
+    the normal gaps, so ``M = G B^{-1} G^T`` is symmetric PSD and PGS converges.
+    Non-penetrating contacts (``q_i >= 0``) get ``nu_i = 0`` by complementarity, so
+    passing the broad index set (all contacts) is safe.
+    """
+    q = np.asarray(q, dtype=float).ravel()
+    n = q.size
+    nu = np.zeros(n, dtype=float)
+    if n == 0:
+        return nu
+    M = np.asarray(M, dtype=float)
+    d = np.diag(M).copy()
+    d[d <= 0.0] = 1.0
+    for _ in range(max_iter):
+        err = 0.0
+        for i in range(n):
+            ri = q[i] + float(M[i] @ nu) - M[i, i] * nu[i]
+            ni = -ri / d[i]
+            ni = ni if ni > 0.0 else 0.0
+            err = max(err, abs(ni - nu[i]))
+            nu[i] = ni
+        if err < tol:
+            break
+    return nu
+
+
 class _ThetaFactorization:
     """One factorization (or preconditioned iterative solve) of the theta operator.
 
@@ -1072,14 +1150,30 @@ class _ThetaFactorization:
     """
 
     def __init__(self, op, backend: str, petsc_options: Optional[dict] = None,
-                 dense_rows=None):
+                 dense_rows=None, lowrank=None):
         self.backend = str(backend or "scipy").lower()
         op_csr = op.tocsr() if sp.issparse(op) else sp.csr_matrix(op)
         self.shape = op_csr.shape
-        # Sherman-Morrison-Woodbury fast path for a sparse operator with a few
-        # dense (feedback-gain) rows; direct-LU backend only.
+        # Sherman-Morrison-Woodbury fast path for a sparse operator plus a
+        # low-rank feedback update; direct-LU backend only.  An explicit
+        # ``lowrank=(U, V, coef)`` (op = op_sparse + coef U V^T) costs only the
+        # true rank; ``dense_rows`` peels dense rows (rank = #rows).
         self._wb = None
-        if (self.backend == "scipy" and dense_rows is not None
+        if lowrank is not None and self.backend != "scipy":
+            # ``op`` here is op_sparse (the feedback term lives in U V^T, not in
+            # the matrix); only the scipy Woodbury path reconstructs the full op.
+            raise ValueError("theta_lowrank_jac requires theta_linear_solver='scipy'")
+        if self.backend == "scipy" and lowrank is not None:
+            U_lr, V_lr, coef_lr = lowrank
+            self._wb = _build_lowrank_woodbury(op_csr, U_lr, V_lr, coef_lr)
+            if self._wb is None:
+                # op here is op_sparse, so a plain LU would silently solve the
+                # WRONG operator (feedback dropped) -- fail loudly instead.
+                raise RuntimeError(
+                    "theta_lowrank_jac: the sparse theta operator is singular; "
+                    "cannot form the Woodbury update"
+                )
+        elif (self.backend == "scipy" and dense_rows is not None
                 and np.atleast_1d(dense_rows).size > 0):
             self._wb = _build_dense_row_woodbury(op_csr, dense_rows)
         if self.backend == "iterative":
@@ -1225,6 +1319,13 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         contact_offset_force: Optional[Any] = None,
         mu_state_callback: Optional[Any] = None,
         dmu_dstate_callback: Optional[Any] = None,
+        gap_callable: Optional[Any] = None,
+        gap_tol: float = 0.0,
+        gap_jac: Optional[Any] = None,
+        combined_projection: bool = False,
+        projection_metric_inv: Optional[Any] = None,
+        projection_tol: float = 1.0e-12,
+        combined_projection_max_iter: int = 3,
         reaction_state_to_reported_scale: Any = 1.0,
         theta: float = 0.5,
         aux_law: Any = "constant",
@@ -1243,8 +1344,9 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         theta_iterative_options: Optional[dict] = None,
         theta_petsc_reuse_steps: int = 1,
         theta_dense_rows: Optional[Any] = None,
+        theta_lowrank_jac: Optional[Any] = None,
         contact_ssn_tol: float = 1.0e-10,
-        contact_ssn_max_iter: int = 30,
+        contact_ssn_max_iter: int = 100,
         contact_ssn_line_search: bool = True,
         contact_allow_nonconverged: bool = False,
     ):
@@ -1257,6 +1359,59 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         self.contact_offset_force = contact_offset_force
         self.mu_state_callback = mu_state_callback
         self.dmu_dstate_callback = dmu_dstate_callback
+        # Geometric activation (gap index set): gap_callable(q_k) -> g_N per contact
+        # keeps contact alpha in the cone problem only while g_alpha(q_k) <= gap_tol,
+        # so the cone can open/close contacts (cf. Acary & Collins-Craft 2025, Eq. 19,
+        # less the u_{N,k}<=0 term, which would flicker a persistent contact whose
+        # normal velocity vibrates around 0).  The gap must be scaled consistently
+        # with D_extract, i.e. d g_alpha/dt = u_{N,alpha}.  For a PERSISTENT contact
+        # held exactly at g=0 (e.g. a prestressed fault, gap ~ 1e-10 numerical noise),
+        # set gap_tol to a small margin above that noise (e.g. 1e-6) so it stays
+        # active; for a genuinely separating contact (a bouncing ball, gap ~ O(1))
+        # use gap_tol=0.  Default gap_callable=None => persistent contact, unchanged.
+        self.gap_callable = gap_callable
+        self.gap_tol = float(gap_tol)
+        if gap_callable is not None and mu_state_callback is not None:
+            raise NotImplementedError(
+                "gap_callable is not yet supported together with mu_state_callback "
+                "(the state-mu coupled SSN path); use the outer mu fixed point "
+                "(mu_from_state in solve_mjf_adaptive) instead."
+            )
+        # Combined projection (GGL position admissibility, cf. Acary 2013
+        # "Projected event-capturing time-stepping schemes" + Siconos
+        # MoreauJeanCombinedProjectionOSi).  This is a thin wrapper *around* the
+        # Fremond velocity law, NOT a replacement: the velocity SOCCP still gives
+        # the physical contact impulse p; an additional projection then nudges the
+        # END-of-step position so g(q_{k+1}) >= 0, using a separate projection
+        # multiplier nu that is NEVER treated as a contact impulse and NEVER turned
+        # into a rebound velocity.  This fixes gap drift / penetration without the
+        # spurious kinetic energy that the naive  u_N + g/h  correction injects
+        # (which made the inelastic ball bounce).  Opt-in; default off => the path
+        # below is byte-for-byte the validated velocity-only scheme.
+        self.combined_projection = bool(combined_projection)
+        self.gap_jac = gap_jac
+        self.projection_metric_inv = projection_metric_inv
+        self.projection_tol = float(projection_tol)
+        self.combined_projection_max_iter = max(1, int(combined_projection_max_iter))
+        if self.combined_projection:
+            if self.gap_callable is None:
+                raise ValueError(
+                    "combined_projection=True requires gap_callable (the normal gap "
+                    "g(q) per contact, scaled consistently with D_extract so that "
+                    "dg/dt = u_N)."
+                )
+            if self.gap_jac is None:
+                raise ValueError(
+                    "combined_projection=True requires gap_jac: the gap Jacobian "
+                    "dg/dy, an (n_contacts x n_state) array/sparse matrix or a "
+                    "callable(y, t) returning one.  For a linear gap g = G y it is "
+                    "the constant matrix G."
+                )
+            if mu_state_callback is not None:
+                raise NotImplementedError(
+                    "combined_projection is not yet supported with mu_state_callback; "
+                    "use the outer mu fixed point (mu_from_state in solve_mjf_adaptive)."
+                )
         self.theta = float(theta)
         if self.theta <= 0.0:
             raise ValueError("theta must be positive")
@@ -1365,6 +1520,26 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         else:
             rows = np.unique(np.asarray(theta_dense_rows, dtype=int).ravel())
             self.theta_dense_rows = rows if rows.size else None
+        # Explicit low-rank Jacobian term: the true Jacobian is
+        # ``rhs_jac(t, y) - U @ V.T`` (rhs_jac returns the genuinely sparse part).
+        # Since ``op = (1/theta) A - h J``, the operator is ``op_sparse + h U V^T``,
+        # a rank-k Woodbury update -- exact, and far cheaper than dense feedback
+        # rows when a dense gain (e.g. full-state LQR/observer feedback fed through
+        # a sparse input column) is globally low rank.  Mutually exclusive with
+        # theta_dense_rows (this takes precedence).
+        if theta_lowrank_jac is None:
+            self.theta_lowrank_jac = None
+        else:
+            U, V = theta_lowrank_jac
+            U = np.asarray(U, dtype=float); V = np.asarray(V, dtype=float)
+            if U.ndim == 1: U = U[:, None]
+            if V.ndim == 1: V = V[:, None]
+            if U.shape != V.shape:
+                raise ValueError(
+                    f"theta_lowrank_jac U and V must have the same shape; got {U.shape} vs {V.shape}"
+                )
+            self.theta_lowrank_jac = (U, V)
+            self.theta_dense_rows = None
         self.contact_ssn_tol = float(contact_ssn_tol)
         self.contact_ssn_max_iter = int(contact_ssn_max_iter)
         self.contact_ssn_line_search = bool(contact_ssn_line_search)
@@ -1522,6 +1697,16 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         op, rhs_base = self._build_theta_system(t, y, h)
         op = op.tocsr() if sp.issparse(op) else sp.csr_matrix(op)
 
+        # Explicit low-rank Jacobian: rhs_jac (hence ``op`` and the affine RHS
+        # built in _build_theta_system) omits the ``-U V^T`` feedback term.  The
+        # Woodbury solve restores it in the operator; restore it in the predictor
+        # RHS too, so both linearize about the SAME J: the affine term needs
+        # ``f - J_full y`` rather than ``f - J_sparse y``, i.e. ``+ h U V^T y``.
+        if self.theta_lowrank_jac is not None:
+            U_lr, V_lr = self.theta_lowrank_jac
+            yv = np.asarray(y, dtype=float).ravel()
+            rhs_base = rhs_base + float(h) * (U_lr @ (V_lr.T @ yv))
+
         # Cross-step reuse: for a fixed-step, constant (affine) operator the
         # theta-matrix is byte-identical across steps -- only the predictor RHS
         # depends on y/t.  Reuse the factorization + Delassus block whenever the
@@ -1553,13 +1738,17 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         # operator changed -> (re)factorize and rebuild the Delassus block
         if cache is not None and cache.get("fac") is not None:
             cache["fac"].destroy()
+        lowrank = None
+        if self.theta_lowrank_jac is not None:
+            U_lr, V_lr = self.theta_lowrank_jac
+            lowrank = (U_lr, V_lr, float(h))     # op = op_sparse + h U V^T
         if self.theta_linear_solver == "iterative":
             fac = _ThetaFactorization(op, "iterative", self.theta_iterative_options,
-                                      dense_rows=self.theta_dense_rows)
+                                      dense_rows=self.theta_dense_rows, lowrank=lowrank)
         else:
             backend = "petsc" if self.theta_linear_solver == "petsc" else "scipy"
             fac = _ThetaFactorization(op, backend, self.theta_petsc_options,
-                                      dense_rows=self.theta_dense_rows)
+                                      dense_rows=self.theta_dense_rows, lowrank=lowrank)
         z_pred = fac.solve(rhs_base)
         entry = {
             "t": float(t),
@@ -1818,6 +2007,194 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         }
         return p, info, diag, mu_vec.copy()
 
+    def _solve_contact_active_subset(
+        self, active_blocks, W, b_soccp, offset_impulse, p0_eff, mu_vec, u_N_old,
+    ):
+        """Solve the SOCCP over only the active contacts (gap index set).
+
+        ``active_blocks`` is the list of active contact indices.  The reduced
+        problem is built by slicing the cached full Delassus ``W`` and the
+        predictor velocity, re-basing the block slices contiguously; inactive
+        contacts get ``p_contact = 0`` (i.e. ``p_effective = offset``) and are
+        dropped from the prestress offset so they do not couple into the active
+        rows.  Returns a FULL-length ``p_effective`` plus the SOCCP info/diag.
+        """
+        ab = np.asarray(active_blocks, dtype=int)
+        act_idx = np.concatenate([
+            np.arange(self.block_slices[k].start, self.block_slices[k].stop)
+            for k in ab
+        ]).astype(int)
+        red_slices = []
+        off = 0
+        for k in ab:
+            d = self.block_slices[k].stop - self.block_slices[k].start
+            red_slices.append(slice(off, off + d))
+            off += d
+        Wm = W.toarray() if sp.issparse(W) else np.asarray(W, dtype=float)
+        # inactive contacts carry no holding reaction -> zero their prestress
+        offset_active = np.zeros_like(offset_impulse)
+        offset_active[act_idx] = offset_impulse[act_idx]
+        b_eff_full = np.asarray(b_soccp, dtype=float) - Wm @ offset_active
+        W_a = Wm[np.ix_(act_idx, act_idx)]
+        b_a = b_eff_full[act_idx]
+        mu_a = np.asarray(mu_vec, dtype=float)[ab]
+        eN_a = np.asarray(self.e_N_vec, dtype=float)[ab]
+        uN_a = np.asarray(u_N_old, dtype=float)[ab]
+        p0_a = np.asarray(p0_eff, dtype=float)[act_idx]
+        shift_a = fremond_shift_factory(mu_a, eN_a, uN_a, theta=self.theta)
+        if self.contact_solver == "pgs":
+            p_a, soccp_info = soccp_pgs(
+                W_a, b_a, red_slices, mu_a, shift_fn=shift_a, p0=p0_a,
+                max_outer=300, max_inner=30, tol_outer=self.contact_ssn_tol,
+                return_info=True,
+            )
+            contact_diag = {}
+        else:
+            p_a, soccp_info, contact_diag = self._solve_contact_petsc_ssn(
+                W_a, b_a, mu_a, shift_a, p0_a, block_slices=red_slices,
+            )
+        p_effective = np.asarray(offset_impulse, dtype=float).copy()
+        p_effective[act_idx] = p_a
+        # report the regime full-length: inactive contacts -> "inactive"
+        red_regime = getattr(soccp_info, "regime", None)
+        full_regime = ["inactive"] * self.n_contacts
+        if red_regime is not None:
+            for j, k in enumerate(ab):
+                if j < len(red_regime):
+                    full_regime[int(k)] = red_regime[j]
+        soccp_info.regime = full_regime
+        contact_diag = dict(contact_diag)
+        contact_diag["active_contacts"] = [int(k) for k in ab]
+        return p_effective, soccp_info, contact_diag
+
+    # ------------------------------------------------------------------
+    # Velocity solve / geometric activation / position projection helpers
+    # (factored so the combined-projection outer loop can re-run the
+    #  velocity solve under an updated active set; with combined_projection
+    #  off these are each called exactly once and reproduce the original
+    #  single-pass path byte-for-byte.)
+    # ------------------------------------------------------------------
+    def _gap_value(self, y_state: np.ndarray, t_gap: float) -> np.ndarray:
+        g = np.asarray(
+            self._call_optional_state_fn(self.gap_callable, y_state, t_gap),
+            dtype=float,
+        ).ravel()
+        if g.size != self.n_contacts:
+            raise ValueError(
+                f"gap_callable returned {g.size} gaps; expected {self.n_contacts}"
+            )
+        return g
+
+    def _geometric_active_blocks(self, y_state: np.ndarray, t_gap: float):
+        """Gap index set Ibar1_k at ``y_state``: None (all active) or the active
+        indices.  Pure geometric activation g(q) <= gap_tol (Eq. 19 less the
+        u_{N,k}<=0 term -- see __init__)."""
+        if self.gap_callable is None:
+            return None
+        active_mask = (self._gap_value(y_state, t_gap) <= self.gap_tol)
+        if bool(active_mask.all()):
+            return None
+        return np.flatnonzero(active_mask)
+
+    def _velocity_solve_given_active(
+        self, active_blocks, W, b_soccp, b_eff, offset_impulse, p0_eff,
+        mu_vec, u_N_old,
+    ):
+        """Fremond velocity SOCCP for a given active set (None => all contacts)."""
+        if active_blocks is None:
+            shift_fn = fremond_shift_factory(
+                mu_vec, self.e_N_vec, u_N_old, theta=self.theta,
+            )
+            if self.contact_solver == "pgs":
+                p_effective, soccp_info = soccp_pgs(
+                    W, b_eff, self.block_slices, mu_vec,
+                    shift_fn=shift_fn, p0=p0_eff,
+                    max_outer=300, max_inner=30, tol_outer=self.contact_ssn_tol,
+                    return_info=True,
+                )
+                contact_diag = {}
+            else:
+                p_effective, soccp_info, contact_diag = self._solve_contact_petsc_ssn(
+                    W, b_eff, mu_vec, shift_fn, p0_eff,
+                )
+        elif active_blocks.size == 0:
+            p_effective = offset_impulse.copy()
+            soccp_info = SocppPgsInfo(converged=True)
+            soccp_info.regime = ["inactive"] * self.n_contacts
+            contact_diag = {"active_contacts": []}
+        else:
+            p_effective, soccp_info, contact_diag = self._solve_contact_active_subset(
+                active_blocks, W, b_soccp, offset_impulse, p0_eff, mu_vec, u_N_old,
+            )
+        return p_effective, soccp_info, contact_diag
+
+    def _gap_jacobian_at(self, y_state: np.ndarray, t_gap: float) -> np.ndarray:
+        """The normal-gap Jacobian G = dg/dy as a dense (n_contacts x n_state) array."""
+        G = self.gap_jac(y_state, t_gap) if callable(self.gap_jac) else self.gap_jac
+        G = G.toarray() if sp.issparse(G) else np.asarray(G, dtype=float)
+        if G.shape != (self.n_contacts, self.n_state):
+            raise ValueError(
+                f"gap_jac must be ({self.n_contacts}, {self.n_state}); got {G.shape}"
+            )
+        return G
+
+    def _apply_projection_metric_inv(self, M: np.ndarray) -> np.ndarray:
+        """Apply B^{-1} (the projection metric inverse) to the columns of ``M``.
+
+        None => identity, so the correction lives in span(G^T): for a gap that
+        depends only on position DOFs this moves ONLY those DOFs and leaves the
+        velocity DOFs untouched -> no rebound, no kinetic-energy injection."""
+        Minv = self.projection_metric_inv
+        if Minv is None:
+            return M
+        if callable(Minv):
+            return np.asarray(Minv(M), dtype=float)
+        return np.asarray(Minv @ M, dtype=float)
+
+    def _project_position(self, y_new: np.ndarray, t_end: float):
+        """GGL position projection: nudge ``y_new`` so g(q_{k+1}) >= 0.
+
+        Solves the unilateral problem  min 1/2 ||dy||_B^2  s.t.  g + G dy >= 0,
+        i.e.  dy = B^{-1} G^T nu  with  0 <= g + (G B^{-1} G^T) nu _|_ nu >= 0.
+        The multiplier ``nu`` is a *position* projection multiplier, kept entirely
+        separate from the contact impulse ``p`` -- it is never used as a reaction
+        or turned into a velocity.  Re-linearizes for a (possibly) nonlinear gap;
+        for a linear gap it converges in one pass.  Returns (y_proj, diag)."""
+        y_proj = np.asarray(y_new, dtype=float).copy()
+        pen_before = float(min(0.0, self._gap_value(y_proj, t_end).min()))
+        nu_total = np.zeros(self.n_contacts, dtype=float)
+        iters = 0
+        for it in range(self.combined_projection_max_iter):
+            g = self._gap_value(y_proj, t_end)
+            if g.min() >= -self.projection_tol:
+                break
+            G = self._gap_jacobian_at(y_proj, t_end)
+            MinvGT = self._apply_projection_metric_inv(G.T)           # (n_state, n_c)
+            Delassus = G @ MinvGT                                     # (n_c, n_c) SPD
+            nu = _solve_unilateral_lcp(Delassus, g, tol=self.projection_tol)
+            y_proj = y_proj + MinvGT @ nu
+            nu_total += nu
+            iters = it + 1
+        pen_after = float(min(0.0, self._gap_value(y_proj, t_end).min()))
+        diag = {
+            "proj_iters": iters,
+            "proj_penetration_before": pen_before,
+            "proj_penetration_after": pen_after,
+            "proj_multiplier": nu_total,
+            "proj_correction_norm": float(np.linalg.norm(y_proj - y_new)),
+        }
+        return y_proj, diag
+
+    @staticmethod
+    def _same_active_blocks(a, b) -> bool:
+        if a is None and b is None:
+            return True
+        if a is None or b is None:
+            return False
+        a = np.asarray(a, dtype=int).ravel()
+        b = np.asarray(b, dtype=int).ravel()
+        return a.size == b.size and bool(np.all(a == b))
+
     def step(
         self,
         t: float,
@@ -1865,6 +2242,8 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             else:
                 p0_eff = offset_impulse.copy()
             t_theta = float(t) + self.theta * float(h)
+            X_contact = np.asarray(theta_sys["X_contact"], dtype=float)
+            proj_diag = {}
             if self.mu_state_callback is not None:
                 if self.contact_solver != "petsc_ssn":
                     raise ValueError("state-dependent mu currently requires contact_solver='petsc_ssn'")
@@ -1875,6 +2254,14 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
                     offset_impulse=offset_impulse,
                     t_theta=t_theta,
                 )
+                p_contact = p_effective - offset_impulse
+                # z_theta = A^{-1}(rhs_base + B p_contact) = z_pred + X_contact p_contact
+                # by linearity, since z_pred = A^{-1} rhs_base and X_contact = A^{-1} B
+                # are already cached -- avoids a full theta-operator back-substitution
+                # on every (mu fixed-point) step() call.
+                z_theta = z_pred + X_contact @ p_contact
+                y_new = y + (z_theta - y) / self.theta
+                mu_vec = self._mu_from_theta_state(z_theta, t_theta)
             else:
                 mu_vec = np.asarray(aux.get("mu", self.mu_init), dtype=float).ravel()
                 if mu_vec.size != self.n_contacts:
@@ -1882,31 +2269,45 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
                         f"aux['mu'] has {mu_vec.size} entries; expected {self.n_contacts}"
                     )
                 u_N_old = np.array([u_old[sl.start] for sl in self.block_slices])
-                shift_fn = fremond_shift_factory(
-                    mu_vec, self.e_N_vec, u_N_old, theta=self.theta,
-                )
-                if self.contact_solver == "pgs":
-                    p_effective, soccp_info = soccp_pgs(
-                        W, b_eff, self.block_slices, mu_vec,
-                        shift_fn=shift_fn, p0=p0_eff,
-                        max_outer=300, max_inner=30, tol_outer=self.contact_ssn_tol,
-                        return_info=True,
+                # Geometric activation: gap index set Ibar1_k (Eq. 19), decided at
+                # the OLD position q_k = y.  gap_callable is None -> every contact
+                # active (persistent contact).  When combined_projection is OFF the
+                # loop runs exactly once and is byte-for-byte the original path.
+                active_blocks = self._geometric_active_blocks(y, t_theta)
+                cp_iters = 0
+                cp_converged = not self.combined_projection
+                for _cp_it in range(self.combined_projection_max_iter):
+                    cp_iters = _cp_it + 1
+                    p_effective, soccp_info, contact_diag = self._velocity_solve_given_active(
+                        active_blocks, W, b_soccp, b_eff, offset_impulse, p0_eff,
+                        mu_vec, u_N_old,
                     )
-                    contact_diag = {}
-                else:
-                    p_effective, soccp_info, contact_diag = self._solve_contact_petsc_ssn(
-                        W, b_eff, mu_vec, shift_fn, p0_eff,
+                    p_contact = p_effective - offset_impulse
+                    z_theta = z_pred + X_contact @ p_contact
+                    y_new = y + (z_theta - y) / self.theta
+                    if not self.combined_projection:
+                        break
+                    # GGL position projection at the step endpoint, then re-check
+                    # the gap index set there.  Re-solve the velocity problem only
+                    # if the projected position changed which contacts are active
+                    # (the "combined" coupling); otherwise accept the projected y.
+                    y_proj, proj_diag = self._project_position(
+                        y_new, float(t) + float(h),
                     )
-            p_contact = p_effective - offset_impulse
+                    new_blocks = self._geometric_active_blocks(
+                        y_proj, float(t) + float(h),
+                    )
+                    y_new = y_proj
+                    if self._same_active_blocks(new_blocks, active_blocks):
+                        cp_converged = True
+                        break
+                    active_blocks = new_blocks
+                if self.combined_projection:
+                    proj_diag = dict(proj_diag)
+                    proj_diag["combined_proj_iters"] = cp_iters
+                    proj_diag["combined_proj_converged"] = bool(cp_converged)
             self._last_p_eff = np.asarray(p_effective, dtype=float).copy()
             self._last_call_key = (float(t), y.copy(), float(h))
-            # z_theta = A^{-1}(rhs_base + B p_contact) = z_pred + X_contact p_contact
-            # by linearity, since z_pred = A^{-1} rhs_base and X_contact = A^{-1} B
-            # are already cached -- avoids a full theta-operator back-substitution
-            # on every (mu fixed-point) step() call.
-            z_theta = z_pred + np.asarray(theta_sys["X_contact"], dtype=float) @ p_contact
-            if self.mu_state_callback is not None:
-                mu_vec = self._mu_from_theta_state(z_theta, t_theta)
         else:
             p_contact = np.zeros(0, dtype=float)
             p_effective = p_contact.copy()
@@ -1914,8 +2315,8 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             soccp_info = SocppPgsInfo(converged=True)
             contact_diag = {}
             z_theta = z_pred
-
-        y_new = y + (z_theta - y) / self.theta
+            proj_diag = {}
+            y_new = y + (z_theta - y) / self.theta
         u_theta = (
             np.asarray(self.D_contact @ z_theta, dtype=float).ravel()
             if self.n_react else np.zeros(0, dtype=float)
@@ -1945,6 +2346,8 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             ),
         }
         info.update(contact_diag)
+        if proj_diag:
+            info.update(proj_diag)
         return y_new, aux_new, info
 
 
@@ -2193,7 +2596,7 @@ def build_moreau_jean_fremond(
     contact_petsc_reuse_steps: int = 1,
     contact_linear_solver: str = "auto",
     contact_ssn_tol: float = 1.0e-10,
-    contact_ssn_max_iter: int = 30,
+    contact_ssn_max_iter: int = 100,
     contact_ssn_line_search: bool = True,
     contact_allow_nonconverged: bool = False,
 ) -> tuple[MoreauJeanFremondStepper, dict]:
