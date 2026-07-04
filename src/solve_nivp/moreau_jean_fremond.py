@@ -2489,7 +2489,10 @@ def solve_mjf_adaptive(
     h_try = min(float(h0), float(h_max), t_end - t0)
     attempts = 0
     last_exc = None
-    while t_hist[-1] < t_end - 10.0 * np.finfo(float).eps:
+    # Scaled by |t_end| so accumulated t drift near a large horizon still counts
+    # as "arrived" (an absolute 10*eps is far below one ULP of t_end ~ 1e2).
+    _end_eps = 10.0 * np.finfo(float).eps * max(abs(t_end), 1.0)
+    while t_hist[-1] < t_end - _end_eps:
         if attempts >= int(max_attempts):
             raise RuntimeError(
                 f"adaptive MJF loop exceeded {max_attempts} attempts"
@@ -2498,6 +2501,14 @@ def solve_mjf_adaptive(
         t_k = float(t_hist[-1])
         h_k = min(float(h_try), t_end - t_k, float(h_max))
         h_k = max(h_k, min(float(h_min), t_end - t_k))
+        # Horizon-snap: if a full step would leave only a sub-step sliver before
+        # t_end (float drift), fold it into this step so the next iteration does
+        # not take a degenerate micro-step.  MJF works in impulses (h*force), so a
+        # micro final step (h ~ 1e-13) makes the reported reaction ~ impulse/h
+        # blow up (garbage final row) and can stall the cone solve.
+        _rem = (t_end - t_k) - h_k
+        if 0.0 < _rem < 1.0e-3 * h_k:
+            h_k = t_end - t_k
         aux_start = _copy_aux(aux_k)
         try:
             y_full, _aux_full, _info_full = _step_with_mu(t_k, y_k, aux_start, h_k)

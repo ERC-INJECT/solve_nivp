@@ -177,6 +177,13 @@ class ODESolver:
         # the implicit Jacobian A/(γh) explode and the nonlinear solver
         # fail, falsely reporting "reached minimum step size".
         _tf_eps = 4.0 * np.finfo(float).eps * max(abs(self.t0), abs(self.tf), 1.0)
+        # Horizon-snap fraction: if a full step would leave only a sliver smaller
+        # than this fraction of the step before tf, fold the sliver into that step
+        # (land tf exactly) instead of appending a degenerate micro-step.  The
+        # accumulated ``t += h_step`` drift after N steps is ~N*eps*tf, which can
+        # far exceed _tf_eps, so relying on _tf_eps alone still lets a micro-step
+        # through (e.g. tf=10, h=0.02 lands ~1e-13 short and appends h~1e-13).
+        _snap_frac = 1.0e-3
 
         # Helper to record a stored sample (handles store_fk + fk fallback).
         def _record(t_store, y, fk_val, h_taken, errinfo):
@@ -210,6 +217,15 @@ class ODESolver:
                 next_te = float(self._t_eval[self._t_eval_idx])
                 if next_te > t:
                     h_step = min(h_step, next_te - t)
+            # Land the horizon exactly: if taking this step would leave only a
+            # sub-step sliver before tf (float drift, not a wanted fractional
+            # step), fold it into this step rather than appending a degenerate
+            # micro-step next iteration.  A micro-step (h ~ 1e-13) makes an
+            # impulse/reaction-based stepper (reaction ~ impulse/h) blow up and
+            # the nonlinear cone solve stall.  Fractional final steps that are a
+            # real fraction of h (>= _snap_frac*h) are left untouched.
+            if 0.0 < (self.tf - t) - h_step < _snap_frac * h:
+                h_step = self.tf - t
             if self.system.adaptive:
                 # Adaptive stepping returns:
                 # (y_new, fk_new, h_new, E, success, solver_error, iterations)

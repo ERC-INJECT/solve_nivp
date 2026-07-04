@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
 project = 'solve_nivp'
 copyright = '2025, David Riley'
 author = 'David Riley'
-release = '0.2.0.dev1'
+release = '0.2.1.dev2'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
