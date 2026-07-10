@@ -34,6 +34,7 @@ contact dynamics."  HAL-04230941.
 
 from __future__ import annotations
 
+import collections
 import inspect as _inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -57,10 +58,12 @@ try:
     from ._numba_accel import (
         NUMBA_AVAILABLE as _NUMBA_OK,
         soc_fb_ssn_assemble as _soc_fb_assemble_nb,
+        soc_fb_ssn_assemble_state_mu as _soc_fb_assemble_state_mu_nb,
     )
 except Exception:  # pragma: no cover - numba is an optional dependency
     _NUMBA_OK = False
     _soc_fb_assemble_nb = None
+    _soc_fb_assemble_state_mu_nb = None
 from .solvers.nonlinear_solvers import ImplicitEquationSolver, PETSC_AVAILABLE
 
 
@@ -1074,28 +1077,28 @@ def _build_dense_row_woodbury(op_csr, rows):
     return {"lu": lu, "W": W, "V": V, "Cinv": Cinv}
 
 
-def _build_lowrank_woodbury(op_sparse_csr, U, V, coef):
-    """Prefactor ``op = op_sparse + coef * U V^T`` for a Sherman-Morrison-Woodbury solve.
+def _build_lowrank_woodbury_from_solves(solve_multi_fn, U, V, coef):
+    """Capacitance data for ``op = op_sparse + coef U V^T`` given a raw multi-RHS
+    solve against ``op_sparse``.
 
-    Unlike :func:`_build_dense_row_woodbury` (which peels dense *rows* of a single
-    operator and is therefore rank = number of dense rows), this takes the rank-k
-    update factors ``U, V`` directly, so a globally low-rank feedback term costs
-    only its true rank.  ``op_sparse`` is the operator built from the *sparse*
-    Jacobian (the caller arranges for ``rhs_jac`` to omit the ``-U V^T`` term);
-    the factorization is exact.  Returns ``None`` (caller falls back to plain LU)
-    if ``op_sparse`` is singular or the capacitance is.
+    Backend-agnostic: the caller supplies ``solve_multi_fn`` (a scipy ``splu``
+    back-substitution or a PETSc/MUMPS ``matSolve``) so the exact Sherman-
+    Morrison-Woodbury update works under either direct backend.  ``op_sparse`` is
+    the operator built from the *sparse* Jacobian (the caller arranges for
+    ``rhs_jac`` to omit the ``-U V^T`` term); the correction is exact.  Returns
+    ``None`` (caller falls back to plain LU) if ``op_sparse`` is singular or the
+    capacitance ``I + V^T op_sparse^{-1} (coef U)`` is.
     """
     U = np.asarray(U, dtype=float); V = np.asarray(V, dtype=float)
     if U.ndim == 1: U = U[:, None]
     if V.ndim == 1: V = V[:, None]
     k = U.shape[1]
     try:
-        lu = spla.splu(op_sparse_csr.tocsc())
-        W = np.asarray(lu.solve(float(coef) * U)).reshape(U.shape[0], k)
+        W = np.asarray(solve_multi_fn(float(coef) * U)).reshape(U.shape[0], k)
         Cinv = np.linalg.inv(np.eye(k) + V.T @ W)
     except (RuntimeError, ValueError, np.linalg.LinAlgError):
         return None
-    return {"lu": lu, "W": W, "V": V, "Cinv": Cinv}
+    return {"W": W, "V": V, "Cinv": Cinv}
 
 
 def _solve_unilateral_lcp(M, q, *, tol=1.0e-14, max_iter=200):
@@ -1128,6 +1131,29 @@ def _solve_unilateral_lcp(M, q, *, tol=1.0e-14, max_iter=200):
     return nu
 
 
+class _LRCPythonCtx:
+    """MATSHELL context ``y = A_sparse x + coef * U (V^T x)``.
+
+    Fallback used by the ``petsc_shell`` backend only when ``Mat.createLRC`` /
+    ``MatDenseCUDA`` is unavailable on the build: ``U``, ``V`` stay host-side, so
+    each mult adds the rank-k correction on the CPU (a small device<->host
+    round-trip when ``A_sparse`` lives on the GPU).  Implements only ``mult``,
+    which is all a right-preconditioned GMRES/FGMRES needs.
+    """
+
+    def __init__(self, A_sparse, U, V, coef):
+        self._A = A_sparse
+        self._U = np.ascontiguousarray(np.asarray(U, dtype=float))
+        self._V = np.ascontiguousarray(np.asarray(V, dtype=float))
+        self._coef = float(coef)
+
+    def mult(self, mat, x, y):
+        self._A.mult(x, y)                                    # y = A_sparse x
+        xv = np.asarray(x.getArray(readonly=True))
+        yv = np.asarray(y.getArray(readonly=True))
+        y.setArray(yv + self._coef * (self._U @ (self._V.T @ xv)))
+
+
 class _ThetaFactorization:
     """One factorization (or preconditioned iterative solve) of the theta operator.
 
@@ -1155,25 +1181,24 @@ class _ThetaFactorization:
         op_csr = op.tocsr() if sp.issparse(op) else sp.csr_matrix(op)
         self.shape = op_csr.shape
         # Sherman-Morrison-Woodbury fast path for a sparse operator plus a
-        # low-rank feedback update; direct-LU backend only.  An explicit
+        # low-rank feedback update; direct backends only.  An explicit
         # ``lowrank=(U, V, coef)`` (op = op_sparse + coef U V^T) costs only the
         # true rank; ``dense_rows`` peels dense rows (rank = #rows).
         self._wb = None
-        if lowrank is not None and self.backend != "scipy":
-            # ``op`` here is op_sparse (the feedback term lives in U V^T, not in
-            # the matrix); only the scipy Woodbury path reconstructs the full op.
-            raise ValueError("theta_lowrank_jac requires theta_linear_solver='scipy'")
-        if self.backend == "scipy" and lowrank is not None:
-            U_lr, V_lr, coef_lr = lowrank
-            self._wb = _build_lowrank_woodbury(op_csr, U_lr, V_lr, coef_lr)
-            if self._wb is None:
-                # op here is op_sparse, so a plain LU would silently solve the
-                # WRONG operator (feedback dropped) -- fail loudly instead.
-                raise RuntimeError(
-                    "theta_lowrank_jac: the sparse theta operator is singular; "
-                    "cannot form the Woodbury update"
-                )
-        elif (self.backend == "scipy" and dense_rows is not None
+        if lowrank is not None and self.backend == "iterative":
+            # The iterative backend has no exact inner solve, so it cannot form
+            # the Woodbury capacitance ``I + V^T op_sparse^{-1} (coef U)``; a
+            # plain solve of ``op_sparse`` would silently drop the feedback.
+            raise ValueError(
+                "theta_lowrank_jac requires a direct backend "
+                "('scipy' or 'petsc'); the iterative backend has no exact "
+                "inner solve for the Woodbury capacitance")
+        # ``dense_rows`` peeling stays scipy-only and is built up front (it uses
+        # its own peeled-operator LU, kept in ``self._wb['lu']``).  The generic
+        # ``lowrank`` update is built AFTER backend setup (below), so its raw
+        # inner solve can run against the just-created scipy LU or PETSc KSP.
+        if (self.backend == "scipy" and lowrank is None
+                and dense_rows is not None
                 and np.atleast_1d(dense_rows).size > 0):
             self._wb = _build_dense_row_woodbury(op_csr, dense_rows)
         if self.backend == "iterative":
@@ -1219,13 +1244,324 @@ class _ThetaFactorization:
             self._ksp = ksp
             self._x = self._mat.createVecLeft()
             self._b = self._mat.createVecRight()
+        elif self.backend == "petsc_shell":
+            # PETSc KSP whose SYSTEM operator is the TRUE low-rank operator
+            # ``op_sparse + coef U V^T`` (a MATLRC applied inside the Krylov
+            # matvec) while the PRECONDITIONER matrix is ``op_sparse`` alone -- so
+            # the rank-k crack-pressure feedback is absorbed by the iterations and
+            # the converged residual is a true-operator residual (no inexact
+            # Woodbury capacitance).  Never sets ``self._lu`` and never touches the
+            # Woodbury path (see the ``!= 'petsc_shell'`` guard below), so
+            # ``self._wb`` stays ``None``.  Purely additive: no other backend is
+            # reached through this branch.
+            if not PETSC_AVAILABLE:
+                raise RuntimeError(
+                    "theta_linear_solver='petsc_shell' requires petsc4py/PETSc"
+                )
+            if (dense_rows is not None
+                    and np.atleast_1d(dense_rows).size > 0):
+                raise NotImplementedError(
+                    "theta_linear_solver='petsc_shell' does not support "
+                    "theta_dense_rows (dense-row peeling is scipy-only); pass a "
+                    "low-rank (U, V) feedback pair via theta_lowrank_jac instead"
+                )
+            self._init_petsc_shell(op_csr, petsc_options, lowrank)
         elif self._wb is None:
             self._lu = spla.splu(op_csr.tocsc())
+        # Generic low-rank Woodbury update, built now that the backend's raw
+        # inner solve (``self._lu`` for scipy, ``self._ksp`` for petsc) exists.
+        # The ``petsc_shell`` backend is EXCLUDED: it applies the low-rank term
+        # directly inside its Krylov matvec (MATLRC), so forming a Woodbury
+        # capacitance from its INEXACT KSP solves would silently corrupt every
+        # subsequent solve.  ``self._wb`` therefore stays ``None`` for it.
+        if lowrank is not None and self.backend != "petsc_shell":
+            U_lr, V_lr, coef_lr = lowrank
+            self._wb = _build_lowrank_woodbury_from_solves(
+                self._raw_solve_multi, U_lr, V_lr, coef_lr)
+            if self._wb is None:
+                # op here is op_sparse, so a plain solve would silently solve the
+                # WRONG operator (feedback dropped) -- fail loudly instead.
+                raise RuntimeError(
+                    "theta_lowrank_jac: the sparse theta operator is singular; "
+                    "cannot form the Woodbury update")
+
+    def _petsc_solve_vec(self, rhs):
+        """Raw single-RHS PETSc KSP solve against ``op_sparse`` (no Woodbury)."""
+        self._b.setArray(np.asarray(rhs, dtype=float).ravel())
+        self._ksp.solve(self._b, self._x)
+        return np.array(self._x.getArray(readonly=True), copy=True)
+
+    def _petsc_mat_solve(self, RHS):
+        """Raw multi-RHS PETSc solve against ``op_sparse`` via ``matSolve``.
+
+        Falls back to a per-column raw KSP solve (never through ``self.solve``,
+        which would re-enter the Woodbury path) if the dense ``matSolve`` route
+        is unavailable.
+        """
+        PETSc = self._PETSc
+        RHS = np.asarray(RHS, dtype=float)
+        try:
+            B_mat = PETSc.Mat().createDense(
+                size=(RHS.shape[0], RHS.shape[1]),
+                array=np.asfortranarray(RHS), comm=PETSc.COMM_SELF,
+            )
+            B_mat.assemble()
+            X_mat = PETSc.Mat().createDense(
+                size=(RHS.shape[0], RHS.shape[1]), comm=PETSc.COMM_SELF,
+            )
+            X_mat.assemble()
+            self._ksp.matSolve(B_mat, X_mat)
+            X = np.array(X_mat.getDenseArray(), copy=True)
+            B_mat.destroy()
+            X_mat.destroy()
+            return X
+        except Exception:
+            return np.column_stack(
+                [self._petsc_solve_vec(RHS[:, j]) for j in range(RHS.shape[1])]
+            )
+
+    #: option keys accepted by the ``petsc_shell`` backend (unknown keys raise).
+    _PETSC_SHELL_OPTION_KEYS = frozenset((
+        "mat_type", "ksp_type", "pc_type", "pc_factor_mat_solver_type",
+        "rtol", "atol", "max_it", "restart", "pc_side",
+        "options_prefix", "extra_options", "warm_start",
+    ))
+
+    def _init_petsc_shell(self, op_csr, petsc_options, lowrank):
+        """Build the ``petsc_shell`` KSP: system operator = MATLRC
+        (``op_sparse + coef U V^T``), preconditioner matrix = ``op_sparse``."""
+        import time
+        from petsc4py import PETSc
+        self._PETSc = PETSc
+        opts = dict(petsc_options or {})
+        unknown = set(opts) - self._PETSC_SHELL_OPTION_KEYS
+        if unknown:
+            raise ValueError(
+                "theta_linear_solver='petsc_shell' got unknown option key(s) "
+                f"{sorted(unknown)}; allowed keys are "
+                f"{sorted(self._PETSC_SHELL_OPTION_KEYS)}"
+            )
+        mat_type = str(opts.get("mat_type", "aij")).lower()
+        gpu = mat_type == "aijcusparse"
+        ksp_type = str(opts.get("ksp_type", "gmres"))
+        pc_type = str(opts.get("pc_type", "ilu"))
+        factor_type = opts.get("pc_factor_mat_solver_type")
+        rtol = float(opts.get("rtol", 1.0e-10))
+        atol = float(opts.get("atol", 1.0e-50))
+        max_it = int(opts.get("max_it", 1000))
+        restart = opts.get("restart")
+        pc_side = str(opts.get("pc_side", "right")).lower()
+        self._warm_start = bool(opts.get("warm_start", False))
+        self.instrumentation = []
+        self.used_shell_fallback = False
+        self._U_m = None
+        self._V_m = None
+        self._c = None
+        self._shell_ctx = None
+
+        n = op_csr.shape[0]
+        # Preconditioner matrix: op_sparse only (a real assembled AIJ/AIJCUSPARSE
+        # matrix the PC can factor).  Built via createAIJ (the production 'petsc'
+        # idiom) and converted to aijcusparse on the GPU path.
+        Amat = PETSc.Mat().createAIJ(
+            size=(n, n), csr=(op_csr.indptr, op_csr.indices, op_csr.data),
+        )
+        Amat.assemble()
+        if gpu:
+            Amat_gpu = Amat.convert("aijcusparse")
+            if Amat_gpu is not Amat:
+                Amat.destroy()
+            Amat = Amat_gpu
+        self._Amat = Amat
+
+        # System operator: op_sparse (+ low-rank feedback if present).
+        if lowrank is not None:
+            U_lr, V_lr, coef_lr = lowrank
+            U = np.asarray(U_lr, dtype=float)
+            V = np.asarray(V_lr, dtype=float)
+            if U.ndim == 1:
+                U = U[:, None]
+            if V.ndim == 1:
+                V = V[:, None]
+            self._sys = self._build_lrc_operator(Amat, U, V, float(coef_lr), gpu)
+        else:
+            self._sys = Amat
+
+        ksp = PETSc.KSP().create(PETSc.COMM_SELF)
+        # Amat_sys = true LRC operator (Krylov matvec); Pmat = op_sparse (factored
+        # by the PC).  The rank-k perturbation is absorbed by the iterations.
+        ksp.setOperators(self._sys, Amat)
+        ksp.setType(ksp_type)
+        if restart is not None and ksp_type in (
+                "gmres", "fgmres", "lgmres", "dgmres", "pipefgmres", "pgmres"):
+            ksp.setGMRESRestart(int(restart))
+        pc = ksp.getPC()
+        pc.setType(pc_type)
+        if factor_type:
+            pc.setFactorSolverType(str(factor_type))
+        ksp.setTolerances(rtol=rtol, atol=atol, max_it=max_it)
+        # UNPRECONDITIONED norm so ``rtol`` means the same thing across variants.
+        ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
+        # Right preconditioning gives a deterministic residual meaning for
+        # gmres; fgmres is right-preconditioned by construction (leave its side).
+        if ksp_type != "fgmres":
+            ksp.setPCSide(PETSc.PC.Side.RIGHT if pc_side == "right"
+                          else PETSc.PC.Side.LEFT)
+        if self._warm_start:
+            ksp.setInitialGuessNonzero(True)
+        prefix = opts.get("options_prefix")
+        if prefix:
+            ksp.setOptionsPrefix(str(prefix))
+        extra = opts.get("extra_options")
+        if extra:
+            optDB = PETSc.Options()
+            for kk, vv in dict(extra).items():
+                optDB[str(kk)] = vv
+            ksp.setFromOptions()
+        t0 = time.perf_counter()
+        ksp.setUp()
+        self.setup_time = float(time.perf_counter() - t0)
+        self._ksp = ksp
+        # Vectors from the concrete Amat so their device type matches the PC.
+        self._x = Amat.createVecRight()
+        self._b = Amat.createVecRight()
+        self._x.set(0.0)
+
+    def _build_lrc_operator(self, Amat, U, V, coef, gpu):
+        """MATLRC ``Amat + U diag(coef) V^T`` (instance-method createLRC; the
+        coefficient is a mandatory Vec).
+
+        On the GPU path the dense factors ``U``, ``V`` are built as HOST dense
+        mats (``createDense``) and moved to the device with
+        ``.convert('densecuda')`` -- calling ``createDenseCUDA`` directly is a
+        native PETSc/cuSPARSE SEGV on this build (round-5 diagnosis: the first
+        ``createDenseCUDA`` crashes uncatchably in-process), whereas the
+        host-then-convert idiom is probe-verified (device LRC matvec rel_err
+        ~1.7e-16, scratchpad ``gpu_lrc_fix_probes.py`` case
+        ``fix_convert_densecuda_UV``).  The coefficient Vec is a device
+        (``'cuda'``) Vec so its VecType matches the device U/V -- createLRC
+        rejects a mismatched coefficient VecType.
+
+        Falls back to a Python MATSHELL computing the same matvec with host
+        U, V if createLRC / MatDenseCUDA is unavailable on this build (flagged
+        via ``used_shell_fallback``)."""
+        PETSc = self._PETSc
+        n, k = U.shape
+        U_m = V_m = c = None
+        U_host = V_host = None
+        try:
+            if gpu:
+                # NEVER createDenseCUDA here: the first such call is a native
+                # SEGV on this PETSc/cuSPARSE build.  Build host dense mats and
+                # move them to the device via convert -- the probe-verified fix.
+                U_host = PETSc.Mat().createDense(
+                    size=(n, k), array=np.asfortranarray(U),
+                    comm=PETSc.COMM_SELF)
+                V_host = PETSc.Mat().createDense(
+                    size=(n, k), array=np.asfortranarray(V),
+                    comm=PETSc.COMM_SELF)
+                U_host.assemble()
+                V_host.assemble()
+                U_m = U_host.convert("densecuda")
+                V_m = V_host.convert("densecuda")
+                # convert returns fresh device mats; release the host originals.
+                for hm in (U_host, V_host):
+                    if hm is not None and hm is not U_m and hm is not V_m:
+                        try:
+                            hm.destroy()
+                        except Exception:
+                            pass
+                U_host = V_host = None
+            else:
+                U_m = PETSc.Mat().createDense(
+                    size=(n, k), array=np.asfortranarray(U),
+                    comm=PETSc.COMM_SELF)
+                V_m = PETSc.Mat().createDense(
+                    size=(n, k), array=np.asfortranarray(V),
+                    comm=PETSc.COMM_SELF)
+                U_m.assemble()
+                V_m.assemble()
+            c_arr = coef * np.ones(k, dtype=float)
+            if gpu:
+                c = PETSc.Vec().create(comm=PETSc.COMM_SELF)
+                c.setSizes(k)
+                c.setType("cuda")
+                c.setUp()
+                c.setArray(c_arr)
+                c.assemble()
+            else:
+                c = PETSc.Vec().createWithArray(c_arr, comm=PETSc.COMM_SELF)
+            self._c_arr = c_arr           # keep the buffer alive for createWithArray
+            A_full = PETSc.Mat().createLRC(Amat, U_m, c, V_m)
+            self._U_m, self._V_m, self._c = U_m, V_m, c
+            return A_full
+        except Exception:
+            for m in (U_m, V_m, c, U_host, V_host):
+                try:
+                    if m is not None:
+                        m.destroy()
+                except Exception:
+                    pass
+            self._U_m = self._V_m = self._c = None
+            self.used_shell_fallback = True
+            ctx = _LRCPythonCtx(Amat, U, V, coef)
+            shell = PETSc.Mat().createPython((n, n), ctx, comm=PETSc.COMM_SELF)
+            shell.setUp()
+            self._shell_ctx = ctx
+            return shell
+
+    def _petsc_shell_solve_vec(self, rhs, warm=False):
+        """Single-RHS KSP solve of the true LRC operator; records
+        (iterations, wall, converged_reason) and raises on divergence."""
+        import time
+        self._b.setArray(np.asarray(rhs, dtype=float).ravel())
+        if warm and self._warm_start:
+            self._ksp.setInitialGuessNonzero(True)   # reuse the previous solution
+        else:
+            self._ksp.setInitialGuessNonzero(False)
+            self._x.set(0.0)
+        t0 = time.perf_counter()
+        self._ksp.solve(self._b, self._x)
+        wall = float(time.perf_counter() - t0)
+        reason = int(self._ksp.getConvergedReason())
+        iters = int(self._ksp.getIterationNumber())
+        self.instrumentation.append((iters, wall, reason))
+        if reason < 0:
+            raise RuntimeError(
+                "theta petsc_shell KSP failed to converge "
+                f"(KSPConvergedReason={reason}, iters={iters}); loosen rtol or "
+                "strengthen the preconditioner"
+            )
+        return np.array(self._x.getArray(readonly=True), copy=True)
+
+    def _raw_solve_multi(self, B):
+        """Multi-RHS solve of the *sparse* operator only (bypasses Woodbury).
+
+        Used to build the Woodbury capacitance and inside :meth:`_wb_apply`.
+        Always returns a 2-D array of shape ``(n, ncols)``.
+        """
+        B = np.asarray(B, dtype=float)
+        if B.ndim == 1:
+            B = B[:, None]
+        if self.backend == "petsc":
+            return np.asarray(self._petsc_mat_solve(B))
+        return np.asarray(self._lu.solve(B))
 
     def _wb_apply(self, B):
-        """Woodbury solve: ``op^{-1} B = x0 - W C^{-1} (V^T x0)``, ``x0 = op_sparse^{-1} B``."""
+        """Woodbury solve: ``op^{-1} B = x0 - W C^{-1} (V^T x0)``, ``x0 = op_sparse^{-1} B``.
+
+        ``dense_rows`` factorizations carry a self-contained peeled-operator LU
+        under ``wb['lu']``; the generic low-rank path has no stored factor and
+        routes through the backend's raw solve.
+        """
         wb = self._wb
-        x0 = wb["lu"].solve(B)
+        lu = wb.get("lu")
+        if lu is not None:
+            x0 = lu.solve(B)
+        else:
+            x0 = self._raw_solve_multi(B)
+            if np.asarray(B).ndim == 1:
+                x0 = x0[:, 0]
         return x0 - wb["W"] @ (wb["Cinv"] @ (wb["V"].T @ x0))
 
     def solve(self, rhs: np.ndarray) -> np.ndarray:
@@ -1245,9 +1581,11 @@ class _ThetaFactorization:
                 )
             return np.asarray(x)
         if self.backend == "petsc":
-            self._b.setArray(rhs)
-            self._ksp.solve(self._b, self._x)
-            return np.array(self._x.getArray(readonly=True), copy=True)
+            return self._petsc_solve_vec(rhs)
+        if self.backend == "petsc_shell":
+            # z_pred / corrector single solve: warm-startable (the B-column loop
+            # in solve_multi stays cold).
+            return self._petsc_shell_solve_vec(rhs, warm=True)
         return np.asarray(self._lu.solve(rhs))
 
     def solve_multi(self, RHS: np.ndarray) -> np.ndarray:
@@ -1261,26 +1599,14 @@ class _ThetaFactorization:
                 [self.solve(RHS[:, j]) for j in range(RHS.shape[1])]
             )
         if self.backend == "petsc":
-            PETSc = self._PETSc
-            try:
-                B_mat = PETSc.Mat().createDense(
-                    size=(RHS.shape[0], RHS.shape[1]),
-                    array=np.asfortranarray(RHS), comm=PETSc.COMM_SELF,
-                )
-                B_mat.assemble()
-                X_mat = PETSc.Mat().createDense(
-                    size=(RHS.shape[0], RHS.shape[1]), comm=PETSc.COMM_SELF,
-                )
-                X_mat.assemble()
-                self._ksp.matSolve(B_mat, X_mat)
-                X = np.array(X_mat.getDenseArray(), copy=True)
-                B_mat.destroy()
-                X_mat.destroy()
-                return X
-            except Exception:
-                return np.column_stack(
-                    [self.solve(RHS[:, j]) for j in range(RHS.shape[1])]
-                )
+            return np.asarray(self._petsc_mat_solve(RHS))
+        if self.backend == "petsc_shell":
+            # NEVER ksp.matSolve for an iterative KSP: loop columns, cold start
+            # (B-columns must not inherit a warm guess).
+            return np.column_stack(
+                [self._petsc_shell_solve_vec(RHS[:, j], warm=False)
+                 for j in range(RHS.shape[1])]
+            )
         return np.asarray(self._lu.solve(RHS))
 
     def destroy(self):
@@ -1291,6 +1617,20 @@ class _ThetaFactorization:
                 if obj is not None:
                     obj.destroy()
                     setattr(self, attr, None)
+        elif self.backend == "petsc_shell":
+            # ``_sys`` may alias ``_Amat`` (lowrank=None): destroy each unique
+            # PETSc object once.
+            seen = set()
+            for attr in ("_x", "_b", "_ksp", "_sys", "_Amat",
+                         "_U_m", "_V_m", "_c"):
+                obj = getattr(self, attr, None)
+                if obj is not None and id(obj) not in seen:
+                    seen.add(id(obj))
+                    try:
+                        obj.destroy()
+                    except Exception:
+                        pass
+                setattr(self, attr, None)
 
 
 class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
@@ -1345,6 +1685,7 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         theta_petsc_reuse_steps: int = 1,
         theta_dense_rows: Optional[Any] = None,
         theta_lowrank_jac: Optional[Any] = None,
+        theta_cache_size: int = 4,
         contact_ssn_tol: float = 1.0e-10,
         contact_ssn_max_iter: int = 100,
         contact_ssn_line_search: bool = True,
@@ -1507,10 +1848,11 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             contact_linear_solver
         )
         self.theta_linear_solver = str(theta_linear_solver or "scipy").lower()
-        if self.theta_linear_solver not in ("scipy", "petsc", "iterative"):
+        if self.theta_linear_solver not in (
+                "scipy", "petsc", "iterative", "petsc_shell"):
             raise ValueError(
-                "theta_linear_solver must be 'scipy', 'petsc', or 'iterative'; "
-                f"got {self.theta_linear_solver!r}"
+                "theta_linear_solver must be 'scipy', 'petsc', 'iterative', or "
+                f"'petsc_shell'; got {self.theta_linear_solver!r}"
             )
         self.theta_petsc_options = dict(theta_petsc_options or self.contact_petsc_options)
         self.theta_iterative_options = dict(theta_iterative_options or {})
@@ -1545,7 +1887,14 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         self.contact_ssn_line_search = bool(contact_ssn_line_search)
         self.contact_allow_nonconverged = bool(contact_allow_nonconverged)
         self._contact_petsc_solver = None
-        self._theta_cache = None
+        # Multi-level theta-factorization cache: op(h) = (1/theta)A - hJ is
+        # affine and byte-identical at a fixed h, so each distinct h needs
+        # exactly one factorization.  Keyed by float(h) with an LRU bound so
+        # h-revisits under an adaptive driver are free.
+        self.theta_cache_size = max(1, int(theta_cache_size))
+        self._theta_cache = collections.OrderedDict()
+        self._theta_factorizations = 0     # permanent instrumentation counter
+        self._theta_cache_evictions = 0
         self._B_dense = None
         # last converged effective contact impulse + its (t, y, h) key, reused
         # as the contact-SSN warm start on mu fixed-point re-entries (identical
@@ -1676,23 +2025,36 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         return float(h) * force / self.reaction_state_to_reported_scale
 
     def _theta_system_cached(self, t: float, y: np.ndarray, h: float) -> dict:
-        """Factorized theta system for ``(t, y, h)``, memoized one-deep.
+        """Factorized theta system for ``(t, y, h)``, memoized per step size.
 
-        Outer fixed-point iterations on aux state (e.g. mu(s) consistency at
-        the theta point) re-enter ``step()`` with identical ``(t, y, h)``;
-        the operator, factorization, predictor, and Delassus block do not
-        depend on aux, so they are reused.  Any change of arguments rebuilds
-        from scratch — there is no cross-step staleness.
+        The theta operator ``op(h) = (1/theta)A - hJ`` is affine and, at a fixed
+        h, byte-identical across steps; only the predictor RHS depends on
+        ``(t, y)``.  Entries are cached in an LRU-bounded ``OrderedDict`` keyed by
+        ``float(h)`` (cap ``theta_cache_size``), so a lenient adaptive driver that
+        revisits earlier step sizes reuses their factorization for free.
+
+        Within a fixed h three cases arise:
+
+        * exact ``(t, y, h)`` re-entry (aux/mu fixed-point iterations re-enter
+          ``step()`` with identical arguments): return the cached entry as is --
+          operator, factorization, predictor and Delassus block are unchanged.
+        * byte-identical operator, new ``(t, y)``: reuse the factorization and
+          Delassus block, recompute only the back-substitution.
+        * a genuine operator change (time-dependent or nonlinear J) at this h is
+          detected by the byte fingerprint and triggers a full rebuild -- no
+          cross-step staleness.
         """
         cache = self._theta_cache
+        key = float(h)
+        entry = cache.get(key)
         # exact (t, y, h) hit: aux fixed-point re-entry, nothing changed at all
         if (
-            cache is not None
-            and cache["t"] == float(t)
-            and cache["h"] == float(h)
-            and np.array_equal(cache["y"], y)
+            entry is not None
+            and entry["t"] == float(t)
+            and np.array_equal(entry["y"], y)
         ):
-            return cache
+            cache.move_to_end(key)
+            return entry
 
         op, rhs_base = self._build_theta_system(t, y, h)
         op = op.tocsr() if sp.issparse(op) else sp.csr_matrix(op)
@@ -1707,50 +2069,61 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             yv = np.asarray(y, dtype=float).ravel()
             rhs_base = rhs_base + float(h) * (U_lr @ (V_lr.T @ yv))
 
-        # Cross-step reuse: for a fixed-step, constant (affine) operator the
-        # theta-matrix is byte-identical across steps -- only the predictor RHS
-        # depends on y/t.  Reuse the factorization + Delassus block whenever the
-        # operator matrix is unchanged; recompute only the back-substitution.
-        # Any genuine operator change (h, time-dependent or nonlinear J) is
-        # detected here and triggers a full rebuild -- no staleness.
+        # Cross-step reuse at this h: reuse the factorization + Delassus block
+        # (its per-rung Woodbury rides inside fac) whenever the operator matrix is
+        # byte-identical; recompute only the back-substitution.  A genuine
+        # operator change at this h fails the fingerprint and rebuilds below.
         reuse = (
-            cache is not None
-            and cache["h"] == float(h)
-            and cache.get("fac") is not None
-            and cache.get("op_shape") == op.shape
-            and cache.get("op_nnz") == op.nnz
-            and np.array_equal(cache["op_indptr"], op.indptr)
-            and np.array_equal(cache["op_indices"], op.indices)
-            and np.array_equal(cache["op_data"], op.data)
+            entry is not None
+            and entry.get("fac") is not None
+            and entry.get("op_shape") == op.shape
+            and entry.get("op_nnz") == op.nnz
+            and np.array_equal(entry["op_indptr"], op.indptr)
+            and np.array_equal(entry["op_indices"], op.indices)
+            and np.array_equal(entry["op_data"], op.data)
         )
         if reuse:
-            fac = cache["fac"]
+            fac = entry["fac"]
             z_pred = fac.solve(rhs_base)
-            entry = dict(cache)                      # shares fac, X_contact, W
-            entry.update(t=float(t), y=np.array(y, copy=True),
-                         rhs=rhs_base, z_pred=z_pred)
+            new_entry = dict(entry)                  # shares fac, X_contact, W
+            new_entry.update(t=float(t), y=np.array(y, copy=True),
+                             rhs=rhs_base, z_pred=z_pred)
             if self.n_react > 0:
-                entry["b_soccp"] = np.asarray(self.D_contact @ z_pred, dtype=float).ravel()
-                entry["u_old"] = np.asarray(self.D_contact @ y, dtype=float).ravel()
-            self._theta_cache = entry
-            return entry
+                new_entry["b_soccp"] = np.asarray(self.D_contact @ z_pred, dtype=float).ravel()
+                new_entry["u_old"] = np.asarray(self.D_contact @ y, dtype=float).ravel()
+            cache[key] = new_entry
+            cache.move_to_end(key)
+            return new_entry
 
-        # operator changed -> (re)factorize and rebuild the Delassus block
-        if cache is not None and cache.get("fac") is not None:
-            cache["fac"].destroy()
+        # operator changed / cold rung -> (re)factorize and rebuild the Delassus
+        # block, dropping this rung's stale factorization first.  Pop the stale
+        # entry from the cache BEFORE destroying its factorization: if the
+        # rebuild below raises (e.g. _ThetaFactorization construction fails),
+        # no cache entry may remain reachable that references a destroyed fac.
+        if entry is not None and entry.get("fac") is not None:
+            cache.pop(key, None)
+            entry["fac"].destroy()
         lowrank = None
         if self.theta_lowrank_jac is not None:
             U_lr, V_lr = self.theta_lowrank_jac
             lowrank = (U_lr, V_lr, float(h))     # op = op_sparse + h U V^T
+        self._theta_factorizations += 1
         if self.theta_linear_solver == "iterative":
             fac = _ThetaFactorization(op, "iterative", self.theta_iterative_options,
+                                      dense_rows=self.theta_dense_rows, lowrank=lowrank)
+        elif self.theta_linear_solver == "petsc_shell":
+            # Explicit elif (never the ``else`` fallback): a missing branch would
+            # silently route petsc_shell to scipy-splu and corrupt every solve
+            # while all gates pass.  The low-rank (U, V, h) term is applied INSIDE
+            # the Krylov matvec (MATLRC), so no Woodbury capacitance is formed.
+            fac = _ThetaFactorization(op, "petsc_shell", self.theta_petsc_options,
                                       dense_rows=self.theta_dense_rows, lowrank=lowrank)
         else:
             backend = "petsc" if self.theta_linear_solver == "petsc" else "scipy"
             fac = _ThetaFactorization(op, backend, self.theta_petsc_options,
                                       dense_rows=self.theta_dense_rows, lowrank=lowrank)
         z_pred = fac.solve(rhs_base)
-        entry = {
+        new_entry = {
             "t": float(t),
             "h": float(h),
             "y": np.array(y, copy=True),
@@ -1768,12 +2141,20 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
                 B = self.B.tocsr() if sp.issparse(self.B) else sp.csr_matrix(self.B)
                 self._B_dense = np.asarray(B.toarray(), dtype=float)
             X = fac.solve_multi(self._B_dense)
-            entry["X_contact"] = np.asarray(X, dtype=float)
-            entry["W"] = np.asarray(self.D_contact @ X, dtype=float)
-            entry["b_soccp"] = np.asarray(self.D_contact @ z_pred, dtype=float).ravel()
-            entry["u_old"] = np.asarray(self.D_contact @ y, dtype=float).ravel()
-        self._theta_cache = entry
-        return entry
+            new_entry["X_contact"] = np.asarray(X, dtype=float)
+            new_entry["W"] = np.asarray(self.D_contact @ X, dtype=float)
+            new_entry["b_soccp"] = np.asarray(self.D_contact @ z_pred, dtype=float).ravel()
+            new_entry["u_old"] = np.asarray(self.D_contact @ y, dtype=float).ravel()
+        cache[key] = new_entry
+        cache.move_to_end(key)
+        # LRU eviction: the current rung is most-recently-used (moved to the
+        # end), so popitem(last=False) never evicts it.
+        while len(cache) > self.theta_cache_size:
+            _evicted_key, evicted = cache.popitem(last=False)
+            if evicted.get("fac") is not None:
+                evicted["fac"].destroy()
+            self._theta_cache_evictions += 1
+        return new_entry
 
 
     @staticmethod
@@ -1813,8 +2194,21 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         X_contact: np.ndarray,
         offset_impulse: np.ndarray,
         t_theta: float,
+        u_N_old: np.ndarray,
     ) -> tuple[np.ndarray, SocppPgsInfo, dict, np.ndarray]:
-        """Reduced contact SSN with mu evaluated from z_theta(p)."""
+        """Reduced contact SSN with mu evaluated from z_theta(p).
+
+        ``u_N_old`` is the PRE-STEP normal contact velocity ``(D @ y)[normal]``
+        per contact -- the ``u_{N,k}`` of the Fremond restitution offset
+        ``(theta(1+e)-1) u_{N,k}``, same datum as the standard (aux-mu) route.
+        It must NOT be approximated by the free predictor
+        ``D (z_pred - X offset)``: that is the velocity with the entire contact
+        reaction (including the prestress hold) removed, which for a
+        prestressed resting contact is a large fictitious closing velocity --
+        the restitution offset it induces forces spurious slip through the
+        De Saxce coupling (a critically prestressed fault in exact equilibrium
+        ruptures in one step).
+        """
         if sp.issparse(W):
             W_dense = np.asarray(W.toarray(), dtype=float)
         else:
@@ -1824,17 +2218,47 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         z_pred = np.asarray(z_pred, dtype=float).ravel()
         X_contact = np.asarray(X_contact, dtype=float)
         offset_impulse = np.asarray(offset_impulse, dtype=float).ravel()
-        u_N_old = np.array([
-            (self.D_contact @ (z_pred - X_contact @ offset_impulse))[sl.start]
-            for sl in self.block_slices
-        ])
+        u_N_old = np.asarray(u_N_old, dtype=float).ravel()
+
+        z_free = z_pred - X_contact @ offset_impulse
 
         def state_from_effective_impulse(p_eff: np.ndarray) -> np.ndarray:
-            return z_pred + X_contact @ (np.asarray(p_eff, dtype=float).ravel() - offset_impulse)
+            return z_free + X_contact @ np.asarray(p_eff, dtype=float).ravel()
+
+        # Hoisted fast path for the residual.  mu is NOT hoisted: it is
+        # re-evaluated from the trial theta-state at EVERY residual/Jacobian
+        # evaluation (that per-evaluation update IS the coupled mu closure).
+        # What is hoisted are the genuine per-solve constants -- the
+        # restitution offset rest = (theta(1+e)-1) u_N_old (a pre-step datum
+        # of the impact law) and the contiguous W/b copies -- so the fused
+        # numba kernel is called directly with the fresh mu instead of
+        # rebuilding a shift closure + re-copying W/b on every line-search
+        # trial (the residual is evaluated O(iters x trials) times per solve).
+        _dims = [sl.stop - sl.start for sl in self.block_slices]
+        _rest_c = np.ascontiguousarray(
+            (self.theta * (1.0 + self.e_N_vec) - 1.0) * u_N_old, dtype=float,
+        )
+        _use_nb = (
+            _NUMBA_OK
+            and _soc_fb_assemble_nb is not None
+            and self.contact_residual == "soc_fb"
+            and b.size > 0
+            and bool(_dims)
+            and all(dd == _dims[0] for dd in _dims)
+        )
+        _W_c = np.ascontiguousarray(W_dense) if _use_nb else None
+        _b_c = np.ascontiguousarray(b) if _use_nb else None
 
         def residual_for(p_eff: np.ndarray):
             z_theta = state_from_effective_impulse(p_eff)
             mu_vec = self._mu_from_theta_state(z_theta, t_theta)
+            if _use_nb:
+                mu_c = np.ascontiguousarray(mu_vec, dtype=float)
+                F, _, u_full = _soc_fb_assemble_nb(
+                    _W_c, _b_c, np.ascontiguousarray(p_eff, dtype=float),
+                    mu_c, mu_c, _rest_c, int(_dims[0]), False, 1.0e-14,
+                )
+                return F, u_full, mu_vec
             shift_fn = fremond_shift_factory(
                 mu_vec, self.e_N_vec, u_N_old, theta=self.theta,
             )
@@ -1871,9 +2295,23 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             return F, J, mu_vec
 
         def residual_and_jacobian(p_eff: np.ndarray):
-            F, u_full, mu_vec = residual_for(p_eff)
             if self.dmu_dstate_callback is None or self.contact_residual != "soc_fb":
                 return residual_and_jacobian_fd(p_eff)
+            if _use_nb and _soc_fb_assemble_state_mu_nb is not None:
+                # Fused kernel: residual + mu-coupled Jacobian in one pass
+                # (identical formulas to the python loop below).
+                z_theta = state_from_effective_impulse(p_eff)
+                mu_vec = self._mu_from_theta_state(z_theta, t_theta)
+                dmu_dp = dmu_dp_for(z_theta)
+                mu_c = np.ascontiguousarray(mu_vec, dtype=float)
+                F, J, _u = _soc_fb_assemble_state_mu_nb(
+                    _W_c, _b_c, np.ascontiguousarray(p_eff, dtype=float),
+                    mu_c, mu_c, _rest_c,
+                    np.ascontiguousarray(dmu_dp, dtype=float),
+                    int(_dims[0]), 1.0e-14,
+                )
+                return F, J, mu_vec
+            F, u_full, mu_vec = residual_for(p_eff)
             z_theta = state_from_effective_impulse(p_eff)
             dmu_dp = dmu_dp_for(z_theta)
             J = np.zeros((F.size, p_eff.size), dtype=float)
@@ -1945,8 +2383,6 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         converged = False
         residual_norm = float("inf")
         iters = 0
-        mu_vec = self._mu_from_theta_state(state_from_effective_impulse(p), t_theta)
-        u_full = np.asarray(W_dense @ p + b, dtype=float).ravel()
         for it in range(max(1, self.contact_ssn_max_iter)):
             F, J, mu_vec = residual_and_jacobian(p)
             residual_norm = float(np.linalg.norm(F))
@@ -2014,10 +2450,12 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
 
         ``active_blocks`` is the list of active contact indices.  The reduced
         problem is built by slicing the cached full Delassus ``W`` and the
-        predictor velocity, re-basing the block slices contiguously; inactive
-        contacts get ``p_contact = 0`` (i.e. ``p_effective = offset``) and are
-        dropped from the prestress offset so they do not couple into the active
-        rows.  Returns a FULL-length ``p_effective`` plus the SOCCP info/diag.
+        predictor velocity, re-basing the block slices contiguously.  Open (gap-deactivated)
+        contacts keep ``p_effective = 0`` and stay out of the cone problem,
+        but their prestress release couples into the active rows through the
+        Delassus off-diagonal via the full-offset reduced rhs
+        ``b_a = (b_soccp - W @ offset)[active]``.  Returns a FULL-length
+        ``p_effective`` plus the SOCCP info/diag.
         """
         ab = np.asarray(active_blocks, dtype=int)
         act_idx = np.concatenate([
@@ -2031,10 +2469,22 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             red_slices.append(slice(off, off + d))
             off += d
         Wm = W.toarray() if sp.issparse(W) else np.asarray(W, dtype=float)
-        # inactive contacts carry no holding reaction -> zero their prestress
-        offset_active = np.zeros_like(offset_impulse)
-        offset_active[act_idx] = offset_impulse[act_idx]
-        b_eff_full = np.asarray(b_soccp, dtype=float) - Wm @ offset_active
+        # Build the reduced rhs from the FULL prestress offset so the active
+        # (closed) rows feel the RELEASE of the gap-deactivated rows through the
+        # Delassus off-diagonal.  A geometrically-open contact carries zero
+        # TOTAL reaction (p_effective = 0, booked below) and hands the bulk the
+        # increment p_contact = -offset; through W this perturbs a coupled,
+        # still-closed contact's velocity by W[closed, open] @ (-offset[open]).
+        # The correct reduced affine term is therefore the full-set rhs
+        #   b_eff = b_soccp - W @ offset_impulse    (see the all-active path
+        #   in step())
+        # restricted to the active rows.  The open rows stay OUT of the cone
+        # problem (they are not in act_idx) -- only their prestress *release*
+        # couples in.  Zeroing the open rows' offset here would drop that cross
+        # term and let a closed contact adjacent to an open prestressed one
+        # drift into the wall at an O(h) normal velocity (interpenetration).
+        offset_full = np.asarray(offset_impulse, dtype=float)
+        b_eff_full = np.asarray(b_soccp, dtype=float) - Wm @ offset_full
         W_a = Wm[np.ix_(act_idx, act_idx)]
         b_a = b_eff_full[act_idx]
         mu_a = np.asarray(mu_vec, dtype=float)[ab]
@@ -2053,7 +2503,11 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             p_a, soccp_info, contact_diag = self._solve_contact_petsc_ssn(
                 W_a, b_a, mu_a, shift_a, p0_a, block_slices=red_slices,
             )
-        p_effective = np.asarray(offset_impulse, dtype=float).copy()
+        # Gap-deactivated (open) contacts carry zero TOTAL reaction: p_effective
+        # = 0 on their rows, so the increment handed to the bulk is p_contact =
+        # -offset (the prestress release), NOT 0.  Only the active rows carry the
+        # solved reaction ``p_a``.
+        p_effective = np.zeros_like(np.asarray(offset_impulse, dtype=float))
         p_effective[act_idx] = p_a
         # report the regime full-length: inactive contacts -> "inactive"
         red_regime = getattr(soccp_info, "regime", None)
@@ -2118,7 +2572,10 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
                     W, b_eff, mu_vec, shift_fn, p0_eff,
                 )
         elif active_blocks.size == 0:
-            p_effective = offset_impulse.copy()
+            # Every contact is geometrically open -> zero total reaction on all
+            # rows; p_contact = p_effective - offset = -offset releases the
+            # prestress everywhere.
+            p_effective = np.zeros_like(np.asarray(offset_impulse, dtype=float))
             soccp_info = SocppPgsInfo(converged=True)
             soccp_info.regime = ["inactive"] * self.n_contacts
             contact_diag = {"active_contacts": []}
@@ -2224,26 +2681,41 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             )
             b_eff = b_soccp - W @ offset_impulse
             # Warm start (initial guess only; converged solution unchanged):
-            # prefer a caller-supplied nonzero impulse; otherwise, on a mu
-            # fixed-point re-entry (identical (t, y, h)), reuse the previous
-            # iteration's converged impulse -- only mu changed, so it is a tight
-            # guess that cuts contact-SSN iterations on the 2nd+ mu sweeps.
+            # Warm-start priority (initial guess only; the converged solution is
+            # set by the SOCCP, not the guess):
+            #   1. mu fixed-point re-entry (identical (t, y, h)): the previous
+            #      sweep's converged impulse -- exact h, near-final mu, so the
+            #      semismooth Newton starts inside its quadratic basin.
+            #   2. previous step's impulse, RESCALED to the current step size:
+            #      contact impulses are h*force, so carrying p_contact_prev
+            #      across the adaptive full/half sub-steps unscaled leaves the
+            #      guess ~2x off in magnitude -- far outside the Newton basin
+            #      (globalization then costs ~3x the iterations).
+            #   3. the offset impulse (prestress hold).
             reentry = (
                 self._last_call_key is not None
                 and self._last_call_key[0] == float(t)
                 and self._last_call_key[2] == float(h)
                 and np.array_equal(self._last_call_key[1], y)
             )
-            if np.any(p0):
-                p0_eff = p0 + offset_impulse
-            elif (reentry and self._last_p_eff is not None
-                  and self._last_p_eff.size == self.n_react):
+            if (reentry and self._last_p_eff is not None
+                    and self._last_p_eff.size == self.n_react):
                 p0_eff = self._last_p_eff.copy()
+            elif np.any(p0):
+                h_prev = aux.get("p_contact_prev_h")
+                p0_scale = (
+                    float(h) / float(h_prev)
+                    if h_prev is not None and float(h_prev) > 0.0 else 1.0
+                )
+                p0_eff = p0 * p0_scale + offset_impulse
             else:
                 p0_eff = offset_impulse.copy()
             t_theta = float(t) + self.theta * float(h)
             X_contact = np.asarray(theta_sys["X_contact"], dtype=float)
             proj_diag = {}
+            # Pre-step normal contact velocity u_{N,k} = (D y)[normal] -- the
+            # Fremond restitution datum, shared by BOTH mu routes below.
+            u_N_old = np.array([u_old[sl.start] for sl in self.block_slices])
             if self.mu_state_callback is not None:
                 if self.contact_solver != "petsc_ssn":
                     raise ValueError("state-dependent mu currently requires contact_solver='petsc_ssn'")
@@ -2253,6 +2725,7 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
                     X_contact=theta_sys["X_contact"],
                     offset_impulse=offset_impulse,
                     t_theta=t_theta,
+                    u_N_old=u_N_old,
                 )
                 p_contact = p_effective - offset_impulse
                 # z_theta = A^{-1}(rhs_base + B p_contact) = z_pred + X_contact p_contact
@@ -2268,7 +2741,6 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
                     raise ValueError(
                         f"aux['mu'] has {mu_vec.size} entries; expected {self.n_contacts}"
                     )
-                u_N_old = np.array([u_old[sl.start] for sl in self.block_slices])
                 # Geometric activation: gap index set Ibar1_k (Eq. 19), decided at
                 # the OLD position q_k = y.  gap_callable is None -> every contact
                 # active (persistent contact).  When combined_projection is OFF the
@@ -2326,6 +2798,7 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             u_theta, self.block_slices, h, self.aux_law_params,
         )
         aux_new["p_contact_prev"] = p_contact.copy()
+        aux_new["p_contact_prev_h"] = float(h)   # impulse scale for warm-start rescaling
         aux_new["u_old_endpoint"] = (
             np.asarray(self.D_contact @ y_new, dtype=float).ravel()
             if self.n_react else np.zeros(0, dtype=float)
@@ -2572,6 +3045,564 @@ def solve_mjf_adaptive(
             "accepted": [rec["accepted"] for rec in attempt_records],
             "records": attempt_records,
         },
+    )
+
+
+# -----------------------------------------------------------------------------
+# Ratio-mode adaptive driver: reuse AdaptiveStepping instead of hand-rolling a
+# controller.  A thin adapter presents the MJF stepper under the integrator
+# contract .step(fun, t, y, h) -> (y_new, fk, solver_err, ok, iters); the
+# generic AdaptiveStepping(mode="ratio") owns step-size control (Gustafsson /
+# Soderlind digital filter with the LENIENT ratio-band acceptance), DAE-aware
+# error weighting, and the active-set filter.  A HOLD layer above the
+# controller keeps the committed step size FIXED while the controller's
+# proposal drifts inside a band, so the per-h theta factorization cache
+# (Task A) is reused: factorizations ~= number of distinct committed h << steps.
+# -----------------------------------------------------------------------------
+
+
+def _mass_is_identity(A) -> bool:
+    """True iff mass matrix ``A`` is the identity (all DOFs differential).
+
+    Sparse-safe: never densifies (an ``A.toarray()`` is n^2 memory and OOMs at
+    production sizes).  A false negative only routes through
+    ``_detect_algebraic_dofs``, which then finds no zero rows and returns the
+    same all-differential mask, so the exact (rather than allclose) comparison
+    is safe.
+    """
+    A_csr = A.tocsr() if sp.issparse(A) else sp.csr_matrix(np.asarray(A, dtype=float))
+    n, m = A_csr.shape
+    if n != m:
+        return False
+    diff = (A_csr - sp.identity(n, format="csr")).tocsr()
+    diff.eliminate_zeros()
+    return diff.nnz == 0
+
+
+def _mjf_velocity_dof_map(stepper) -> list:
+    """Per-contact-block map to the coupled *state* velocity DOF indices.
+
+    Uses ``stepper.D_contact``, whose rows are already permuted into reaction
+    (block-slice) order via ``contact_velocity_rows`` — indexing ``D_extract``
+    directly by block-slice positions is WRONG whenever the contact velocity
+    rows interleave (e.g. crack plants with rows ``[k, n_c + k]`` for contact
+    ``k``): the filter would silently suppress OTHER contacts' DOFs.  Row
+    access is CSR-native (no densification).
+    """
+    D = stepper.D_contact
+    D_csr = D.tocsr() if sp.issparse(D) else sp.csr_matrix(np.asarray(D, dtype=float))
+    vmap = []
+    for sl in stepper.block_slices:
+        idxs: set[int] = set()
+        for r in range(sl.start, sl.stop):
+            if r < D_csr.shape[0]:
+                lo, hi = D_csr.indptr[r], D_csr.indptr[r + 1]
+                cols = D_csr.indices[lo:hi]
+                vals = D_csr.data[lo:hi]
+                idxs.update(int(c) for c, v in zip(cols, vals) if v != 0.0)
+        vmap.append(np.array(sorted(idxs), dtype=int))
+    return vmap
+
+
+class _MJFRegimeProjection:
+    """Projection-shaped regime tracker for AdaptiveStepping's active-set filter.
+
+    The MJF SOCCP reports a per-contact regime label ('separation'|'stick'|
+    'slip') in each step's ``info['regime']``.  The adapter pushes the latest
+    label list here; :meth:`regime_snapshot` / :meth:`regime_changed_mask` then
+    mirror :class:`MuScaledSOCProjection`'s active-set-filter contract so the
+    error estimator can suppress velocity DOFs whose contact regime flipped
+    across a step (the discontinuous constraint-force jump is not a
+    discretization error and must not force a rejection).
+    """
+
+    def __init__(self, velocity_dof_map: list):
+        self._velocity_dof_map = velocity_dof_map
+        self._regime = None  # latest list[str] or None until first step
+
+    def update_regime(self, regime) -> None:
+        if regime is not None:
+            self._regime = list(regime)
+
+    def regime_snapshot(self):
+        return None if self._regime is None else list(self._regime)
+
+    def regime_changed_mask(self, prev_snapshot, n_dof):
+        if prev_snapshot is None or self._regime is None:
+            return None
+        cur = self._regime
+        n_blk = min(len(prev_snapshot), len(cur))
+        changed = [k for k in range(n_blk) if prev_snapshot[k] != cur[k]]
+        if not changed:
+            return None
+        mask = np.ones(int(n_dof), dtype=float)
+        for k in changed:
+            if k < len(self._velocity_dof_map):
+                for idx in self._velocity_dof_map[k]:
+                    if 0 <= idx < n_dof:
+                        mask[idx] = 0.0
+        return mask
+
+
+class _MJFSolverShim:
+    """Minimal ``solver`` object so AdaptiveStepping can reach ``.proj``.
+
+    ``AdaptiveStepping`` reads ``integrator.solver.proj`` for the active-set
+    filter and pokes a few cache attributes on nonlinear failure; those pokes
+    are inert for MJF (the theta cache is keyed by h, so a retry at a different
+    h never reuses a stale factorization).
+    """
+
+    def __init__(self, proj):
+        self.proj = proj
+        self._lu = None
+        self._lu_shape = None
+        self._J_cross_call = None
+        self._petsc_needs_matrix_update = False
+
+
+class _MJFRatioAdapter:
+    """Adapt a ``DescriptorMoreauJeanFremondStepper`` to the integrator contract.
+
+    ``step(fun, t, y, h) -> (y_new, info, solver_err, ok, iters)`` ignores
+    ``fun`` (MJF carries its own descriptor dynamics), runs the contact solve
+    (plus an optional outer mu fixed point, exactly as ``solve_mjf_adaptive``),
+    and reports ``ok`` from the SSN/SOCCP outcome so the controller can shrink
+    on a failed solve.  ``info`` rides back as the ``fk`` slot of the contract
+    so the driver recovers the accepted step's reactions.
+
+    The controller's Richardson estimator calls ``step`` three times per
+    attempt (one full + two half steps).  The MJF ``aux`` state (cumulative
+    slip, warm-start impulse, friction) must thread through those sub-steps:
+    the full and first-half sub-steps start from the committed aux, and the
+    second-half sub-step must start from the aux the first half produced.  This
+    is done with a per-attempt ``{(t, y) -> aux}`` map seeded at the committed
+    state; each completed sub-step records its endpoint aux, so the second
+    half's start ``(t + h/2, y_half)`` resolves to the first half's output
+    (a byte-exact key match, since the controller forwards the same array).
+    """
+
+    has_embedded_error = False  # force the Richardson (step-doubling) path
+
+    def __init__(self, stepper, *, mu_from_state=None, slip_weakening=None,
+                 mu_fixed_point_tol: float = 1.0e-10,
+                 mu_fixed_point_max_iter: int = 30):
+        self.stepper = stepper
+        self.theta = float(getattr(stepper, "theta", 0.5))
+        if mu_from_state is not None and slip_weakening is not None:
+            raise ValueError(
+                "pass at most one of mu_from_state / slip_weakening"
+            )
+        self.mu_from_state = mu_from_state
+        # slip_weakening: explicit-slip route for the causal DRIVER build, where
+        # the stepper's slip rows are identity/rhs=0 so a mu_from_state(y) that
+        # reads a state slip row would FREEZE mu.  Here the slip is integrated
+        # explicitly from the tangential velocity (s += h|v_t,theta|) and written
+        # back into the slip rows, reproducing MJFIntegrationMethod._step_weakening.
+        self.slip_weakening = dict(slip_weakening) if slip_weakening else None
+        self.mu_fixed_point_tol = float(mu_fixed_point_tol)
+        self.mu_fixed_point_max_iter = int(mu_fixed_point_max_iter)
+
+        # DAE-aware error weighting reads these off the integrator.
+        self.A = stepper.A
+        self.use_identity = _mass_is_identity(stepper.A)
+
+        # Active-set filter reaches ``.solver.proj``.
+        self._proj = _MJFRegimeProjection(_mjf_velocity_dof_map(stepper))
+        self.solver = _MJFSolverShim(self._proj)
+
+        # aux threading across the 3 Richardson sub-steps of one attempt
+        self._committed_aux: dict = {}
+        self._aux_map: dict = {}
+        self._last_out_y = None
+        self._last_out_aux = None
+        self._last_out_info = None
+        self._last_exc = None
+
+    # -- aux threading -------------------------------------------------------
+    @staticmethod
+    def _key(t, y):
+        return (float(t), np.ascontiguousarray(y, dtype=float).tobytes())
+
+    def reset_committed(self, t, y, aux) -> None:
+        """Reset the transient aux map to a single committed ``(t, y) -> aux``.
+
+        Called by the driver between controller steps: on acceptance with the
+        newly advanced state, on rejection with the unchanged state.
+        """
+        self._committed_aux = _copy_aux_dict(aux)
+        self._aux_map = {self._key(t, y): _copy_aux_dict(aux)}
+
+    def accepted_aux(self):
+        """Aux of the accepted refined solution (the last sub-step's output)."""
+        return _copy_aux_dict(self._last_out_aux)
+
+    # -- mu fixed point (mirrors solve_mjf_adaptive._step_with_mu) -----------
+    def _solve_with_mu(self, t, y, aux_in, h):
+        if self.mu_from_state is None:
+            y1, aux1, info1 = self.stepper.step(t, y, _copy_aux_dict(aux_in), h)
+            return y1, aux1, dict(info1)
+        mu_guess = np.asarray(self.mu_from_state(y), dtype=float).ravel()
+        err_mu = 0.0
+        mu_iter = 0
+        y1 = aux1 = info1 = None
+        for mu_iter in range(1, max(1, self.mu_fixed_point_max_iter) + 1):
+            aux_try = _copy_aux_dict(aux_in)
+            aux_try["mu"] = mu_guess.copy()
+            y1, aux1, info1 = self.stepper.step(t, y, aux_try, h)
+            y_theta = y + self.theta * (y1 - y)
+            mu_theta = np.asarray(self.mu_from_state(y_theta), dtype=float).ravel()
+            err_mu = (
+                float(np.max(np.abs(mu_theta - mu_guess))) if mu_guess.size else 0.0
+            )
+            mu_guess = mu_theta
+            if err_mu <= self.mu_fixed_point_tol:
+                break
+        info1 = dict(info1)
+        info1["mu_law"] = mu_guess.copy()
+        info1["mu_fixed_point_iters"] = mu_iter
+        info1["mu_fixed_point_error"] = err_mu
+        info1["mu_fp_converged"] = bool(err_mu <= self.mu_fixed_point_tol)
+        return y1, aux1, info1
+
+    # -- slip-weakening (explicit slip, mirrors MJFIntegrationMethod._step_weakening)
+    def _solve_slip_weakening(self, t, y, aux_in, h):
+        sw = self.slip_weakening
+        slip_slice = sw["slip_slice"]
+        mu_from_slip = sw["mu_from_slip"]
+        vel_t_extract = sw["vel_t_extract"]
+        n_phys = int(sw["n_phys"])
+        s_k = np.asarray(y[slip_slice], dtype=float).ravel()
+        mu_guess = np.asarray(mu_from_slip(s_k), dtype=float).ravel()
+        v_t_theta = np.zeros_like(mu_guess)
+        y1 = aux1 = info1 = None
+        last_resid = np.inf
+        n_iter = 0
+        for n_iter in range(1, max(1, self.mu_fixed_point_max_iter) + 1):
+            aux_try = _copy_aux_dict(aux_in)
+            aux_try["mu"] = mu_guess.copy()
+            y1, aux1, info1 = self.stepper.step(t, y, aux_try, h)
+            y_theta = y + self.theta * (y1 - y)
+            v_t_theta = np.asarray(
+                vel_t_extract @ y_theta[:n_phys], dtype=float,
+            ).ravel()
+            s_theta = s_k + self.theta * h * np.abs(v_t_theta)
+            mu_theta = np.asarray(mu_from_slip(s_theta), dtype=float).ravel()
+            last_resid = (
+                float(np.linalg.norm(mu_theta - mu_guess, ord=np.inf))
+                if mu_guess.size else 0.0
+            )
+            mu_guess = mu_theta
+            if last_resid <= self.mu_fixed_point_tol:
+                break
+        # explicit slip integral, written back into the (identity/rhs=0) slip rows
+        s_next = s_k + h * np.abs(v_t_theta)
+        y1 = np.asarray(y1, dtype=float).ravel().copy()
+        y1[slip_slice] = s_next
+        aux1 = _copy_aux_dict(aux1)
+        mu_next = np.asarray(mu_from_slip(s_next), dtype=float).ravel()
+        aux1["mu"] = mu_next
+        aux1["cum_slip"] = s_next.copy()
+        info1 = dict(info1)
+        info1["mu_law"] = mu_next
+        info1["mu_fixed_point_iters"] = int(n_iter)
+        info1["mu_fixed_point_error"] = last_resid
+        info1["mu_fp_converged"] = bool(last_resid <= self.mu_fixed_point_tol)
+        return y1, aux1, info1
+
+    # -- integrator contract -------------------------------------------------
+    def step(self, fun, t, y, h):
+        y = np.asarray(y, dtype=float).ravel()
+        aux_in = self._aux_map.get(self._key(t, y), self._committed_aux)
+        try:
+            if self.slip_weakening is not None:
+                y1, aux1, info = self._solve_slip_weakening(
+                    float(t), y, aux_in, float(h))
+            else:
+                y1, aux1, info = self._solve_with_mu(float(t), y, aux_in, float(h))
+        except Exception as exc:  # noqa: BLE001 — surfaced as a rejection
+            self._last_exc = exc
+            return y, None, float("inf"), False, 0
+
+        y1 = np.asarray(y1, dtype=float).ravel()
+        finite = bool(np.all(np.isfinite(y1)))
+        soccp_ok = bool(info.get("soccp_converged", True))
+        ssn_ok = bool(info.get("contact_ssn_converged", True))
+        # mu-gate: production MJFIntegrationMethod.step fails the step when the
+        # friction fixed point has not converged; mirror that here so the
+        # controller shrinks rather than accepting a stale-mu state.
+        mu_ok = bool(info.get("mu_fp_converged", True))
+        ok = finite and soccp_ok and ssn_ok and mu_ok
+        solver_err = float(info.get("soccp_residual", 0.0) or 0.0)
+        iters = int(info.get("soccp_outer_iters", 0) or 0)
+
+        # record this sub-step's endpoint aux for the next sub-step, and remember
+        # the refined output so the driver can commit it on acceptance.
+        self._aux_map[self._key(float(t) + float(h), y1)] = _copy_aux_dict(aux1)
+        self._last_out_y = y1.copy()
+        self._last_out_aux = _copy_aux_dict(aux1)
+        self._last_out_info = dict(info)
+        self._proj.update_regime(info.get("regime"))
+        return y1, info, solver_err, ok, iters
+
+
+def _copy_aux_dict(aux: dict) -> dict:
+    return {
+        key: (val.copy() if hasattr(val, "copy") else val)
+        for key, val in (aux or {}).items()
+    }
+
+
+def solve_mjf_adaptive_ratio(
+    stepper,
+    t_span,
+    y0: np.ndarray,
+    aux0: Optional[dict] = None,
+    *,
+    rtol: Any = 1.0e-3,
+    atol: Any = 1.0e-6,
+    h0: Optional[float] = None,
+    h_min: float = 1.0e-10,
+    h_max: float = np.inf,
+    error_order: int = 2,
+    error_mask: Optional[np.ndarray] = None,
+    mu_from_state: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    slip_weakening: Optional[dict] = None,
+    mu_fixed_point_tol: float = 1.0e-10,
+    mu_fixed_point_max_iter: int = 30,
+    aux_sync: Optional[Callable[[dict, np.ndarray], dict]] = None,
+    max_attempts: int = 100000,
+    # --- ratio controller / hold layer ---
+    controller: str = "H211b",
+    r_min: float = 0.8,
+    r_max: float = 1.2,
+    b_param: float = 2.0,
+    dae_var_weight: str = "auto",
+    active_set_filter: bool = True,
+    hold_threshold: float = 0.2,
+    quiescence: Optional[Callable[[float, np.ndarray], bool]] = None,
+    record_attempts: bool = False,
+):
+    """Ratio-mode adaptive driver for Moreau-Jean-Fremond steppers.
+
+    Delegates step-size control to :class:`~solve_nivp.adaptive_integrator.AdaptiveStepping`
+    in ``mode="ratio"`` (Gustafsson / Soderlind digital filter with lenient
+    ratio-band acceptance, DAE-aware error weighting, active-set filter).  A
+    HOLD layer above the controller keeps the *committed* step size fixed while
+    the controller's proposal drifts within ``hold_threshold`` of it, so the
+    per-h theta factorization cache is reused and the number of factorizations
+    tracks the number of *distinct* committed step sizes rather than the number
+    of steps.
+
+    Additive to :func:`solve_mjf_adaptive` (unchanged): same plant, aux, and
+    mu-fixed-point contract, plus the reaction / horizon-landing bookkeeping.
+
+    Parameters mirror :func:`solve_mjf_adaptive`; extras:
+
+    controller : digital-filter preset (default ``"H211b"``).
+    r_min, r_max : ratio-band acceptance bounds (``rho_prop`` inside is accepted).
+    hold_threshold : commit a new step size only when the ACCUMULATED proposal
+        drift since the last commit, ``prod_k(h_next_k / h_held)``, leaves the
+        band ``|drift - 1| <= hold_threshold`` (default 0.2 = 20%); between
+        commits the held factorization is reused.  Accumulation matters: the
+        controller clamps each accepted-step ratio to ``[r_min, r_max]``, so a
+        single-step test against a threshold >= ``r_max - 1`` would never fire
+        and h would be stuck at h0.
+    mu_fixed_point_tol, mu_fixed_point_max_iter : friction fixed-point control;
+        defaults (1e-10, 30) align with the production ``MJFIntegrationMethod``
+        (stricter than ``solve_mjf_adaptive``'s 1e-8/12).  Non-convergence
+        FAILS the attempt (mu-gate), as in ``MJFIntegrationMethod.step``.
+    slip_weakening : optional dict ``{slip_slice, mu_from_slip, vel_t_extract,
+        n_phys}`` selecting the explicit-slip friction route (mutually exclusive
+        with ``mu_from_state``).  Use this for the causal DRIVER build where the
+        stepper's slip rows are identity/rhs=0: a ``mu_from_state(y)`` reading a
+        state slip row would FREEZE mu, whereas this route integrates the slip
+        explicitly from the tangential velocity (``s += h|v_t,theta|``) and writes
+        it back, so ``mu(s)`` actually evolves (reproduces
+        ``MJFIntegrationMethod._step_weakening``).
+    dae_var_weight : ``"auto"`` excludes zero-mass (algebraic) DOFs from the
+        error norm.
+    active_set_filter : suppress regime-transition velocity DOFs from the norm.
+    quiescence : optional ``(t, y) -> bool``; when True the attempt proposes
+        ``h_max`` (the controller and ratio band still gate acceptance).
+
+    Returns ``(t, y, h, info, attempts)`` as :func:`solve_mjf_adaptive`, with
+    ``attempts`` additionally carrying ``n_factorizations`` (theta refactor
+    count over the march), ``distinct_committed_h``, and, when
+    ``record_attempts``, the controller ``attempt_log``.
+    """
+    from .adaptive_integrator import AdaptiveStepping
+
+    t0, t_end = float(t_span[0]), float(t_span[1])
+    if t_end <= t0:
+        raise ValueError("t_span must be increasing")
+    y_k = np.asarray(y0, dtype=float).ravel().copy()
+    n_state = y_k.size
+    aux_k = dict(aux0 or {})
+
+    reported_scale = np.asarray(
+        getattr(stepper, "reaction_state_to_reported_scale", 1.0), dtype=float,
+    )
+
+    adapter = _MJFRatioAdapter(
+        stepper,
+        mu_from_state=mu_from_state,
+        slip_weakening=slip_weakening,
+        mu_fixed_point_tol=mu_fixed_point_tol,
+        mu_fixed_point_max_iter=mu_fixed_point_max_iter,
+    )
+
+    if h0 is None:
+        h0 = min(float(h_max), (t_end - t0) / 100.0)
+    h0 = min(float(h0), float(h_max), t_end - t0)
+
+    ctrl = AdaptiveStepping(
+        integrator=adapter,
+        atol=atol,
+        rtol=rtol,
+        h0=float(h0),
+        h_min=float(h_min),
+        h_max=float(h_max),
+        method_order=int(error_order),
+        mode="ratio",
+        controller=controller,
+        b_param=float(b_param),
+        r_min=float(r_min),
+        r_max=float(r_max),
+        dae_var_weight=dae_var_weight,
+        active_set_filter=bool(active_set_filter),
+        record_attempts=bool(record_attempts),
+    )
+
+    # Honour an explicit error_mask by folding it into the (auto) DAE weight:
+    # excluded rows get weight 0 in BOTH the error accumulation and the DOF
+    # count, exactly as solve_mjf_adaptive's boolean mask does.
+    if error_mask is not None:
+        mask_f = np.asarray(error_mask, dtype=bool).ravel().astype(float)
+        if mask_f.size != n_state:
+            raise ValueError(
+                f"error_mask has {mask_f.size} entries; expected {n_state}"
+            )
+        auto = ctrl._ensure_dae_mask(n_state).copy()
+        ctrl._dae_mask = auto * mask_f
+
+    t_hist = [t0]
+    y_hist = [y_k.copy()]
+    h_hist = []
+    info_hist = []
+    attempt_records = []
+    distinct_h: set[float] = set()
+    n_fac_start = int(getattr(stepper, "_theta_factorizations", 0))
+
+    t = t0
+    h_held = float(h0)                 # committed / reused step size
+    drift = 1.0                        # accumulated proposal drift since last commit
+    adapter.reset_committed(t, y_k, aux_k)
+    _end_eps = 10.0 * np.finfo(float).eps * max(abs(t_end), 1.0)
+    _snap_frac = 1.0e-3
+    attempts = 0
+
+    while t < t_end - _end_eps:
+        if attempts >= int(max_attempts):
+            raise RuntimeError(
+                f"adaptive-ratio MJF loop exceeded {max_attempts} attempts"
+            )
+        attempts += 1
+
+        # committed step, clamped to the horizon; quiescence proposes h_max.
+        h_step = min(h_held, float(h_max), t_end - t)
+        quiesced = quiescence is not None and bool(quiescence(t, y_k))
+        if quiesced:
+            h_step = min(float(h_max), t_end - t)
+        h_step = max(h_step, min(float(h_min), t_end - t))
+        # horizon snap: fold a sub-step sliver into this step (no micro-steps).
+        _rem = (t_end - t) - h_step
+        if 0.0 < _rem < _snap_frac * h_step:
+            h_step = t_end - t
+
+        distinct_h.add(float(h_step))
+        y_new, info, h_next, E_curr, success, solver_err, iters = ctrl.step(
+            stepper.rhs_callable, t, y_k, h_step,
+        )
+        accepted = bool(success) and bool(np.all(np.isfinite(y_new)))
+        attempt_records.append(
+            {"accepted": accepted, "t": float(t), "h": float(h_step),
+             "h_committed": float(h_held), "error": float(E_curr)}
+        )
+
+        if accepted:
+            aux_ref = adapter.accepted_aux()
+            if aux_sync is not None:
+                aux_ref = aux_sync(aux_ref, y_new)
+            info_aug = dict(info)
+            info_aug["adaptive_error"] = float(E_curr)
+            info_aug["adaptive_h"] = float(h_step)
+            info_aug["adaptive_h_committed"] = float(h_held)
+            p_c = np.asarray(info_aug.get("p_contact", np.zeros(0)), dtype=float)
+            p_e = np.asarray(
+                info_aug.get("p_contact_effective", np.zeros(0)), dtype=float,
+            )
+            if p_c.size:
+                h_half = 0.5 * h_step
+                info_aug["p_contact_force"] = p_c * reported_scale / h_half
+                info_aug["p_contact_effective_force"] = p_e * reported_scale / h_half
+
+            t = t + h_step
+            y_k = np.asarray(y_new, dtype=float).ravel().copy()
+            aux_k = aux_ref
+            t_hist.append(t)
+            y_hist.append(y_k.copy())
+            h_hist.append(float(h_step))
+            info_hist.append(info_aug)
+            adapter.reset_committed(t, y_k, aux_k)
+
+            # HOLD layer: ratio mode drifts h every accepted step (h_next =
+            # rho*h_step with rho clamped to [r_min, r_max]), so a SINGLE-step
+            # ratio test against hold_threshold >= r_max-1 is unsatisfiable (a
+            # dead band that degenerates the march to fixed-step at h0).
+            # Instead ACCUMULATE the per-step proposal ratio across held steps
+            # and commit once the accumulated drift leaves the hold band; this
+            # lets h grow/shrink geometrically (~r_max per step across commits)
+            # while the theta factorization is still reused between commits.
+            if quiesced:
+                # quiescence boosted this attempt to h_max; adopt the
+                # controller's proposal for the next committed step directly.
+                h_held = min(float(h_max), max(float(h_min), float(h_next)))
+                drift = 1.0
+            elif h_step == h_held:
+                drift *= (h_next / h_step) if h_step > 0.0 else 1.0
+                if abs(drift - 1.0) > hold_threshold:
+                    h_held = min(float(h_max), max(float(h_min), h_held * drift))
+                    drift = 1.0
+            # else: horizon-clamped final sliver -- keep h_held and drift.
+        else:
+            # reject: state unchanged; a failed step must change h, so follow
+            # the controller's (shrunk) proposal and reset the drift memory.
+            adapter.reset_committed(t, y_k, aux_k)
+            h_new = min(float(h_max), max(float(h_min), float(h_next)))
+            if h_new <= float(h_min) * (1.0 + 1.0e-12) and h_held <= float(h_min) * (1.0 + 1.0e-12):
+                raise RuntimeError(
+                    f"adaptive-ratio MJF step failed at h_min={h_new}"
+                )
+            h_held = h_new
+            drift = 1.0
+
+    n_factorizations = int(getattr(stepper, "_theta_factorizations", 0)) - n_fac_start
+    attempts_out = {
+        "accepted": [rec["accepted"] for rec in attempt_records],
+        "records": attempt_records,
+        "n_factorizations": n_factorizations,
+        "distinct_committed_h": sorted(distinct_h),
+        "n_attempts": attempts,
+    }
+    if record_attempts:
+        attempts_out["attempt_log"] = ctrl.get_attempt_log()
+    return (
+        np.asarray(t_hist, dtype=float),
+        np.asarray(y_hist, dtype=float),
+        np.asarray(h_hist, dtype=float),
+        info_hist,
+        attempts_out,
     )
 
 

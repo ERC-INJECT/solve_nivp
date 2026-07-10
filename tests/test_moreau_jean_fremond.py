@@ -749,6 +749,55 @@ def test_descriptor_mjf_state_dependent_mu_uses_theta_state_without_outer_fixed_
     assert dmu_calls["count"] > 0
     assert info["contact_ssn_converged"]
 
+
+def test_descriptor_mjf_state_mu_uses_prestep_velocity_for_fremond_offset():
+    # The Fremond restitution offset (theta(1+e)-1)*u_{N,k} must be built from
+    # the PRE-STEP contact velocity D@y on the state-mu route, exactly as on
+    # the aux-mu route -- not from the free predictor D@(z_pred - X@offset)
+    # (the velocity with the whole contact reaction, including the prestress
+    # hold, removed).  A critically prestressed contact in exact equilibrium
+    # must STICK with zero motion; with the predictor datum it ruptures in one
+    # step (the fictitious closing velocity turns into a restitution push that
+    # the De Saxce coupling converts into slip).
+    import scipy.sparse as sp
+
+    mu0, N0 = 0.3, 1.0e6
+    tau = 0.999 * mu0 * N0                  # prestress at 99.9% of the cone
+    n = 2
+    common = dict(
+        A=sp.eye(n, format="csr"),
+        rhs_callable=lambda t, y: np.zeros(n),
+        rhs_jac_callable=lambda t, y: sp.csr_matrix((n, n)),
+        D_extract=np.eye(n), B=np.eye(n),
+        contacts=[{"vel_normal_idx": 0, "vel_tangential_idx": [1],
+                   "mu_init": mu0, "e": 0.0}],
+        contact_offset_force=lambda y, t: np.array([N0, -tau]),
+        theta=0.5, aux_law="constant", contact_solver="petsc_ssn",
+        contact_linear_solver="dense", contact_residual="soc_fb",
+        theta_linear_solver="scipy",
+    )
+    y0 = np.zeros(n)
+    h = 1.0e-2
+
+    ref = DescriptorMoreauJeanFremondStepper(**common)
+    y_ref, _, info_ref = ref.step(0.0, y0, {"mu": np.array([mu0])}, h)
+
+    st = DescriptorMoreauJeanFremondStepper(
+        **common, mu_state_callback=lambda z, t: np.array([mu0]),
+    )
+    y_new, _, info = st.step(0.0, y0, {"mu": np.array([mu0])}, h)
+
+    # equilibrium: stick, zero motion, reaction = prestress hold
+    assert info["regime"] == ["stick"]
+    np.testing.assert_allclose(y_new, np.zeros(n), atol=1.0e-9)
+    # constant mu => the state-mu route must reproduce the aux-mu route
+    np.testing.assert_allclose(y_new, y_ref, atol=1.0e-12)
+    np.testing.assert_allclose(
+        info["p_contact_effective"], info_ref["p_contact_effective"],
+        rtol=1.0e-12,
+    )
+
+
 def test_solve_mjf_adaptive_sliding_block_matches_analytical():
     mass, g, mu = 1.0, 9.81, 0.4
     F_T = 1.5 * mu * mass * g

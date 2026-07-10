@@ -295,6 +295,117 @@ def _scalar_fb_nb(a, b):
 
 
 @njit(cache=True)
+def soc_fb_ssn_assemble_state_mu(W, b, p, mu, alpha, rest, dmu_dp, d, tie):
+    """Fused soc_fb SSN residual + mu-COUPLED dense Jacobian (state-dependent mu).
+
+    Mirrors the pure-python block loop in
+    ``DescriptorMoreauJeanFremondStepper._solve_contact_petsc_ssn_state_mu``:
+    on top of the fixed-mu Jacobian, each cone block picks up the chain-rule
+    terms through mu(p) with per-contact gradient rows ``dmu_dp`` (N, n):
+    the shift term d(alpha*||u_T||)/dmu, the rescalings dT_x/dmu, dT_y/dmu,
+    and the T_y^{-1} prefactor derivative.  The scalar branch (d == 1 or
+    vanishing mu) matches ``soc_fb_ssn_assemble`` (no mu coupling there,
+    exactly as the python loop).  ``alpha`` must equal ``mu`` for the
+    coupling terms to be exact (the state-mu route always passes alpha=mu).
+    """
+    N = mu.shape[0]
+    n = N * d
+    u_full = W @ p + b
+    residual = np.zeros(n)
+    jac = np.zeros((n, n))
+
+    for k in range(N):
+        i0 = k * d
+        mk = mu[k]
+        ak = alpha[k]
+        u = u_full[i0:i0 + d].copy()
+        pb = p[i0:i0 + d].copy()
+
+        nT = 0.0
+        for j in range(1, d):
+            nT += u[j] * u[j]
+        nT = np.sqrt(nT)
+        u_hat = u.copy()
+        u_hat[0] += ak * nT + rest[k]
+
+        if mk <= 1.0e-14 or d == 1:
+            # Scalar normal NCP + identity tangential rows (no mu coupling).
+            phi0, dphi_du, dphi_dp = _scalar_fb_nb(u_hat[0], pb[0])
+            residual[i0] = phi0
+            for c in range(n):
+                jac[i0, c] = dphi_du * W[i0, c]
+            if nT > 0.0:
+                for j in range(1, d):
+                    g = ak * u[j] / nT
+                    for c in range(n):
+                        jac[i0, c] += dphi_du * g * W[i0 + j, c]
+            elif ak > 0.0:
+                for j in range(1, d):
+                    for c in range(n):
+                        jac[i0, c] += dphi_du * ak * W[i0 + j, c]
+            jac[i0, i0] += dphi_dp
+            for j in range(1, d):
+                residual[i0 + j] = pb[j]
+                jac[i0 + j, i0 + j] = 1.0
+            continue
+
+        # Cone branch: x_sd = T_x u_hat, y_sd = T_y p_block.
+        x_sd = u_hat.copy()
+        for j in range(1, d):
+            x_sd[j] *= mk
+        y_sd = pb.copy()
+        y_sd[0] *= mk
+        phi, dX, dY = _soc_fb_phi_jac_nb(x_sd, y_sd, True, tie)
+        tyi0 = 1.0 / mk
+        residual[i0] = tyi0 * phi[0]
+        for j in range(1, d):
+            residual[i0 + j] = phi[j]
+
+        # J_shift row 0 tangential coupling (Clarke element at u_T = 0).
+        g_shift = np.empty(d)
+        g_shift[0] = 0.0
+        if nT > 0.0:
+            for j in range(1, d):
+                g_shift[j] = mk * u[j] / nT
+        else:
+            for j in range(1, d):
+                g_shift[j] = mk
+        dmu_row = dmu_dp[k]
+
+        # dx_dp[a, c] and dy_dp[a, c] built column-wise:
+        #   duhat_dp[0, c] = W[i0, c] + sum_j g_shift[j] W[i0+j, c] + nT dmu_row[c]
+        #   duhat_dp[j, c] = W[i0+j, c]
+        #   dx_dp[0, c] = duhat_dp[0, c]                      ((dT_x uhat)[0] = 0)
+        #   dx_dp[j, c] = mk W[i0+j, c] + u[j] dmu_row[c]     ((dT_x uhat)[j] = uhat[j])
+        #   dy_dp[0, c] = mk E[i0, c] + pb[0] dmu_row[c]
+        #   dy_dp[j, c] = E[i0+j, c]
+        # J rows: T_y_inv (dX dx_dp + dY dy_dp) + outer(dT_y_inv phi, dmu_row).
+        dx0 = np.empty(n)
+        for c in range(n):
+            s = W[i0, c]
+            for j in range(1, d):
+                s += g_shift[j] * W[i0 + j, c]
+            dx0[c] = s + nT * dmu_row[c]
+        for a in range(d):
+            ty_a = tyi0 if a == 0 else 1.0
+            for c in range(n):
+                acc = dX[a, 0] * dx0[c]
+                for bb in range(1, d):
+                    acc += dX[a, bb] * (mk * W[i0 + bb, c] + u[bb] * dmu_row[c])
+                acc += dY[a, 0] * pb[0] * dmu_row[c]
+                jac[i0 + a, c] = ty_a * acc
+            # E-block columns of dy_dp (identity within the block).
+            jac[i0 + a, i0] += ty_a * dY[a, 0] * mk
+            for bb in range(1, d):
+                jac[i0 + a, i0 + bb] += ty_a * dY[a, bb]
+        # d(T_y_inv)/dmu prefactor term on the normal row.
+        for c in range(n):
+            jac[i0, c] += (-phi[0] / (mk * mk)) * dmu_row[c]
+
+    return residual, jac, u_full
+
+
+@njit(cache=True)
 def soc_fb_ssn_assemble(W, b, p, mu, alpha, rest, d, want_jac, tie):
     """Fused soc_fb SSN residual (+ dense Jacobian) for uniform block dim d.
 
