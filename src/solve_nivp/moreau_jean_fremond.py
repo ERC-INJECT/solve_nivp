@@ -35,6 +35,7 @@ contact dynamics."  HAL-04230941.
 from __future__ import annotations
 
 import collections
+import gc
 import inspect as _inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -42,6 +43,8 @@ from typing import Any, Callable, Optional
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+
+from .mjf_run_control import MJFRunMonitor, resolve_mjf_checkpoint
 
 from .soccp_pgs import (
     soccp_pgs,
@@ -2850,6 +2853,15 @@ def solve_mjf_adaptive(
     mu_fixed_point_max_iter: int = 12,
     aux_sync: Optional[Callable[[dict, np.ndarray], dict]] = None,
     max_attempts: int = 100000,
+    label: str = "MJF-adaptive",
+    on_step: Optional[Callable[..., None]] = None,
+    progress_interval_s: Optional[float] = None,
+    checkpoint_path=None,
+    checkpoint_every_steps: Optional[int] = None,
+    checkpoint_every_walltime_s: Optional[float] = None,
+    thin_output: int = 1,
+    gc_interval: int = 0,
+    resume_from=None,
 ):
     """Adaptive step-doubling driver for Moreau-Jean-Fremond steppers.
 
@@ -2875,6 +2887,41 @@ def solve_mjf_adaptive(
     aux_sync : callable, optional
         ``(aux, y) -> aux`` applied after each accepted step, for aux entries
         mirrored from the DAE state (e.g. ``aux['cum_slip']``).
+    label : str
+        Run label used in progress lines and checkpoints.
+    on_step : callable, optional
+        ``on_step(t, y, aux, info)`` invoked after every accepted step (never
+        for rejected attempts).  Exceptions propagate and abort the march.
+    progress_interval_s : float, optional
+        When set, print a one-line status (accepted/rejected counts,
+        simulation time, percent of horizon, step size, elapsed wall time,
+        ETA) at most every this many wall-clock seconds, plus a final line.
+    checkpoint_path : str or os.PathLike, optional
+        Destination ``.npz`` for restart checkpoints (written atomically;
+        each write replaces the previous file).  A final checkpoint is
+        written when the march completes.
+    checkpoint_every_steps : int, optional
+        Checkpoint every N accepted steps.
+    checkpoint_every_walltime_s : float, optional
+        Checkpoint whenever this much wall time passed since the last one
+        (combinable with ``checkpoint_every_steps``; first trigger wins).
+    thin_output : int, default 1
+        Store only every N-th accepted step in the returned ``t``/``y``/``h``
+        /``info`` histories (the final state is always stored); the march
+        itself is unchanged.  With ``thin_output > 1`` the per-attempt
+        ``attempts['records']`` keep only the stored accepted steps --
+        use ``attempts['n_accepted']`` / ``attempts['n_rejected']`` (always
+        present) for exact counts.
+    gc_interval : int, default 0
+        Run ``gc.collect()`` every N accepted steps (0 disables).
+    resume_from : str, os.PathLike or dict, optional
+        Checkpoint path (or dict from
+        :func:`~solve_nivp.mjf_run_control.load_mjf_checkpoint`) to restart
+        from: the march starts at the checkpointed ``(t, y, aux)`` and runs
+        to ``t_span[1]``; ``y0``/``aux0`` are ignored, and ``h0`` defaults to
+        the checkpointed step-size proposal.  The returned histories cover
+        only this segment.  The step controller's error-history memory is not
+        checkpointed (it re-converges within a few steps).
 
     Returns
     -------
@@ -2886,14 +2933,58 @@ def solve_mjf_adaptive(
         ``mu_from_state`` is given), and ``p_contact_force`` /
         ``p_contact_effective_force`` (impulse over the half step converted
         to reported force units).
-    attempts : dict with ``accepted`` flags and per-attempt ``records``.
+    attempts : dict with ``accepted`` flags, per-attempt ``records``, and
+        exact ``n_accepted`` / ``n_rejected`` counters.
     """
     t0, t_end = float(t_span[0]), float(t_span[1])
     if t_end <= t0:
         raise ValueError("t_span must be increasing")
+    thin_output = max(1, int(thin_output))
+    step_index0 = 0
+    if resume_from is not None:
+        _ckpt = resolve_mjf_checkpoint(resume_from)
+        t0 = float(_ckpt["t"])
+        y0 = _ckpt["y"]
+        aux0 = _ckpt["aux"]
+        step_index0 = int(_ckpt.get("step_index", 0))
+        if h0 is None:
+            _h_next = _ckpt.get("extras", {}).get("h_next")
+            h0 = float(_h_next) if _h_next is not None else float(_ckpt["h"])
     y_k = np.asarray(y0, dtype=float).ravel().copy()
     n_state = y_k.size
     aux_k = dict(aux0 or {})
+
+    monitor = None
+    if (on_step is not None or progress_interval_s is not None
+            or checkpoint_path is not None
+            or checkpoint_every_steps is not None
+            or checkpoint_every_walltime_s is not None):
+        monitor = MJFRunMonitor(
+            t_start=t0, t_end=t_end, label=label, driver="adaptive",
+            progress_interval_s=progress_interval_s, on_step=on_step,
+            checkpoint_path=checkpoint_path,
+            checkpoint_every_steps=checkpoint_every_steps,
+            checkpoint_every_walltime_s=checkpoint_every_walltime_s,
+            step_index0=step_index0)
+
+    # A resumed checkpoint already at (or past) the horizon: return the
+    # trivial single-state segment (fresh calls with a bad horizon raised
+    # above, unchanged).
+    if resume_from is not None:
+        _arrived_eps = 10.0 * np.finfo(float).eps * max(abs(t_end), 1.0)
+        if t0 >= t_end - _arrived_eps:
+            if monitor is not None:
+                monitor.finish(t0, y_k, aux_k, h=float(h0),
+                               extras={"h_next": float(h0)})
+            return (
+                np.asarray([t0], dtype=float),
+                np.asarray([y_k.copy()], dtype=float),
+                np.zeros(0),
+                [],
+                {"accepted": [], "records": [],
+                 "n_accepted": 0, "n_rejected": 0,
+                 "thin_output": thin_output},
+            )
 
     atol_arr = np.broadcast_to(np.asarray(atol, dtype=float), (n_state,))
     rtol_arr = np.broadcast_to(np.asarray(rtol, dtype=float), (n_state,))
@@ -2956,6 +3047,14 @@ def solve_mjf_adaptive(
     h_hist = []
     info_hist = []
     attempt_records = []
+    n_accepted = 0
+    n_rejected = 0
+    # Thinning bookkeeping: index of the last accepted step actually stored,
+    # and a one-slot buffer of the most recent accepted step so the final
+    # state can be stored even when it falls off the thinning grid.  The
+    # buffer (with its state copy) is only maintained when thinning is on.
+    _last_stored_step = 0
+    _last_entry = None
     expo = -1.0 / (float(error_order) + 1.0)
     if h0 is None:
         h0 = min(float(h_max), (t_end - t0) / 100.0)
@@ -2965,13 +3064,14 @@ def solve_mjf_adaptive(
     # Scaled by |t_end| so accumulated t drift near a large horizon still counts
     # as "arrived" (an absolute 10*eps is far below one ULP of t_end ~ 1e2).
     _end_eps = 10.0 * np.finfo(float).eps * max(abs(t_end), 1.0)
-    while t_hist[-1] < t_end - _end_eps:
+    t_cur = t0
+    while t_cur < t_end - _end_eps:
         if attempts >= int(max_attempts):
             raise RuntimeError(
                 f"adaptive MJF loop exceeded {max_attempts} attempts"
             )
         attempts += 1
-        t_k = float(t_hist[-1])
+        t_k = float(t_cur)
         h_k = min(float(h_try), t_end - t_k, float(h_max))
         h_k = max(h_k, min(float(h_min), t_end - t_k))
         # Horizon-snap: if a full step would leave only a sub-step sliver before
@@ -2998,10 +3098,10 @@ def solve_mjf_adaptive(
             finite = False
             last_exc = exc
         accepted = finite and (err <= 1.0 or h_k <= float(h_min) * (1.0 + 1e-12))
-        attempt_records.append(
-            {"accepted": bool(accepted), "t": t_k, "h": h_k, "error": float(err)}
-        )
+        _rec = {"accepted": bool(accepted), "t": t_k, "h": h_k, "error": float(err)}
         if accepted:
+            n_accepted += 1
+            t_cur = t_k + h_k
             y_k = y_ref
             aux_k = aux_sync(aux_ref, y_ref) if aux_sync is not None else aux_ref
             info_aug = dict(info_ref)
@@ -3014,17 +3114,32 @@ def solve_mjf_adaptive(
             if p_c.size:
                 info_aug["p_contact_force"] = p_c * reported_scale / h_half
                 info_aug["p_contact_effective_force"] = p_e * reported_scale / h_half
-            t_hist.append(t_k + h_k)
-            y_hist.append(y_k.copy())
-            h_hist.append(h_k)
-            info_hist.append(info_aug)
+            _store = (n_accepted % thin_output == 0)
+            if _store:
+                t_hist.append(t_cur)
+                y_hist.append(y_k.copy())
+                h_hist.append(h_k)
+                info_hist.append(info_aug)
+                _last_stored_step = n_accepted
+            if thin_output == 1 or _store:
+                attempt_records.append(_rec)
+            if thin_output > 1:
+                _last_entry = (n_accepted, t_cur, y_k.copy(), h_k, info_aug, _rec)
             if err <= 1.0e-16:
                 factor = float(max_factor)
             else:
                 factor = float(safety) * err ** expo
                 factor = min(float(max_factor), max(float(min_factor), factor))
             h_try = min(float(h_max), max(float(h_min), h_k * factor))
+            if monitor is not None:
+                monitor.after_step(t_cur, y_k, aux_k, info_aug, h=h_k,
+                                   extras={"h_next": float(h_try)})
+            if gc_interval > 0 and n_accepted % gc_interval == 0:
+                gc.collect()
         else:
+            n_rejected += 1
+            if thin_output == 1:
+                attempt_records.append(_rec)
             if not finite and h_k <= float(h_min) * (1.0 + 1e-12):
                 raise RuntimeError(
                     f"MJF step failed at h_min={h_k}"
@@ -3035,7 +3150,22 @@ def solve_mjf_adaptive(
                 factor = float(safety) * err ** expo
                 factor = min(0.8, max(float(min_factor), factor))
             h_try = max(float(h_min), h_k * factor)
+            if monitor is not None:
+                monitor.after_reject(t_k, h_k)
 
+    # With thinning on, the final accepted state may fall off the storage
+    # grid; append it (and its attempt record) from the buffer so the
+    # trajectory always ends at t_end.
+    if _last_entry is not None and _last_entry[0] != _last_stored_step:
+        _, _t_last, _y_last, _h_last, _info_last, _rec_last = _last_entry
+        t_hist.append(_t_last)
+        y_hist.append(_y_last)
+        h_hist.append(_h_last)
+        info_hist.append(_info_last)
+        attempt_records.append(_rec_last)
+    if monitor is not None:
+        monitor.finish(t_cur, y_k, aux_k, h=float(h_try),
+                       extras={"h_next": float(h_try)})
     return (
         np.asarray(t_hist, dtype=float),
         np.asarray(y_hist, dtype=float),
@@ -3044,6 +3174,9 @@ def solve_mjf_adaptive(
         {
             "accepted": [rec["accepted"] for rec in attempt_records],
             "records": attempt_records,
+            "n_accepted": n_accepted,
+            "n_rejected": n_rejected,
+            "thin_output": thin_output,
         },
     )
 
@@ -3057,7 +3190,7 @@ def solve_mjf_adaptive(
 # error weighting, and the active-set filter.  A HOLD layer above the
 # controller keeps the committed step size FIXED while the controller's
 # proposal drifts inside a band, so the per-h theta factorization cache
-# (Task A) is reused: factorizations ~= number of distinct committed h << steps.
+# is reused: factorizations ~= number of distinct committed h << steps.
 # -----------------------------------------------------------------------------
 
 
@@ -3382,6 +3515,15 @@ def solve_mjf_adaptive_ratio(
     hold_threshold: float = 0.2,
     quiescence: Optional[Callable[[float, np.ndarray], bool]] = None,
     record_attempts: bool = False,
+    label: str = "MJF-ratio",
+    on_step: Optional[Callable[..., None]] = None,
+    progress_interval_s: Optional[float] = None,
+    checkpoint_path=None,
+    checkpoint_every_steps: Optional[int] = None,
+    checkpoint_every_walltime_s: Optional[float] = None,
+    thin_output: int = 1,
+    gc_interval: int = 0,
+    resume_from=None,
 ):
     """Ratio-mode adaptive driver for Moreau-Jean-Fremond steppers.
 
@@ -3425,20 +3567,81 @@ def solve_mjf_adaptive_ratio(
     active_set_filter : suppress regime-transition velocity DOFs from the norm.
     quiescence : optional ``(t, y) -> bool``; when True the attempt proposes
         ``h_max`` (the controller and ratio band still gate acceptance).
+    label, on_step, progress_interval_s, checkpoint_path,
+    checkpoint_every_steps, checkpoint_every_walltime_s, thin_output,
+    gc_interval, resume_from : run-control options with the same semantics as
+        :func:`solve_mjf_adaptive` (progress heartbeat, per-accepted-step user
+        callback, periodic atomic restart checkpoints, history thinning with
+        the final state always stored, periodic ``gc.collect()``, and restart
+        from a checkpoint).  Ratio-specific notes: the checkpoint stores the
+        *held/committed* step size, so a resumed march continues at the held
+        ``h`` (``h0`` overrides it); the digital filter's internal memory and
+        the hold-layer drift accumulator are not checkpointed and re-converge
+        within a few steps after resume.
 
     Returns ``(t, y, h, info, attempts)`` as :func:`solve_mjf_adaptive`, with
     ``attempts`` additionally carrying ``n_factorizations`` (theta refactor
-    count over the march), ``distinct_committed_h``, and, when
-    ``record_attempts``, the controller ``attempt_log``.
+    count over the march), ``distinct_committed_h``, ``n_accepted`` /
+    ``n_rejected`` exact counters, and, when ``record_attempts``, the
+    controller ``attempt_log``.
     """
     from .adaptive_integrator import AdaptiveStepping
 
     t0, t_end = float(t_span[0]), float(t_span[1])
     if t_end <= t0:
         raise ValueError("t_span must be increasing")
+    thin_output = max(1, int(thin_output))
+    step_index0 = 0
+    if resume_from is not None:
+        _ckpt = resolve_mjf_checkpoint(resume_from)
+        t0 = float(_ckpt["t"])
+        y0 = _ckpt["y"]
+        aux0 = _ckpt["aux"]
+        step_index0 = int(_ckpt.get("step_index", 0))
+        if h0 is None:
+            _h_held = _ckpt.get("extras", {}).get("h_held")
+            h0 = float(_h_held) if _h_held is not None else float(_ckpt["h"])
     y_k = np.asarray(y0, dtype=float).ravel().copy()
     n_state = y_k.size
     aux_k = dict(aux0 or {})
+
+    monitor = None
+    if (on_step is not None or progress_interval_s is not None
+            or checkpoint_path is not None
+            or checkpoint_every_steps is not None
+            or checkpoint_every_walltime_s is not None):
+        monitor = MJFRunMonitor(
+            t_start=t0, t_end=t_end, label=label, driver="ratio",
+            progress_interval_s=progress_interval_s, on_step=on_step,
+            checkpoint_path=checkpoint_path,
+            checkpoint_every_steps=checkpoint_every_steps,
+            checkpoint_every_walltime_s=checkpoint_every_walltime_s,
+            step_index0=step_index0)
+
+    # A resumed checkpoint already at (or past) the horizon: return the
+    # trivial single-state segment (fresh calls with a bad horizon raised
+    # above, unchanged).
+    if resume_from is not None:
+        _arrived_eps = 10.0 * np.finfo(float).eps * max(abs(t_end), 1.0)
+        if t0 >= t_end - _arrived_eps:
+            if monitor is not None:
+                monitor.finish(t0, y_k, aux_k, h=float(h0),
+                               extras={"h_held": float(h0)})
+            attempts_out = {
+                "accepted": [], "records": [], "n_factorizations": 0,
+                "distinct_committed_h": [], "n_attempts": 0,
+                "n_accepted": 0, "n_rejected": 0,
+                "thin_output": thin_output,
+            }
+            if record_attempts:
+                attempts_out["attempt_log"] = None
+            return (
+                np.asarray([t0], dtype=float),
+                np.asarray([y_k.copy()], dtype=float),
+                np.zeros(0),
+                [],
+                attempts_out,
+            )
 
     reported_scale = np.asarray(
         getattr(stepper, "reaction_state_to_reported_scale", 1.0), dtype=float,
@@ -3491,6 +3694,13 @@ def solve_mjf_adaptive_ratio(
     h_hist = []
     info_hist = []
     attempt_records = []
+    n_accepted = 0
+    n_rejected = 0
+    # Thinning bookkeeping (same contract as solve_mjf_adaptive): last stored
+    # accepted-step index plus a one-slot buffer of the newest accepted step,
+    # maintained only when thinning is on.
+    _last_stored_step = 0
+    _last_entry = None
     distinct_h: set[float] = set()
     n_fac_start = int(getattr(stepper, "_theta_factorizations", 0))
 
@@ -3525,12 +3735,11 @@ def solve_mjf_adaptive_ratio(
             stepper.rhs_callable, t, y_k, h_step,
         )
         accepted = bool(success) and bool(np.all(np.isfinite(y_new)))
-        attempt_records.append(
-            {"accepted": accepted, "t": float(t), "h": float(h_step),
-             "h_committed": float(h_held), "error": float(E_curr)}
-        )
+        _rec = {"accepted": accepted, "t": float(t), "h": float(h_step),
+                "h_committed": float(h_held), "error": float(E_curr)}
 
         if accepted:
+            n_accepted += 1
             aux_ref = adapter.accepted_aux()
             if aux_sync is not None:
                 aux_ref = aux_sync(aux_ref, y_new)
@@ -3550,10 +3759,18 @@ def solve_mjf_adaptive_ratio(
             t = t + h_step
             y_k = np.asarray(y_new, dtype=float).ravel().copy()
             aux_k = aux_ref
-            t_hist.append(t)
-            y_hist.append(y_k.copy())
-            h_hist.append(float(h_step))
-            info_hist.append(info_aug)
+            _store = (n_accepted % thin_output == 0)
+            if _store:
+                t_hist.append(t)
+                y_hist.append(y_k.copy())
+                h_hist.append(float(h_step))
+                info_hist.append(info_aug)
+                _last_stored_step = n_accepted
+            if thin_output == 1 or _store:
+                attempt_records.append(_rec)
+            if thin_output > 1:
+                _last_entry = (n_accepted, t, y_k.copy(), float(h_step),
+                               info_aug, _rec)
             adapter.reset_committed(t, y_k, aux_k)
 
             # HOLD layer: ratio mode drifts h every accepted step (h_next =
@@ -3575,9 +3792,17 @@ def solve_mjf_adaptive_ratio(
                     h_held = min(float(h_max), max(float(h_min), h_held * drift))
                     drift = 1.0
             # else: horizon-clamped final sliver -- keep h_held and drift.
+            if monitor is not None:
+                monitor.after_step(t, y_k, aux_k, info_aug, h=float(h_step),
+                                   extras={"h_held": float(h_held)})
+            if gc_interval > 0 and n_accepted % gc_interval == 0:
+                gc.collect()
         else:
             # reject: state unchanged; a failed step must change h, so follow
             # the controller's (shrunk) proposal and reset the drift memory.
+            n_rejected += 1
+            if thin_output == 1:
+                attempt_records.append(_rec)
             adapter.reset_committed(t, y_k, aux_k)
             h_new = min(float(h_max), max(float(h_min), float(h_next)))
             if h_new <= float(h_min) * (1.0 + 1.0e-12) and h_held <= float(h_min) * (1.0 + 1.0e-12):
@@ -3586,7 +3811,22 @@ def solve_mjf_adaptive_ratio(
                 )
             h_held = h_new
             drift = 1.0
+            if monitor is not None:
+                monitor.after_reject(float(t), float(h_step))
 
+    # With thinning on, the final accepted state may fall off the storage
+    # grid; append it (and its attempt record) from the buffer so the
+    # trajectory always ends at t_end.
+    if _last_entry is not None and _last_entry[0] != _last_stored_step:
+        _, _t_last, _y_last, _h_last, _info_last, _rec_last = _last_entry
+        t_hist.append(_t_last)
+        y_hist.append(_y_last)
+        h_hist.append(_h_last)
+        info_hist.append(_info_last)
+        attempt_records.append(_rec_last)
+    if monitor is not None:
+        monitor.finish(float(t), y_k, aux_k, h=float(h_held),
+                       extras={"h_held": float(h_held)})
     n_factorizations = int(getattr(stepper, "_theta_factorizations", 0)) - n_fac_start
     attempts_out = {
         "accepted": [rec["accepted"] for rec in attempt_records],
@@ -3594,6 +3834,9 @@ def solve_mjf_adaptive_ratio(
         "n_factorizations": n_factorizations,
         "distinct_committed_h": sorted(distinct_h),
         "n_attempts": attempts,
+        "n_accepted": n_accepted,
+        "n_rejected": n_rejected,
+        "thin_output": thin_output,
     }
     if record_attempts:
         attempts_out["attempt_log"] = ctrl.get_attempt_log()

@@ -1,4 +1,4 @@
-"""Ratio-mode adaptive MJF driver (Task B).
+"""Ratio-mode adaptive MJF driver.
 
 ``solve_mjf_adaptive_ratio`` delegates step-size control to the generic
 :class:`~solve_nivp.adaptive_integrator.AdaptiveStepping` in ``mode="ratio"``
@@ -7,10 +7,11 @@ DAE-aware error weighting, active-set filter), driving the
 :class:`DescriptorMoreauJeanFremondStepper` through a thin integrator-contract
 adapter.  A HOLD layer above the controller keeps the committed step size fixed
 while the controller's proposal drifts inside a band, so the per-h theta
-factorization cache (Task A) is reused and the factorization count tracks the
-number of *distinct* committed step sizes, not the number of steps.
+factorization cache (see ``test_theta_multilevel_cache.py``) is reused and the
+factorization count tracks the number of *distinct* committed step sizes, not
+the number of steps.
 
-Test map (per the Task B brief):
+Test map:
   (e)   trajectory vs analytical on the sliding block (mirrors
         test_moreau_jean_fremond::test_solve_mjf_adaptive_sliding_block_*)
   (r1)  ratio-band leniency: a step with E > 1 is accepted (band, not E<=1)
@@ -47,7 +48,7 @@ def _sliding_block(mu, F_T, *, mass=1.0, g=9.81, n_slip=0):
 
     Copy of ``test_moreau_jean_fremond._descriptor_sliding_block``.  The bulk
     Jacobian is CONSTANT, so the theta operator is byte-identical at a fixed h
-    and the Task-A cache applies.
+    and the theta-factorization cache applies.
     """
     n = 4 + n_slip
     A = np.eye(n)
@@ -216,7 +217,7 @@ def test_r2_factorizations_track_distinct_committed_h_contact():
 
 
 def test_r2b_hold_layer_grows_h_from_too_small_h0():
-    # DEAD-BAND regression (review blocking-1): the controller clamps the
+    # DEAD-BAND regression: the controller clamps the
     # accepted-step ratio to [r_min, r_max] = [0.8, 1.2], so a single-step
     # commit test against hold_threshold = 0.2 (== the band edge) could never
     # fire and h stayed at h0 forever (fixed-step degeneration).  The hold
@@ -300,7 +301,7 @@ def test_r4b_adapter_exposes_projection_to_controller():
 
 
 def test_r4b2_velocity_dof_map_interleaved_rows():
-    # Review blocking-2: production crack plants interleave the contact
+    # Regression: production crack plants interleave the contact
     # velocity rows in D_extract (all normals first, then all tangentials:
     # contact k uses rows [k, n_c + k]), so indexing D_extract by the reaction
     # block-slice positions [2k, 2k+2) mixes DOFs across contacts and the
@@ -553,7 +554,7 @@ def test_slip_weakening_route_actually_evolves_mu():
 
 
 def test_slip_weakening_trajectory_pins_production_fixed_route():
-    # Production-route regression pin (review request 4): force the adaptive
+    # Production-route regression pin: force the adaptive
     # driver onto a fixed h (h0 = h_max = h, lenient tolerance -> every attempt
     # accepted), so each accepted step is exactly two h/2 theta-steps; the
     # trajectory must then reproduce solve_mjf_fixed_step (the production

@@ -78,9 +78,9 @@ Research And Workspace Material
 
 The repository currently contains research notebooks, benchmark outputs,
 diagnostic scripts, and generated result files.  Those are valuable for
-reproducibility, but they are not the core package API.  During cleanup they
-should be separated from the installable library path and marked as examples,
-benchmarks, external reproductions, or archived artifacts.
+reproducibility, but they are not the core package API.  They are kept outside
+the installable library path and should be treated as examples, benchmarks,
+external reproductions, or archived artifacts.
 
 Compatibility Rule
 ------------------

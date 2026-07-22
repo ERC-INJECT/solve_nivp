@@ -1,6 +1,6 @@
-"""Phase 0 verification: SDIRK2 + SOC contact with step_size_arg = γh.
+"""SDIRK2 + SOC contact with step_size_arg = γh.
 
-Tests cover the four acceptance criteria:
+Tests cover four contact invariants:
   (a) gap ≥ 0
   (b) p_N ≥ 0
   (c) Coulomb feasibility ‖p_T‖ ≤ μ·p_N
@@ -112,7 +112,7 @@ class TestSDIRK2BouncingBall:
         _, y, *_ = sdirk2_solution
         q_y = y[:, 3]  # position in y-direction
         # SDIRK2's stage-2 extrapolation may allow O(h²) penetration;
-        # tighter gap enforcement requires event-location (Phase 2+).
+        # tighter gap enforcement would require event location (not implemented).
         assert np.all(q_y >= -1e-3), f"Penetration: min gap = {q_y.min()}"
 
     def test_normal_reaction_nonneg(self, sdirk2_solution):

@@ -2092,8 +2092,7 @@ def build_projected_radau_contact(
             # Signorini scalar FB on the normal + velocity-level Coulomb
             # compliance on the tangential), De Saxce / SOC-FB bipotential
             # at the endpoint Stage 2 where velocity-cone duality is the
-            # variationally correct setting.  See projected_radau_contact
-            # design notes 2026-05-11.
+            # variationally correct setting.
             law_obj = NCPNormalConeLaw(
                 ncp_type="fischer_burmeister",
                 normal_ncp_type=normal_ncp_type,
@@ -2107,7 +2106,8 @@ def build_projected_radau_contact(
                 )
         elif law_name in {"soc_fb_uniform", "socfb_uniform"}:
             # Legacy single-law dispatch: SOC-FB at both stages.  Retained
-            # for regression comparison with pre-split behavior.  Stage 1
+            # for regression comparison with the original single-law
+            # behavior.  Stage 1
             # SOC-FB is not Breuling-correct; prefer 'soc_fb' for new work.
             law_obj = SOCFischerBurmeisterLaw(
                 alpha=desaxce_alpha,

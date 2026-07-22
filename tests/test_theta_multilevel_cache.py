@@ -1,4 +1,4 @@
-"""Multi-level theta-factorization cache (Task A).
+"""Multi-level theta-factorization cache.
 
 The theta operator op(h) = (1/theta)A - hJ is affine and byte-identical at a
 fixed h, so each distinct h needs exactly one factorization.  The stepper keeps

@@ -50,7 +50,7 @@ See the Sphinx documentation (``docs/``) for extended examples.
 
 import numpy as np
 
-__version__ = "0.2.1.dev3"
+__version__ = "0.2.1.dev4"
 
 from .projections import (
   Projection,
@@ -70,6 +70,11 @@ from .solvers.block_system import SchurComplementSolver, BlockStructuredSystem
 from .ODESystem import ODESystem
 from .ODESolver import ODESolver
 from .mjf_integration import (MJFIntegrationMethod, solve_mjf_fixed_step, MJFContactView)
+from .mjf_run_control import (
+  MJFRunMonitor,
+  save_mjf_checkpoint,
+  load_mjf_checkpoint,
+)
 from .contact import build_impulse_contact, ContactSystem
 from .alart_curnier_contact import (
   build_alart_curnier_contact,

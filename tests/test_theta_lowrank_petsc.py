@@ -56,7 +56,7 @@ def test_scipy_lowrank_still_works():
 
 
 # ---------------------------------------------------------------------------
-# Stepper-level contract (Task 2): a DescriptorMoreauJeanFremondStepper driven
+# Stepper-level contract: a DescriptorMoreauJeanFremondStepper driven
 # with (J_sparse, theta_lowrank_jac=(U, V)) must integrate to the SAME
 # trajectory as one driven with J_folded = J_sparse - U V^T baked into the
 # sparse Jacobian -- both on the MUMPS backend, contact-free.

@@ -176,8 +176,8 @@ def test_projected_radau_inplace_reaction_step_writes_existing_state():
         # D_extract to select the velocity; the impact-from-below physics
         # of this regression test relies on velocity-level Signorini
         # enforcement at internal stages.  The legacy single-law SOC-FB
-        # ("soc_fb_uniform") provides that dispatch; the post-2026-05-11
-        # split "soc_fb" routes Stage 1 to position-level NCP, which is
+        # ("soc_fb_uniform") provides that dispatch; the split "soc_fb"
+        # law routes Stage 1 to position-level NCP, which is
         # admissible for this state and correctly does not generate a
         # contact reaction.
         contact_law="soc_fb_uniform",
