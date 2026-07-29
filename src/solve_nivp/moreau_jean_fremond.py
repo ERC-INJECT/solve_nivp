@@ -265,6 +265,10 @@ class MoreauJeanFremondStepper:
     # higher cap only does extra work where it prevents that collapse.
     contact_ssn_max_iter: int = 100
     contact_ssn_line_search: bool = True
+    # Retry a failed warm-started SSN solve once from p = 0: a stale warm
+    # start near an FB kink can stall for the whole iteration budget while
+    # the cold solve converges in a few iterations.
+    contact_ssn_cold_restart: bool = True
     contact_allow_nonconverged: bool = False
 
     def __post_init__(self):
@@ -355,6 +359,7 @@ class MoreauJeanFremondStepper:
         self.contact_ssn_tol = float(self.contact_ssn_tol)
         self.contact_ssn_max_iter = int(self.contact_ssn_max_iter)
         self.contact_ssn_line_search = bool(self.contact_ssn_line_search)
+        self.contact_ssn_cold_restart = bool(self.contact_ssn_cold_restart)
         self.contact_allow_nonconverged = bool(self.contact_allow_nonconverged)
         self._contact_petsc_solver = None
 
@@ -889,57 +894,72 @@ class MoreauJeanFremondStepper:
             else "petsc"
         )
 
-        converged = False
-        residual_norm = float("inf")
-        iters = 0
-        for it in range(max(1, self.contact_ssn_max_iter)):
-            F, J, _u = self._contact_ssn_residual_jacobian(
-                p, W_dense, b, mu_vec, shift_fn, want_jacobian=True,
+        def _newton_attempt(p):
+            nonlocal linear_backend
+            converged = False
+            residual_norm = float("inf")
+            iters = 0
+            for it in range(max(1, self.contact_ssn_max_iter)):
+                F, J, _u = self._contact_ssn_residual_jacobian(
+                    p, W_dense, b, mu_vec, shift_fn, want_jacobian=True,
+                    transforms=transforms, block_slices=block_slices,
+                )
+                residual_norm = float(np.linalg.norm(F))
+                iters = it + 1
+                if residual_norm < self.contact_ssn_tol:
+                    converged = True
+                    break
+
+                delta, linear_backend = self._contact_linear_solve(J, -F)
+                if self.contact_ssn_line_search:
+                    alpha = 1.0
+                    accepted = False
+                    while alpha >= 1.0e-8:
+                        p_trial = p + alpha * delta
+                        F_trial, _, _ = self._contact_ssn_residual_jacobian(
+                            p_trial, W_dense, b, mu_vec, shift_fn,
+                            want_jacobian=False, transforms=transforms,
+                            block_slices=block_slices,
+                        )
+                        trial_norm = float(np.linalg.norm(F_trial))
+                        if np.isfinite(trial_norm) and trial_norm <= (1.0 - 1.0e-4 * alpha) * residual_norm:
+                            p = p_trial
+                            accepted = True
+                            break
+                        alpha *= 0.5
+                    if not accepted:
+                        p_trial = p + delta
+                        F_trial, _, _ = self._contact_ssn_residual_jacobian(
+                            p_trial, W_dense, b, mu_vec, shift_fn,
+                            want_jacobian=False, transforms=transforms,
+                            block_slices=block_slices,
+                        )
+                        if np.all(np.isfinite(F_trial)):
+                            p = p_trial
+                        else:
+                            break
+                else:
+                    p = p + delta
+
+            F_final, _, u_full = self._contact_ssn_residual_jacobian(
+                p, W_dense, b, mu_vec, shift_fn, want_jacobian=False,
                 transforms=transforms, block_slices=block_slices,
             )
-            residual_norm = float(np.linalg.norm(F))
-            iters = it + 1
-            if residual_norm < self.contact_ssn_tol:
-                converged = True
-                break
+            residual_norm = float(np.linalg.norm(F_final))
+            converged = converged or residual_norm < self.contact_ssn_tol
+            return p, converged, residual_norm, iters, u_full
 
-            delta, linear_backend = self._contact_linear_solve(J, -F)
-            if self.contact_ssn_line_search:
-                alpha = 1.0
-                accepted = False
-                while alpha >= 1.0e-8:
-                    p_trial = p + alpha * delta
-                    F_trial, _, _ = self._contact_ssn_residual_jacobian(
-                        p_trial, W_dense, b, mu_vec, shift_fn,
-                        want_jacobian=False, transforms=transforms,
-                        block_slices=block_slices,
-                    )
-                    trial_norm = float(np.linalg.norm(F_trial))
-                    if np.isfinite(trial_norm) and trial_norm <= (1.0 - 1.0e-4 * alpha) * residual_norm:
-                        p = p_trial
-                        accepted = True
-                        break
-                    alpha *= 0.5
-                if not accepted:
-                    p_trial = p + delta
-                    F_trial, _, _ = self._contact_ssn_residual_jacobian(
-                        p_trial, W_dense, b, mu_vec, shift_fn,
-                        want_jacobian=False, transforms=transforms,
-                        block_slices=block_slices,
-                    )
-                    if np.all(np.isfinite(F_trial)):
-                        p = p_trial
-                    else:
-                        break
-            else:
-                p = p + delta
-
-        F_final, _, u_full = self._contact_ssn_residual_jacobian(
-            p, W_dense, b, mu_vec, shift_fn, want_jacobian=False,
-            transforms=transforms, block_slices=block_slices,
-        )
-        residual_norm = float(np.linalg.norm(F_final))
-        converged = converged or residual_norm < self.contact_ssn_tol
+        warm_start_nonzero = bool(np.any(p != 0.0))
+        p, converged, residual_norm, iters, u_full = _newton_attempt(p)
+        if (not converged and self.contact_ssn_cold_restart
+                and warm_start_nonzero):
+            # retry from p = 0 and keep whichever attempt ends closer
+            p_c, conv_c, resid_c, iters_c, u_c = _newton_attempt(
+                np.zeros_like(p)
+            )
+            iters += iters_c
+            if conv_c or resid_c < residual_norm:
+                p, converged, residual_norm, u_full = p_c, conv_c, resid_c, u_c
         if not converged and not self.contact_allow_nonconverged:
             raise RuntimeError(
                 "PETSc contact SSN failed to converge: "
@@ -1692,6 +1712,7 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         contact_ssn_tol: float = 1.0e-10,
         contact_ssn_max_iter: int = 100,
         contact_ssn_line_search: bool = True,
+        contact_ssn_cold_restart: bool = True,
         contact_allow_nonconverged: bool = False,
     ):
         self.A = _to_dense_or_sparse(A)
@@ -1888,6 +1909,7 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         self.contact_ssn_tol = float(contact_ssn_tol)
         self.contact_ssn_max_iter = int(contact_ssn_max_iter)
         self.contact_ssn_line_search = bool(contact_ssn_line_search)
+        self.contact_ssn_cold_restart = bool(contact_ssn_cold_restart)
         self.contact_allow_nonconverged = bool(contact_allow_nonconverged)
         self._contact_petsc_solver = None
         # Multi-level theta-factorization cache: op(h) = (1/theta)A - hJ is

@@ -88,6 +88,7 @@ class MJFIntegrationMethod(IntegrationMethod):
                  mu_from_slip: Optional[Callable] = None,
                  vel_t_extract=None, n_phys: Optional[int] = None,
                  mu_fp_tol: float = 1.0e-10, mu_fp_max_iter: int = 30,
+                 weaken_while_open: bool = True,
                  run_monitor: Optional[MJFRunMonitor] = None,
                  thin_output: int = 1):
         self.stepper = stepper
@@ -106,6 +107,7 @@ class MJFIntegrationMethod(IntegrationMethod):
         self.n_phys = n_phys
         self.mu_fp_tol = float(mu_fp_tol)
         self.mu_fp_max_iter = int(mu_fp_max_iter)
+        self.weaken_while_open = bool(weaken_while_open)
         # run control / memory options
         self.run_monitor = run_monitor
         self.thin_output = max(1, int(thin_output))
@@ -125,11 +127,30 @@ class MJFIntegrationMethod(IntegrationMethod):
         """Number of successful steps advanced (independent of thinning)."""
         return self._n_steps
 
+    def _closed_mask(self, info):
+        """Per-contact 1.0 where the step's TOTAL normal reaction is compressive.
+
+        An open contact transmits no friction, so its tangential free-flight
+        motion must not feed the slip-weakening law.  ``p_contact_effective``
+        is the total reaction (0 on gap-deactivated contacts); ``p_contact``
+        is the increment, which equals the total for steppers without offset
+        forces (with offsets it is -offset on open rows, still <= 0).
+        """
+        if self.weaken_while_open:
+            return 1.0
+        p_eff = info.get("p_contact_effective", info.get("p_contact"))
+        if p_eff is None:
+            return 1.0
+        p_eff = np.asarray(p_eff, float).ravel()
+        return np.array([float(p_eff[sl.start] > 0.0)
+                         for sl in self.stepper.block_slices])
+
     def _step_weakening(self, t, y, h):
         assert self.mu_from_slip is not None and self.vel_t_extract is not None
         s_k = np.asarray(y[self.slip_slice], float).ravel()
         mu_guess = np.asarray(self.mu_from_slip(s_k), float).ravel()
         v_t_theta = np.zeros(self.n_c)
+        closed = 1.0
         y1 = aux1 = info1 = None
         last_resid = np.inf
         n_iter = 0
@@ -139,13 +160,14 @@ class MJFIntegrationMethod(IntegrationMethod):
             y1, aux1, info1 = self.stepper.step(t, y, aux_in, h)
             y_theta = y + self.theta * (y1 - y)
             v_t_theta = np.asarray(self.vel_t_extract @ y_theta[:self.n_phys], float).ravel()
-            s_theta = s_k + self.theta * h * np.abs(v_t_theta)
+            closed = self._closed_mask(info1)
+            s_theta = s_k + self.theta * h * np.abs(v_t_theta) * closed
             mu_theta = np.asarray(self.mu_from_slip(s_theta), float).ravel()
             last_resid = float(np.linalg.norm(mu_theta - mu_guess, ord=np.inf))
             mu_guess = mu_theta
             if last_resid <= self.mu_fp_tol:
                 break
-        s_next = s_k + h * np.abs(v_t_theta)
+        s_next = s_k + h * np.abs(v_t_theta) * closed
         y1 = np.asarray(y1, float).copy()
         y1[self.slip_slice] = s_next
         aux1 = _copy_aux(aux1)
@@ -216,7 +238,8 @@ class MJFIntegrationMethod(IntegrationMethod):
 def solve_mjf_fixed_step(stepper, y0, aux0, tmax, h_fixed, n_c, reaction_scale,
                          *, slip_slice=None, mu_from_slip=None, vel_t_extract=None,
                          n_phys=None, warm_r=None, mu_fp_tol=1.0e-10,
-                         mu_fp_max_iter=30, max_steps=200000, label="MJF",
+                         mu_fp_max_iter=30, weaken_while_open=True,
+                         max_steps=200000, label="MJF",
                          verbose=True,
                          on_step=None, progress_interval_s=None,
                          checkpoint_path=None, checkpoint_every_steps=None,
@@ -316,6 +339,7 @@ def solve_mjf_fixed_step(stepper, y0, aux0, tmax, h_fixed, n_c, reaction_scale,
         slip_slice=slip_slice, mu_from_slip=mu_from_slip,
         vel_t_extract=vel_t_extract, n_phys=n_phys,
         mu_fp_tol=mu_fp_tol, mu_fp_max_iter=mu_fp_max_iter,
+        weaken_while_open=weaken_while_open,
         run_monitor=monitor, thin_output=thin_output)
 
     # A resumed checkpoint may already sit at (or past) the horizon; return

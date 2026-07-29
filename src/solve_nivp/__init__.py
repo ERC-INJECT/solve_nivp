@@ -50,7 +50,7 @@ See the Sphinx documentation (``docs/``) for extended examples.
 
 import numpy as np
 
-__version__ = "0.2.1.dev4"
+__version__ = "0.2.1.dev5"
 
 from .projections import (
   Projection,
