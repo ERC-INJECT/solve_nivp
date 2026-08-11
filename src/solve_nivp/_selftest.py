@@ -32,7 +32,7 @@ def main():
         print("pytest is required. Install with: pip install -e .[test]", file=sys.stderr)
         return 1
 
-    tests_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'tests')
+    tests_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'tests')
     if not os.path.isdir(tests_path):
         print(f"Tests directory not found: {tests_path}")
         print("If you installed non-editable, clone the repo and run tests from source.")

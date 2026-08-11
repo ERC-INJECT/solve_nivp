@@ -70,6 +70,16 @@ except Exception:  # pragma: no cover - numba is an optional dependency
 from .solvers.nonlinear_solvers import ImplicitEquationSolver, PETSC_AVAILABLE
 
 
+class _StaticThetaOperatorRevision:
+    """Identity token declaring a lifetime-invariant theta operator."""
+
+    def __repr__(self) -> str:
+        return "THETA_OPERATOR_STATIC"
+
+
+THETA_OPERATOR_STATIC = _StaticThetaOperatorRevision()
+
+
 # -----------------------------------------------------------------------------
 # Built-in aux-state laws for slip-rate friction
 # -----------------------------------------------------------------------------
@@ -1675,6 +1685,7 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         A,
         rhs_callable,
         rhs_jac_callable,
+        rhs_affine_callable: Optional[Any] = None,
         D_extract,
         B,
         contacts: list[dict],
@@ -1684,6 +1695,8 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         dmu_dstate_callback: Optional[Any] = None,
         gap_callable: Optional[Any] = None,
         gap_tol: float = 0.0,
+        normal_velocity_atol: float = 0.0,
+        normal_velocity_rtol: float = np.sqrt(np.finfo(float).eps),
         gap_jac: Optional[Any] = None,
         combined_projection: bool = False,
         projection_metric_inv: Optional[Any] = None,
@@ -1708,6 +1721,7 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         theta_petsc_reuse_steps: int = 1,
         theta_dense_rows: Optional[Any] = None,
         theta_lowrank_jac: Optional[Any] = None,
+        theta_operator_revision: Optional[Any] = None,
         theta_cache_size: int = 4,
         contact_ssn_tol: float = 1.0e-10,
         contact_ssn_max_iter: int = 100,
@@ -1718,24 +1732,57 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         self.A = _to_dense_or_sparse(A)
         self.rhs_callable = rhs_callable
         self.rhs_jac_callable = rhs_jac_callable
+        if rhs_affine_callable is not None and not callable(rhs_affine_callable):
+            raise TypeError("rhs_affine_callable must be None or callable")
+        self.rhs_affine_callable = rhs_affine_callable
+        if (
+            theta_operator_revision is not None
+            and theta_operator_revision is not THETA_OPERATOR_STATIC
+            and not callable(theta_operator_revision)
+        ):
+            raise TypeError(
+                "theta_operator_revision must be None, THETA_OPERATOR_STATIC, "
+                "or a callable (t_theta, y) -> hashable revision"
+            )
+        self.theta_operator_revision = theta_operator_revision
         self.D_extract = _to_dense_or_sparse(D_extract)
         self.B = _to_dense_or_sparse(B)
         self.constraints = list(constraints or [])
         self.contact_offset_force = contact_offset_force
         self.mu_state_callback = mu_state_callback
         self.dmu_dstate_callback = dmu_dstate_callback
-        # Geometric activation (gap index set): gap_callable(q_k) -> g_N per contact
-        # keeps contact alpha in the cone problem only while g_alpha(q_k) <= gap_tol,
-        # so the cone can open/close contacts (cf. Acary & Collins-Craft 2025, Eq. 19,
-        # less the u_{N,k}<=0 term, which would flicker a persistent contact whose
-        # normal velocity vibrates around 0).  The gap must be scaled consistently
-        # with D_extract, i.e. d g_alpha/dt = u_{N,alpha}.  For a PERSISTENT contact
-        # held exactly at g=0 (e.g. a prestressed fault, gap ~ 1e-10 numerical noise),
-        # set gap_tol to a small margin above that noise (e.g. 1e-6) so it stays
-        # active; for a genuinely separating contact (a bouncing ball, gap ~ O(1))
-        # use gap_tol=0.  Default gap_callable=None => persistent contact, unchanged.
+        # Geometric activation (Acary & Collins-Craft 2025, Eq. 19): contact
+        # alpha enters the cone problem only while BOTH
+        #
+        #   g_alpha(q_k) <= gap_tol  and  u_N,alpha,k <= velocity_tol_alpha.
+        #
+        # The gap must be scaled consistently with D_extract, i.e.
+        # d g_alpha/dt = u_N,alpha.  A strict floating-point u_N <= 0 test can
+        # flicker at a stationary persistent contact, so velocity_tol uses the
+        # scale-aware componentwise extraction bound
+        #
+        #   atol + rtol * (abs(D_N,alpha) @ abs(y_k)).
+        #
+        # A prior active contact's measured restitution-consistency defect is
+        # added at the next step.  That a posteriori term covers descriptor-
+        # solve error hidden by prestress/reaction cancellation without
+        # broadening the base scale to zero-valued row terms.  The default
+        # sqrt(eps) relative tolerance accepts matvec cancellation while
+        # retaining unit and state-scale covariance.  Set both tolerances to
+        # zero for the literal base comparison.  Default
+        # gap_callable=None retains the persistent all-active path unchanged.
         self.gap_callable = gap_callable
         self.gap_tol = float(gap_tol)
+        self.normal_velocity_atol = float(normal_velocity_atol)
+        self.normal_velocity_rtol = float(normal_velocity_rtol)
+        for name, value in (
+            ("normal_velocity_atol", self.normal_velocity_atol),
+            ("normal_velocity_rtol", self.normal_velocity_rtol),
+        ):
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"{name} must be finite and non-negative; got {value!r}"
+                )
         if gap_callable is not None and mu_state_callback is not None:
             raise NotImplementedError(
                 "gap_callable is not yet supported together with mu_state_callback "
@@ -1847,6 +1894,10 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             self.D_contact = self.D_extract[self.contact_velocity_rows, :]
         else:
             self.D_contact = sp.csr_matrix((0, self.n_state))
+        self.normal_contact_rows = np.array(
+            [block.start for block in self.block_slices], dtype=int,
+        )
+        self.D_normal = self.D_contact[self.normal_contact_rows, :]
 
         self.contact_solver = str(contact_solver or "petsc_ssn").lower()
         if self.contact_solver not in ("pgs", "petsc_ssn"):
@@ -1912,14 +1963,16 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         self.contact_ssn_cold_restart = bool(contact_ssn_cold_restart)
         self.contact_allow_nonconverged = bool(contact_allow_nonconverged)
         self._contact_petsc_solver = None
-        # Multi-level theta-factorization cache: op(h) = (1/theta)A - hJ is
-        # affine and byte-identical at a fixed h, so each distinct h needs
-        # exactly one factorization.  Keyed by float(h) with an LRU bound so
-        # h-revisits under an adaptive driver are free.
+        # Multi-level theta-factorization cache.  Conservative entries are
+        # keyed by float(h) and guarded by a rebuilt CSR fingerprint; explicitly
+        # certified entries are keyed by (float(h), operator_revision).  The LRU
+        # bound keeps both adaptive h-revisits and revision revisits finite.
         self.theta_cache_size = max(1, int(theta_cache_size))
         self._theta_cache = collections.OrderedDict()
         self._theta_factorizations = 0     # permanent instrumentation counter
         self._theta_cache_evictions = 0
+        self._theta_operator_builds = 0
+        self._theta_rhs_only_builds = 0
         self._B_dense = None
         # last converged effective contact impulse + its (t, y, h) key, reused
         # as the contact-SSN warm start on mu fixed-point re-entries (identical
@@ -1955,14 +2008,80 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
                 continue
         return fn(y_sub)
 
+    def _evaluate_affine_rhs(self, t: float) -> np.ndarray:
+        """Return a validated state-independent RHS contribution at ``t``."""
+        value = np.asarray(self.rhs_affine_callable(t), dtype=float).ravel()
+        if value.size != self.n_state:
+            raise ValueError(
+                "rhs_affine_callable returned a vector with invalid length: "
+                f"got {value.size}, expected {self.n_state}"
+            )
+        if not np.all(np.isfinite(value)):
+            raise ValueError("rhs_affine_callable must return only finite values")
+        return value
+
     def _rhs_and_jac_affine(self, t: float, y_ref: np.ndarray):
         f_ref = np.asarray(self.rhs_callable(t, y_ref), dtype=float).ravel()
         J = self.rhs_jac_callable(t, y_ref)
         J_sp = J.tocsr() if sp.issparse(J) else sp.csr_matrix(np.asarray(J, dtype=float))
-        f_affine = f_ref - np.asarray(J_sp @ y_ref).ravel()
+        if self.rhs_affine_callable is not None:
+            if f_ref.size != self.n_state:
+                raise ValueError(
+                    "rhs_callable returned a vector with invalid length: "
+                    f"got {f_ref.size}, expected {self.n_state}"
+                )
+            if not np.all(np.isfinite(f_ref)):
+                raise ValueError("rhs_callable must return only finite values")
+            if J_sp.shape != (self.n_state, self.n_state):
+                raise ValueError(
+                    "rhs_jac_callable returned a matrix with invalid shape: "
+                    f"got {J_sp.shape}, expected "
+                    f"({self.n_state}, {self.n_state})"
+                )
+            if not np.all(np.isfinite(J_sp.data)):
+                raise ValueError("rhs_jac_callable must return only finite values")
+        sparse_action = np.asarray(J_sp @ y_ref).ravel()
+        if (
+            self.rhs_affine_callable is not None
+            and not np.all(np.isfinite(sparse_action))
+        ):
+            raise ValueError(
+                "rhs_jac_callable produced a non-finite Jacobian action"
+            )
+        f_from_linearization = f_ref - sparse_action
+        lowrank_scale = 0.0
+        if self.theta_lowrank_jac is not None:
+            U_lr, V_lr = self.theta_lowrank_jac
+            f_from_linearization = f_from_linearization + np.asarray(
+                U_lr @ (V_lr.T @ y_ref)
+            ).ravel()
+            lowrank_scale = np.asarray(
+                np.abs(U_lr) @ (np.abs(V_lr).T @ np.abs(y_ref))
+            ).ravel()
+
+        if self.rhs_affine_callable is None:
+            f_affine = f_ref - sparse_action
+        else:
+            f_affine = self._evaluate_affine_rhs(t)
+            scale = (
+                np.abs(f_ref)
+                + np.asarray(np.abs(J_sp) @ np.abs(y_ref)).ravel()
+                + np.abs(f_affine)
+                + lowrank_scale
+            )
+            tolerance = 128.0 * np.finfo(float).eps * np.maximum(1.0, scale)
+            defect = np.abs(f_affine - f_from_linearization)
+            if np.any(defect > tolerance):
+                idx = int(np.argmax(defect / tolerance))
+                raise ValueError(
+                    "affine RHS certification failed: "
+                    f"component {idx} has defect {defect[idx]:.6e}, "
+                    f"tolerance {tolerance[idx]:.6e}"
+                )
         return f_affine, J_sp
 
-    def _build_theta_system(self, t: float, y: np.ndarray, h: float):
+    def _assemble_theta_system(self, t: float, y: np.ndarray, h: float):
+        """Build the complete theta system and its reusable operator data."""
         y = np.asarray(y, dtype=float).ravel()
         if y.size != self.n_state:
             raise ValueError(f"state has {y.size} entries; expected {self.n_state}")
@@ -1971,6 +2090,7 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         A_sp = self.A.tocsr() if sp.issparse(self.A) else sp.csr_matrix(self.A)
         op = ((1.0 / self.theta) * A_sp - float(h) * J).tocsr()
         rhs = np.asarray((1.0 / self.theta) * (A_sp @ y) + float(h) * f_affine).ravel()
+        normalized_constraints = []
 
         if self.constraints:
             patch_rows = []
@@ -2000,6 +2120,9 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
                         f"g={g_val.shape}, dg={Jg.shape}, q={q_idx.size}, y={y_idx.size}"
                     )
                 rhs[q_idx] = g_val - Jg @ y_sub
+                normalized_constraints.append(
+                    (q_idx.copy(), y_idx.copy(), Jg.tocsr())
+                )
                 q_all.append(q_idx)
                 patch_rows.append(q_idx)
                 patch_cols.append(q_idx)
@@ -2022,7 +2145,99 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             )
             op = (op + patch.tocsr()).tocsr()
 
+        if self.theta_lowrank_jac is None:
+            lowrank_U = None
+        else:
+            lowrank_U = self.theta_lowrank_jac[0]
+            if normalized_constraints:
+                lowrank_U = np.array(lowrank_U, copy=True)
+                constraint_rows = np.concatenate(
+                    [q_idx for q_idx, _y_idx, _Jg in normalized_constraints]
+                )
+                lowrank_U[constraint_rows, :] = 0.0
+
+        template = {
+            "A": A_sp,
+            "J": J,
+            "constraints": tuple(normalized_constraints),
+            # Constraint equations replace complete operator rows.  Mask the
+            # row factor of any explicit low-rank Jacobian on those rows so the
+            # Woodbury update cannot reintroduce the discarded dynamics.
+            "constraint_masked_lowrank_U": lowrank_U,
+        }
+        return op, rhs, template
+
+    def _build_theta_system(self, t: float, y: np.ndarray, h: float):
+        """Build ``(operator, rhs)``; retained for private compatibility."""
+        op, rhs, _template = self._assemble_theta_system(t, y, h)
         return op, rhs
+
+    def _build_theta_rhs_from_template(
+        self,
+        t: float,
+        y: np.ndarray,
+        h: float,
+        template: dict,
+    ) -> np.ndarray:
+        """Evaluate fresh affine data using a certified operator template."""
+        y = np.asarray(y, dtype=float).ravel()
+        if y.size != self.n_state:
+            raise ValueError(f"state has {y.size} entries; expected {self.n_state}")
+        t_theta = float(t) + self.theta * float(h)
+        A_sp = template["A"]
+        J = template["J"]
+        if self.rhs_affine_callable is None:
+            f_ref = np.asarray(self.rhs_callable(t_theta, y), dtype=float).ravel()
+            f_affine = f_ref - np.asarray(J @ y).ravel()
+        else:
+            f_affine = self._evaluate_affine_rhs(t_theta)
+        rhs = np.asarray(
+            (1.0 / self.theta) * (A_sp @ y) + float(h) * f_affine
+        ).ravel()
+
+        normalized_constraints = template["constraints"]
+        if len(self.constraints) != len(normalized_constraints):
+            raise RuntimeError(
+                "constraint count changed without a theta operator revision"
+            )
+        for c, normalized in zip(self.constraints, normalized_constraints):
+            q_idx, y_idx, Jg = normalized
+            y_sub = y[y_idx]
+            g_val = np.asarray(
+                self._call_constraint_fn(c.get("g"), y_sub, t_theta),
+                dtype=float,
+            ).ravel()
+            if q_idx.size != g_val.size:
+                raise ValueError(
+                    "constraint shape mismatch on cached theta RHS: "
+                    f"g={g_val.shape}, q={q_idx.size}"
+                )
+            rhs[q_idx] = g_val - Jg @ y_sub
+
+        return rhs
+
+    def _theta_cache_key(
+        self,
+        t: float,
+        y: np.ndarray,
+        h: float,
+    ) -> tuple[Any, bool]:
+        """Return the cache key and whether an explicit revision certifies it."""
+        source = self.theta_operator_revision
+        if source is None:
+            return float(h), False
+        if source is THETA_OPERATOR_STATIC:
+            revision = THETA_OPERATOR_STATIC
+        else:
+            t_theta = float(t) + self.theta * float(h)
+            revision = source(t_theta, y)
+            try:
+                hash(revision)
+            except TypeError as exc:
+                raise TypeError(
+                    "theta_operator_revision callback must return a hashable token"
+                ) from exc
+        return (float(h), revision), True
 
     def _contact_offset_impulse(self, y: np.ndarray, t: float, h: float) -> np.ndarray:
         if self.n_react == 0 or self.contact_offset_force is None:
@@ -2050,27 +2265,16 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         return float(h) * force / self.reaction_state_to_reported_scale
 
     def _theta_system_cached(self, t: float, y: np.ndarray, h: float) -> dict:
-        """Factorized theta system for ``(t, y, h)``, memoized per step size.
+        """Return a factorized theta system with conservative or declared reuse.
 
-        The theta operator ``op(h) = (1/theta)A - hJ`` is affine and, at a fixed
-        h, byte-identical across steps; only the predictor RHS depends on
-        ``(t, y)``.  Entries are cached in an LRU-bounded ``OrderedDict`` keyed by
-        ``float(h)`` (cap ``theta_cache_size``), so a lenient adaptive driver that
-        revisits earlier step sizes reuses their factorization for free.
-
-        Within a fixed h three cases arise:
-
-        * exact ``(t, y, h)`` re-entry (aux/mu fixed-point iterations re-enter
-          ``step()`` with identical arguments): return the cached entry as is --
-          operator, factorization, predictor and Delassus block are unchanged.
-        * byte-identical operator, new ``(t, y)``: reuse the factorization and
-          Delassus block, recompute only the back-substitution.
-        * a genuine operator change (time-dependent or nonlinear J) at this h is
-          detected by the byte fingerprint and triggers a full rebuild -- no
-          cross-step staleness.
+        Without an explicit operator revision, each new state/time rebuilds the
+        candidate sparse matrix and the existing CSR byte guard decides whether
+        its factorization is reusable.  A declared revision moves the cache key
+        to ``(h, revision)`` and reuses certified operator data directly while
+        evaluating forcing and constraint values afresh.
         """
         cache = self._theta_cache
-        key = float(h)
+        key, declared_revision = self._theta_cache_key(t, y, h)
         entry = cache.get(key)
         # exact (t, y, h) hit: aux fixed-point re-entry, nothing changed at all
         if (
@@ -2081,25 +2285,48 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             cache.move_to_end(key)
             return entry
 
-        op, rhs_base = self._build_theta_system(t, y, h)
-        op = op.tocsr() if sp.issparse(op) else sp.csr_matrix(op)
+        revision_hit = (
+            declared_revision
+            and entry is not None
+            and entry.get("fac") is not None
+            and entry.get("operator_template") is not None
+        )
+        operator_template = None
+        if revision_hit:
+            self._theta_rhs_only_builds += 1
+            rhs_base = self._build_theta_rhs_from_template(
+                t, y, h, entry["operator_template"],
+            )
+            op = None
+        else:
+            self._theta_operator_builds += 1
+            op, rhs_base, operator_template = self._assemble_theta_system(t, y, h)
+            op = op.tocsr() if sp.issparse(op) else sp.csr_matrix(op)
 
         # Explicit low-rank Jacobian: rhs_jac (hence ``op`` and the affine RHS
-        # built in _build_theta_system) omits the ``-U V^T`` feedback term.  The
+        # built by _assemble_theta_system) omits the ``-U V^T`` feedback term. The
         # Woodbury solve restores it in the operator; restore it in the predictor
         # RHS too, so both linearize about the SAME J: the affine term needs
         # ``f - J_full y`` rather than ``f - J_sparse y``, i.e. ``+ h U V^T y``.
-        if self.theta_lowrank_jac is not None:
-            U_lr, V_lr = self.theta_lowrank_jac
+        if (
+            self.theta_lowrank_jac is not None
+            and self.rhs_affine_callable is None
+        ):
+            active_template = (
+                entry["operator_template"] if revision_hit else operator_template
+            )
+            U_lr = active_template["constraint_masked_lowrank_U"]
+            V_lr = self.theta_lowrank_jac[1]
             yv = np.asarray(y, dtype=float).ravel()
             rhs_base = rhs_base + float(h) * (U_lr @ (V_lr.T @ yv))
 
-        # Cross-step reuse at this h: reuse the factorization + Delassus block
-        # (its per-rung Woodbury rides inside fac) whenever the operator matrix is
-        # byte-identical; recompute only the back-substitution.  A genuine
-        # operator change at this h fails the fingerprint and rebuilds below.
-        reuse = (
-            entry is not None
+        # Cross-step reuse at this key: an explicit revision certifies the
+        # operator template directly; conservative mode requires a byte-identical
+        # candidate matrix.  Both reuse the factorization and Delassus block and
+        # recompute the predictor back-substitution from the fresh RHS.
+        reuse = revision_hit or (
+            not declared_revision
+            and entry is not None
             and entry.get("fac") is not None
             and entry.get("op_shape") == op.shape
             and entry.get("op_nnz") == op.nnz
@@ -2130,8 +2357,12 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             entry["fac"].destroy()
         lowrank = None
         if self.theta_lowrank_jac is not None:
-            U_lr, V_lr = self.theta_lowrank_jac
-            lowrank = (U_lr, V_lr, float(h))     # op = op_sparse + h U V^T
+            U_lr = operator_template["constraint_masked_lowrank_U"]
+            V_lr = self.theta_lowrank_jac[1]
+            if np.any(U_lr):
+                # The replaced constraint rows of U are zero, so the update
+                # applies only to rows that still represent the dynamics.
+                lowrank = (U_lr, V_lr, float(h)) # op = op_sparse + h U V^T
         self._theta_factorizations += 1
         if self.theta_linear_solver == "iterative":
             fac = _ThetaFactorization(op, "iterative", self.theta_iterative_options,
@@ -2155,12 +2386,17 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             "rhs": rhs_base,
             "fac": fac,
             "z_pred": z_pred,
-            "op_shape": op.shape,
-            "op_nnz": op.nnz,
-            "op_indptr": op.indptr.copy(),
-            "op_indices": op.indices.copy(),
-            "op_data": op.data.copy(),
         }
+        if declared_revision:
+            new_entry["operator_template"] = operator_template
+        else:
+            new_entry.update(
+                op_shape=op.shape,
+                op_nnz=op.nnz,
+                op_indptr=op.indptr.copy(),
+                op_indices=op.indices.copy(),
+                op_data=op.data.copy(),
+            )
         if self.n_react > 0:
             if self._B_dense is None:
                 B = self.B.tocsr() if sp.issparse(self.B) else sp.csr_matrix(self.B)
@@ -2564,16 +2800,115 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
             )
         return g
 
-    def _geometric_active_blocks(self, y_state: np.ndarray, t_gap: float):
-        """Gap index set Ibar1_k at ``y_state``: None (all active) or the active
-        indices.  Pure geometric activation g(q) <= gap_tol (Eq. 19 less the
-        u_{N,k}<=0 term -- see __init__)."""
+    def _normal_velocity_tolerance(self, y_state: np.ndarray) -> np.ndarray:
+        """Per-contact numerical zero for the Eq. 19 normal-velocity test.
+
+        ``abs(D_N) @ abs(y)`` measures the componentwise magnitude of the row
+        terms whose cancellation produces ``u_N``.  Unlike a fixed dimensional
+        floor, the default relative-only tolerance transforms with a uniform
+        rescaling of the state and velocity units.  Descriptor-solve error that
+        is hidden by affine prestress/reaction cancellation is supplied
+        separately as the preceding step's restitution-consistency defect.
+        """
+        y_abs = np.abs(np.asarray(y_state, dtype=float).ravel())
+        row_scale = np.asarray(
+            abs(self.D_normal) @ y_abs, dtype=float,
+        ).ravel()
+        return (
+            self.normal_velocity_atol
+            + self.normal_velocity_rtol * row_scale
+        )
+
+    def _geometric_active_blocks(
+        self,
+        y_state: np.ndarray,
+        t_gap: float,
+        u_N_old: Optional[np.ndarray] = None,
+        normal_velocity_error: Optional[np.ndarray] = None,
+    ):
+        """Eq. 19 old-state set: closed and non-separating contact indices.
+
+        ``None`` means every contact is active.  When supplied, ``u_N_old`` is
+        the same pre-step normal velocity already used by the Fremond
+        restitution shift; direct helper callers may omit it and obtain the
+        identical reading from ``D_normal @ y_state``.
+        """
         if self.gap_callable is None:
             return None
-        active_mask = (self._gap_value(y_state, t_gap) <= self.gap_tol)
+        if u_N_old is None:
+            u_N_old = np.asarray(
+                self.D_normal @ y_state, dtype=float,
+            ).ravel()
+        else:
+            u_N_old = np.asarray(u_N_old, dtype=float).ravel()
+        if u_N_old.size != self.n_contacts:
+            raise ValueError(
+                f"u_N_old has {u_N_old.size} entries; "
+                f"expected {self.n_contacts}"
+            )
+        velocity_tol = self._normal_velocity_tolerance(y_state)
+        if normal_velocity_error is not None:
+            normal_velocity_error = np.asarray(
+                normal_velocity_error, dtype=float,
+            ).ravel()
+            if normal_velocity_error.size != self.n_contacts:
+                raise ValueError(
+                    "normal_velocity_error has "
+                    f"{normal_velocity_error.size} entries; "
+                    f"expected {self.n_contacts}"
+                )
+            if (
+                np.any(~np.isfinite(normal_velocity_error))
+                or np.any(normal_velocity_error < 0.0)
+            ):
+                raise ValueError(
+                    "normal_velocity_error entries must be finite and "
+                    "non-negative"
+                )
+            velocity_tol = velocity_tol + normal_velocity_error
+        active_mask = (
+            (self._gap_value(y_state, t_gap) <= self.gap_tol)
+            & (u_N_old <= velocity_tol)
+        )
         if bool(active_mask.all()):
             return None
         return np.flatnonzero(active_mask)
+
+    def _normal_endpoint_consistency_error(
+        self,
+        *,
+        u_N_new: np.ndarray,
+        u_N_old: np.ndarray,
+        regimes,
+    ) -> np.ndarray:
+        """A posteriori normal-velocity error from the preceding contact solve.
+
+        For a contact ending in stick or slip, the discrete restitution law
+        requires ``u_N,k+1 + e_N*u_N,k = 0``.  Its measured defect is therefore
+        an error estimate in velocity units.  Removing the physical rebound
+        term is essential: a genuine ``e_N > 0`` separating velocity must not
+        be absorbed into the Eq. 19 numerical zero.  Inactive contacts receive
+        no allowance, so resolved opening remains separating.
+        """
+        u_N_new = np.asarray(u_N_new, dtype=float).ravel()
+        u_N_old = np.asarray(u_N_old, dtype=float).ravel()
+        regimes = list(regimes)
+        if (
+            u_N_new.size != self.n_contacts
+            or u_N_old.size != self.n_contacts
+            or len(regimes) != self.n_contacts
+        ):
+            raise ValueError(
+                "normal endpoint data and regimes must have one entry per "
+                "contact"
+            )
+        closed = np.fromiter(
+            (regime in ("stick", "slip") for regime in regimes),
+            dtype=bool,
+            count=self.n_contacts,
+        )
+        defect = np.abs(u_N_new + self.e_N_vec * u_N_old)
+        return np.where(closed, defect, 0.0)
 
     def _velocity_solve_given_active(
         self, active_blocks, W, b_soccp, b_eff, offset_impulse, p0_eff,
@@ -2766,11 +3101,18 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
                     raise ValueError(
                         f"aux['mu'] has {mu_vec.size} entries; expected {self.n_contacts}"
                     )
-                # Geometric activation: gap index set Ibar1_k (Eq. 19), decided at
-                # the OLD position q_k = y.  gap_callable is None -> every contact
-                # active (persistent contact).  When combined_projection is OFF the
-                # loop runs exactly once and is byte-for-byte the original path.
-                active_blocks = self._geometric_active_blocks(y, t_theta)
+                # Eq. 19 activation, decided at the OLD state y_k: a contact is
+                # admitted only when it is closed/non-open AND non-separating.
+                # Reuse the exact pre-step u_N datum used by the Fremond shift.
+                # gap_callable=None keeps every contact active (persistent).
+                active_blocks = self._geometric_active_blocks(
+                    y,
+                    t_theta,
+                    u_N_old=u_N_old,
+                    normal_velocity_error=aux.get(
+                        "normal_velocity_error_bound"
+                    ),
+                )
                 cp_iters = 0
                 cp_converged = not self.combined_projection
                 for _cp_it in range(self.combined_projection_max_iter):
@@ -2824,10 +3166,20 @@ class DescriptorMoreauJeanFremondStepper(MoreauJeanFremondStepper):
         )
         aux_new["p_contact_prev"] = p_contact.copy()
         aux_new["p_contact_prev_h"] = float(h)   # impulse scale for warm-start rescaling
-        aux_new["u_old_endpoint"] = (
+        u_old_endpoint = (
             np.asarray(self.D_contact @ y_new, dtype=float).ravel()
             if self.n_react else np.zeros(0, dtype=float)
         )
+        aux_new["u_old_endpoint"] = u_old_endpoint
+        if self.n_react:
+            u_N_new = u_old_endpoint[self.normal_contact_rows]
+            aux_new["normal_velocity_error_bound"] = (
+                self._normal_endpoint_consistency_error(
+                    u_N_new=u_N_new,
+                    u_N_old=u_N_old,
+                    regimes=soccp_info.regime,
+                )
+            )
         info = {
             "soccp_outer_iters": soccp_info.outer_iters,
             "soccp_inner_iters": soccp_info.inner_iters,

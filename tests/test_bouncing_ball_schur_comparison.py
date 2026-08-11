@@ -1,13 +1,21 @@
 """Bouncing ball: analytical vs BE-Schur vs RadauIIA-Schur comparison plot."""
 
 import numpy as np
-import matplotlib
+import pytest
+
+matplotlib = pytest.importorskip(
+    "matplotlib",
+    reason="plot-generation example requires matplotlib",
+)
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 
 from solve_nivp.ncp_contact import build_ncp_contact_blocked
 from solve_nivp.integrations import BackwardEulerSchur, RadauIIASchur
+
+
+pytestmark = pytest.mark.examples
 
 
 def _bouncing_ball_block_system():
